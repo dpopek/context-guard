@@ -5,6 +5,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 
 ## [Unreleased]
 
+## [4.2.0] - 2026-11-14
+
+### Added
+- **Recent preamble window:** Track `Recent (10)` sliding median in `usage_report.py` and drive hygiene warnings from current sessions.
+- **Modular v4.x IDE extension:** Split `vscode-extension/` into `view_model.js`, `updater.js`, `renderers.js`, and `extension.js`.
+- **Dashboard & doctor insights:** Surface `Cache Hit`, `Preamble (Last)`, `Recent (10)`, `probeDoctor`, and `30d Verdict` in IDE views.
+
+### Changed
+- **IDE protection layers:** Remove legacy block/reread/reversal layers from `PROTECTION_LAYERS` while keeping label fallbacks.
+- **IDE extension installer:** Bundle all non-entry `vscode-extension/*.js` modules automatically inside `install_ide_extension`.
+
+### Fixed
+- **Codex preamble attribution:** Replace repeated `additional_tools` snapshots, deduplicate message blocks, and scale overflow to measured.
+
 ## [4.1.4] - 2026-11-14
 
 ### Changed

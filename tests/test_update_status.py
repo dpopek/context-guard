@@ -269,7 +269,9 @@ def test_update_step_env_disables_git_prompts_and_ssh_batch_mode() -> None:
 
 
 def test_extension_tooltip_trusts_only_its_own_commands() -> None:
-    ext_js = (EXT_DIR / "extension.js").read_text(encoding="utf-8")
+    ext_js = "\n".join(
+        p.read_text(encoding="utf-8") for p in sorted(EXT_DIR.glob("*.js"))
+    )
     assert "isTrusted = true" not in ext_js
     trusted = _node_eval("ext.TOOLTIP_COMMANDS")
     linked = sorted(set(re.findall(r"\(command:([\w.]+)\)", ext_js)))

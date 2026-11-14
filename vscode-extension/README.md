@@ -8,7 +8,7 @@ Live token savings telemetry, status bar indicator, SVG donut ring side panel, a
 
 **Context-Guard** is a zero-prompt security guard, silent range-trim, and multi-harness telemetry plugin for **Google Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex CLI/App** using pure Python 3.9+ standard library hooks.
 
-This companion IDE extension reads `telemetry/stats.json` and `update.json` from your installed Context-Guard checkout (`plugin_root.json`, `CONTEXT_GUARD_HOME`, or `~/.gemini/config/plugins/context-guard`) in real time to surface cumulative token and cost savings directly in your editor.
+This companion IDE extension reads `telemetry/stats.json`, `token_usage.json`, `outcomes.json`, and `update.json` from your installed Context-Guard checkout in real time to surface token savings and v4.x insights in your editor.
 
 ---
 
@@ -17,17 +17,16 @@ This companion IDE extension reads `telemetry/stats.json` and `update.json` from
 ### 1. Live Status Bar Pill & 4-Second Intervention Pulse
 - **Idle Pill:** Shows `$(shield) -<saved> · <pct>%` in the status bar (plus `$(cloud-download)` when an update or installer run is pending).
 - **Live Pulse:** Flashes `$(zap) -<delta> (<layer>) · <pct>%` for 4 seconds whenever a `PreToolUse` intervention saves tokens.
-- **Rich Hover Breakdown:** Displays saved/baseline tokens, API cost saved (`≈ $USD`), `200k` windows saved, per-harness bars, and quick actions.
+- **Rich Hover Breakdown:** Displays saved/baseline tokens, API cost saved (`≈ $USD`), `Cache Hit %`, `Preamble (Last)` with `Recent (10)`, `Doctor`, and 30-day `sunset_verdict`.
 
 ### 2. Activity Bar & Explorer Side Panels (`SVG Donut Ring`)
 - **Activity Bar View (`Token Savings`)** and **Explorer Section (`Context-Guard Savings`)**:
   - Interactive SVG donut gauge showing token reduction percentage and saved token total.
-  - KPI cards for **Context Windows Saved (`200k`)**, **Est. API Saved (`$USD`)**, **Baseline Volume**, and **Total Interventions**.
-  - **Last Guard Hit** live banner with relative timestamp and harness badge.
-  - **By Harness** progress bars and **Guard Interventions** breakdown across protection layers.
+  - KPI cards for **Baseline Read**, **Actual Sent**, **Cache Hit %**, **Preamble (Last)** with **Recent (10)** median, **Doctor**, and **30d Verdict**.
+  - **By Harness** progress bars and **By Protection Layer** breakdown across v4.x layers.
 
 ### 3. Interactive Token Savings Report (`contextGuard.showReport`)
-- Click the status bar pill or run **`Context-Guard: Show Token Savings Report`** from the Command Palette to open the full Webview dashboard.
+- Open from the status bar or Command Palette (**`Context-Guard: Show Token Savings Report`**) for full `Cache Hit %`, `Session Preamble (Last)`, `Doctor`, and `sunset_verdict` tables.
 
 ### 4. Safe One-Click Release Updates (`contextGuard.update`)
 - Checks `origin` for newer `vX.Y.Z` release tags in the background at most once per 24 hours.

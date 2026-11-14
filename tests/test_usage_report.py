@@ -86,9 +86,9 @@ def test_user_claude_md_is_not_counted_again_as_project_file(tmp_path: Path) -> 
 
 
 def test_summarize_preamble_median_p90_last() -> None:
-    assert summarize_preamble([]) == {"sessions": 0, "median": 0, "p90": 0, "last": 0}
-    assert summarize_preamble([50, 10, 30, 20]) == {"sessions": 4, "median": 25, "p90": 50, "last": 20}
-    assert summarize_preamble(list(range(1, 11)) + [True, "x"]) == {"sessions": 10, "median": 5, "p90": 9, "last": 10}
+    assert summarize_preamble([]) == {"sessions": 0, "median": 0, "recent_median": 0, "p90": 0, "last": 0}
+    assert summarize_preamble([50, 10, 30, 20]) == {"sessions": 4, "median": 25, "recent_median": 25, "p90": 50, "last": 20}
+    assert summarize_preamble(list(range(1, 11)) + [True, "x"]) == {"sessions": 10, "median": 5, "recent_median": 5, "p90": 9, "last": 10}
 
 
 def test_hygiene_warnings_thresholds() -> None:
@@ -97,6 +97,20 @@ def test_hygiene_warnings_thresholds() -> None:
     assert len(warnings) == 2
     assert "151 lines" in warnings[0] and "first 200" in warnings[0]
     assert "claude" in warnings[1] and "30,001" in warnings[1]
+
+
+def test_hygiene_warnings_use_recent_window_median_ignoring_stale_history() -> None:
+    improved_summary = summarize_preamble([60_000] * 12 + [18_000] * 10)
+    assert improved_summary["median"] == 60_000
+    assert improved_summary["recent_median"] == 18_000
+    assert hygiene_warnings(0, {"claude": improved_summary}) == []
+
+    regressed_summary = summarize_preamble([15_000] * 12 + [42_000] * 10)
+    assert regressed_summary["median"] == 15_000
+    assert regressed_summary["recent_median"] == 42_000
+    warnings = hygiene_warnings(0, {"claude": regressed_summary})
+    assert len(warnings) == 1
+    assert "Recent" in warnings[0] and "42,000" in warnings[0]
 
 
 def ledger() -> dict:
@@ -136,8 +150,8 @@ def test_rendered_sections() -> None:
     assert "| `cursor` | estimate | 1 files | ~250 | n/a | n/a | n/a | n/a |" in text
     assert "usage on 3 of 18 planner steps" in text
     assert "**50.00%**" in text
-    assert "| `claude` | 3 | 35,000 | 40,000 | 35,000 |" in text
-    assert "| `codex` | no data | | | |" in text
+    assert "| `claude` | 3 | 35,000 | 35,000 | 40,000 | 35,000 |" in text
+    assert "| `codex` | no data | | | | |" in text
     assert "| system prompt + tools + MCP (unattributed) | 30,000 |" in text
     assert "160 lines" in text and "claude" in text
 
@@ -315,8 +329,8 @@ def test_mixed_claude_cli_and_desktop_preambles_are_reported_separately() -> Non
     ]
     text = "\n".join(render_usage_sections(state, 2000, PreambleBreakdown(components=(), memory_lines=10)))
     preamble_table = text.split("## Session Preamble", 1)[1].split("### ", 1)[0]
-    assert "| `claude (cli)` | 3 | 30,000 | 31,000 | 31,000 |" in preamble_table
-    assert "| `claude (desktop)` | 1 | 88,000 | 88,000 | 88,000 |" in preamble_table
+    assert "| `claude (cli)` | 3 | 30,000 | 30,000 | 31,000 | 31,000 |" in preamble_table
+    assert "| `claude (desktop)` | 1 | 88,000 | 88,000 | 88,000 | 88,000 |" in preamble_table
     assert "| `claude` |" not in preamble_table
     assert "### Claude Code preamble breakdown — claude (cli) (measured, median of 3 sessions)" in text
     assert "### Claude Code preamble breakdown — claude (desktop) (measured, median of 1 sessions)" in text
@@ -326,8 +340,20 @@ def test_mixed_claude_cli_and_desktop_preambles_are_reported_separately() -> Non
     assert "Median claude (cli) session preamble" not in text
 
     summary = usage_summary(state, 2000, PreambleBreakdown(components=(), memory_lines=10))
-    assert summary["preamble"]["claude (cli)"] == {"sessions": 3, "median": 30_000, "p90": 31_000, "last": 31_000}
-    assert summary["preamble"]["claude (desktop)"] == {"sessions": 1, "median": 88_000, "p90": 88_000, "last": 88_000}
+    assert summary["preamble"]["claude (cli)"] == {
+        "sessions": 3,
+        "median": 30_000,
+        "recent_median": 30_000,
+        "p90": 31_000,
+        "last": 31_000,
+    }
+    assert summary["preamble"]["claude (desktop)"] == {
+        "sessions": 1,
+        "median": 88_000,
+        "recent_median": 88_000,
+        "p90": 88_000,
+        "last": 88_000,
+    }
     assert summary["preamble"]["claude"]["sessions"] == 4
     assert set(summary["attribution"]["cohorts"]) == {"claude (cli)", "claude (desktop)"}
     assert summary["attribution"]["cohorts"]["claude (desktop)"]["unattributed"] == 68_500
@@ -340,8 +366,8 @@ def test_desktop_only_claude_sessions_label_desktop_breakdown_and_no_cli_data() 
     state["preamble"] = {"claude": [85_000]}
     state["preamble_parts"] = [{"measured": 85_000, "components": desktop_parts}]
     text = "\n".join(render_usage_sections(state, 0, PreambleBreakdown(components=(), memory_lines=0)))
-    assert "| `claude (cli)` | no data | | | |" in text
-    assert "| `claude (desktop)` | 1 | 85,000 | 85,000 | 85,000 |" in text
+    assert "| `claude (cli)` | no data | | | | |" in text
+    assert "| `claude (desktop)` | 1 | 85,000 | 85,000 | 85,000 | 85,000 |" in text
     assert "### Claude Code preamble breakdown — claude (desktop) (measured, median of 1 sessions)" in text
 
 
@@ -358,8 +384,8 @@ def test_codex_cohorts_and_antigravity_estimate_appear_in_usage_report() -> None
         antigravity_components=(("user GEMINI.md / AGENTS.md", 1200), ("MCP tool schemas", 8000)),
     )
     text = "\n".join(render_usage_sections(state, 0, bd))
-    assert "| `codex (cli)` | 1 | 16,000 | 16,000 | 16,000 |" in text
-    assert "| `codex (desktop)` | 1 | 32,000 | 32,000 | 32,000 |" in text
+    assert "| `codex (cli)` | 1 | 16,000 | 16,000 | 16,000 | 16,000 |" in text
+    assert "| `codex (desktop)` | 1 | 32,000 | 32,000 | 32,000 | 32,000 |" in text
     assert "### Codex preamble breakdown — codex (desktop) (measured, median of 1 sessions)" in text
     assert "### Antigravity preamble breakdown (estimate, bytes / 4)" in text
     summary = usage_summary(state, 0, bd)

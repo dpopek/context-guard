@@ -304,9 +304,8 @@ def test_block_gauge_and_svg_donut_sidebar_rendering() -> None:
     hud = render_claude_hud({"model": {"display_name": "Sonnet 4.6"}}, stats)
     assert "▰▰▰▱▱" in hud
 
-    ext_js = (
-        Path(__file__).resolve().parent.parent / "vscode-extension" / "extension.js"
-    ).read_text(encoding="utf-8")
+    ext_dir = Path(__file__).resolve().parent.parent / "vscode-extension"
+    ext_js = "\n".join(p.read_text(encoding="utf-8") for p in sorted(ext_dir.glob("*.js")))
     assert "function formatBlockGauge(" in ext_js
     assert "function estimateCostUsd(" in ext_js
     assert "function escapeHtml(" in ext_js
@@ -688,7 +687,9 @@ def test_cost_estimate_uses_current_input_rate_and_is_labelled_approximate() -> 
     assert "approx" in out["sidebar"].lower()
     assert f"v{VERSION}" in out["sidebar"]
 
-    ext_js = ext_path.read_text(encoding="utf-8")
+    ext_js = "\n".join(
+        p.read_text(encoding="utf-8") for p in sorted(ext_path.parent.glob("*.js"))
+    )
     assert "~$${costUsd}" not in ext_js
     assert "Est. API" not in ext_js
     assert ext_js.count("COST_BASIS_NOTE") >= 4

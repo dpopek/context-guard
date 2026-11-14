@@ -12,9 +12,12 @@ from bin.preamble_attribution import (
     CODEX_CLI_HARNESS,
     CODEX_DESKTOP_HARNESS,
     MalformedAttachment,
+    accumulate_codex_preamble,
     attribute_codex_record,
     attribute_record,
+    cap_parts_to_measured,
     codex_session_traits,
+    finalize_codex_preamble,
     find_candidates,
     is_claude_desktop_parts,
     measure_antigravity_preamble,
@@ -510,5 +513,123 @@ def test_measure_antigravity_preamble_counts_lazy_mcp_stems_and_config_rules(tmp
     measured = dict(measure_antigravity_preamble(home, None))
     assert measured["user GEMINI.md / AGENTS.md"] == 400
     assert 0 < measured["MCP tool schemas"] < 50
+
+
+def test_accumulate_codex_preamble_replaces_tool_snapshots_and_deduplicates_messages() -> None:
+    snap_1 = {
+        "type": "response_item",
+        "payload": {
+            "type": "additional_tools",
+            "tools": [{"type": "function", "name": "mcp__stale_srv__ping", "description": "s" * 400}],
+        },
+    }
+    snap_2 = {
+        "type": "response_item",
+        "payload": {
+            "type": "additional_tools",
+            "tools": [{"type": "function", "name": "mcp__alpha__run", "description": "a" * 500}],
+        },
+    }
+    skills_text = "<skills_instructions>\n- superpowers:tdd: Use TDD\n</skills_instructions>" + " " * 20
+    tools_text = "<tools>\nDeferred tool namespaces:\n- mcp__demo_srv: Demo deferred tool\n</tools>"
+    collab_text = "<collaboration_mode># Collab mode " + "c" * 80 + "</collaboration_mode>"
+    role_text = "<multi_agent_role>Primary role " + "r" * 80 + "</multi_agent_role>"
+    dev_rec = {
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "developer",
+            "content": [
+                {"type": "input_text", "text": skills_text},
+                {"type": "input_text", "text": tools_text},
+                {"type": "input_text", "text": collab_text},
+                {"type": "input_text", "text": role_text},
+            ],
+        },
+    }
+    pending = None
+    for rec in (snap_1, dev_rec, snap_2, dev_rec):
+        pending = accumulate_codex_preamble(pending, rec)
+    assert pending is not None and isinstance(pending["seen"], list)
+    finalized = finalize_codex_preamble(pending)
+    assert finalized is not None
+    assert "mcp:stale_srv" not in finalized.get("deferred_tools", {})
+    assert "mcp:alpha" in finalized["deferred_tools"]
+    assert "mcp:demo_srv" in finalized["deferred_tools"]
+    skill_body = "- superpowers:tdd: Use TDD\n</skills_instructions>" + " " * 20 + "\n"
+    assert finalized["skills"]["superpowers"] == tokens(skill_body)
+    assert "session_context" in finalized.get("other", {})
+    assert "core" not in finalized.get("system_prompt", {})
+
+
+def test_codex_preamble_parts_never_exceed_measured_tokens(tmp_path: Path) -> None:
+    import json
+
+    legacy_entry = {
+        "measured": 40_000,
+        "cohort": CODEX_DESKTOP_HARNESS,
+        "components": {
+            "deferred_tools": {"builtin": 25_000, "mcp:codex_app": 25_000},
+            "system_prompt": {"core": 10_000},
+        },
+    }
+    split = split_codex_parts([legacy_entry])
+    legacy_summary = summarize_parts(split[CODEX_DESKTOP_HARNESS])
+    assert legacy_summary["clamped"] is False
+    assert legacy_summary["unattributed"] >= 0
+    comps = legacy_summary["components"]
+    assert comps["deferred_tools"]["builtin"] == comps["deferred_tools"]["mcp:codex_app"] > comps["system_prompt"]["core"]
+    assert cap_parts_to_measured(100, {"skills": {"a": 300, "b": 100}}) == {"skills": {"a": 75, "b": 25}}
+
+    roots = {name: tmp_path / name for name in ("antigravity", "claude", "codex", "cursor")}
+    day_dir = roots["codex"] / "2026" / "11" / "14"
+    day_dir.mkdir(parents=True)
+    rollout = day_dir / "rollout-overcount.jsonl"
+    oversized_dev = "You are Codex.\n" + ("word " * 2_400)
+    rollout.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "timestamp": "2026-11-14T10:00:00Z",
+                        "type": "session_meta",
+                        "payload": {"originator": "Codex Desktop", "source": "vscode"},
+                    }
+                ),
+                json.dumps({"type": "turn_context", "payload": {"model": "gpt-6.1-sol"}}),
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "developer",
+                            "content": [{"type": "input_text", "text": oversized_dev}],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "timestamp": "2026-11-14T10:00:01Z",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {
+                                "last_token_usage": {"input_tokens": 1000, "cached_input_tokens": 0, "output_tokens": 10},
+                                "total_token_usage": {"input_tokens": 1000, "cached_input_tokens": 0, "output_tokens": 10},
+                            },
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = empty_usage_state()
+    ingest_transcripts(state, roots)
+    entry = state["codex_preamble_parts"][0]
+    total_attributed = sum(v for sec in entry["components"].values() for v in sec.values())
+    assert total_attributed <= entry["measured"] == 1000
+    assert summarize_parts(split_codex_parts(state["codex_preamble_parts"])[CODEX_DESKTOP_HARNESS])["clamped"] is False
 
 

@@ -443,7 +443,16 @@ def install_ide_extension(
         )
         shutil.copy2(src_dir / "extension.js", target_dir / "extension.js")
         fallback_ext_dir = Path(__file__).resolve().parent.parent / "vscode-extension"
-        for js_module in ("view_model.js",):
+        js_names = sorted(
+            {
+                p.name
+                for d in (src_dir, fallback_ext_dir)
+                if d.is_dir()
+                for p in d.glob("*.js")
+                if p.name != "extension.js"
+            }
+        )
+        for js_module in js_names:
             for candidate in (src_dir / js_module, fallback_ext_dir / js_module):
                 if candidate.is_file():
                     shutil.copy2(candidate, target_dir / js_module)

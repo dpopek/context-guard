@@ -1,4 +1,4 @@
-# Context-Guard (v4.1.4)
+# Context-Guard (v4.2.0)
 
 Zero-prompt security guard, silent range-trim, machine-artifact unwrapper, and multi-harness telemetry plugin for **Google Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex CLI/App** across **macOS, Linux, and Windows**.
 
@@ -55,7 +55,7 @@ Source code and Markdown reads never block; `cg-outline <path>` handles on-deman
 
 ### 4. Two-Stage Auto-Compact Sensor & Multi-Harness Preamble Attribution
 - Incrementally scans `transcript.jsonl` / `transcript_full.jsonl` (`O(delta)`), injecting `AUTO-COMPACT SENSOR` (`>= 80` steps or `512 KB`) and `AUTO-COMPACT HARD STOP` (`>= 200` steps or `1024 KB`).
-- Splits `claude (cli)` vs `claude (desktop)` (`mcp:ccd_*`), `codex (cli)` vs `codex (desktop)`, estimates Antigravity filesystem preamble overhead, excludes subagents, and computes 30-day `sunset_verdict` in `--usage`.
+- Splits `claude (cli)` vs `claude (desktop)` (`mcp:ccd_*`), `codex (cli)` vs `codex (desktop)`, scores `Recent (10)` preamble hygiene, estimates Antigravity overhead, and computes 30-day `sunset_verdict` in `--usage`.
 
 ---
 
@@ -98,7 +98,9 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 | `bin/preamble_attribution.py` | CLI & UI | Measures always-on instruction files, separates CLI/Desktop apps, and computes `sunset_verdict`. |
 | `bin/usage_report.py` | CLI & UI | Formats real token usage, cache read share, preamble breakdowns, and sunset advice. |
 | `vscode-extension/extension.js` | IDE Extension | Status bar pill, 4s pulse, report panel, `update.lock` backoff, and one-click updater. |
-| `vscode-extension/view_model.js` | IDE Extension | Pure telemetry normalization, SemVer validation, and CSP. |
+| `vscode-extension/view_model.js` | IDE Extension | Pure telemetry normalization, v4.x insights summarization, SemVer validation, and CSP. |
+| `vscode-extension/updater.js` | IDE Extension | Self-update runner, `plugin_root.json` resolver, and harness `probeDoctor`. |
+| `vscode-extension/renderers.js` | IDE Extension | Escaped tooltip Markdown, sidebar SVG donut HTML, and dashboard report views. |
 
 ---
 
@@ -107,11 +109,11 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 Context-Guard runs from wherever you clone it: the installer points every harness hook at that checkout. Pick any directory; `~/.gemini` is needed only if you use Antigravity.
 
 ```bash
-# 1. Clone anywhere (or unpack dist/context-guard-v4.1.4.zip there)
+# 1. Clone anywhere (or unpack dist/context-guard-v4.2.0.zip there)
 CG_DIR=~/tools/context-guard
 git clone https://github.com/dpopek/context-guard.git "$CG_DIR"
 
-# 2. Install hooks (Claude Code, Codex, Cursor, Antigravity) & advox.context-guard-statusbar-4.1.4 extension
+# 2. Install hooks (Claude Code, Codex, Cursor, Antigravity) & advox.context-guard-statusbar-4.2.0 extension
 python3 "$CG_DIR/bin/install_harnesses.py" --install
 
 # Check status, preview dry-run, or uninstall cleanly

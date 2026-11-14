@@ -3,11 +3,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import re
 from datetime import date, timedelta
-from typing import Any
+from typing import Any, Callable
 
 COMPONENTS = (
     "system_prompt",
@@ -23,6 +24,7 @@ CANDIDATE_COMPONENTS = ("skills", "deferred_tools", "agents", "mcp_instructions"
 GENERIC_KEYS = frozenset({"standalone", "builtin"})
 CANDIDATE_MIN_TOKENS = 500
 CANDIDATE_WINDOW_DAYS = 30
+CODEX_TOOL_BYTES_PER_TOKEN = 5
 DESKTOP_MCP_PREFIX = "mcp:ccd_"
 CLAUDE_CLI_HARNESS = "claude (cli)"
 CLAUDE_DESKTOP_HARNESS = "claude (desktop)"
@@ -81,14 +83,14 @@ def _texts(value: Any, field: str) -> list[str]:
     raise MalformedAttachment(field)
 
 
-def _listing(component: str, text: str) -> list[tuple[str, str, str]]:
-    """One part per line: a `- <name>: ...` line opens an entry, the lines after it belong to it, the header to `standalone`."""
-    key = "standalone"
+def _listing(component: str, text: str, key_fn: Callable[[str], str] = plugin_key) -> list[tuple[str, str, str]]:
+    """One part per line: a `- <name>: ...` line opens an entry, the lines after it belong to it."""
+    key = "builtin" if key_fn is tool_key else "standalone"
     parts = []
     for line in text.splitlines():
         match = _ENTRY_RE.match(line)
         if match:
-            key = plugin_key(match.group(1))
+            key = key_fn(match.group(1))
         parts.append((component, key, line + "\n"))
     return parts
 
@@ -346,7 +348,9 @@ def _codex_tools_parts(tools: Any) -> list[tuple[str, str, int]]:
     return out
 
 
-def _codex_message_parts(role: str, content: Any) -> list[tuple[str, str, int]]:
+def _codex_message_parts(
+    role: str, content: Any, seen_hashes: list[str] | None = None
+) -> list[tuple[str, str, int]]:
     out: list[tuple[str, str, int]] = []
     for item in content if isinstance(content, list) else []:
         if not isinstance(item, dict):
@@ -354,14 +358,26 @@ def _codex_message_parts(role: str, content: Any) -> list[tuple[str, str, int]]:
         text = item.get("text")
         if not isinstance(text, str) or not text:
             continue
+        if seen_hashes is not None:
+            digest = hashlib.sha256(f"{role}\0{text}".encode("utf-8")).hexdigest()[:24]
+            if digest in seen_hashes:
+                continue
+            seen_hashes.append(digest)
         stripped = text.lstrip()
         nbytes = len(text.encode("utf-8"))
-        if stripped.startswith("<app-context>"):
+        if stripped.startswith("<app-context>") or stripped.startswith("<codex_apps_"):
             out.append(("other", "app_context", nbytes))
+        elif stripped.startswith(
+            ("<collaboration_mode>", "<recommended_plugins>", "<multi_agent_role>", "<multi_agent_mode>")
+        ):
+            out.append(("other", "session_context", nbytes))
         elif "MEMORY_SUMMARY" in text or stripped.startswith("## Memory"):
             out.append(("instructions", "memory", nbytes))
         elif stripped.startswith("<skills_instructions>"):
             for comp, key, line in _listing("skills", text):
+                out.append((comp, key, len(line.encode("utf-8"))))
+        elif stripped.startswith("<tools>"):
+            for comp, key, line in _listing("deferred_tools", text, key_fn=tool_key):
                 out.append((comp, key, len(line.encode("utf-8"))))
         elif stripped.startswith(("# AGENTS.md", "<INSTRUCTIONS>")):
             out.append(("instructions", "agents_md", nbytes))
@@ -374,19 +390,7 @@ def _codex_message_parts(role: str, content: Any) -> list[tuple[str, str, int]]:
     return out
 
 
-def attribute_codex_record(record: dict[str, Any]) -> dict[str, dict[str, int]] | None:
-    """Tokens (UTF-8 bytes / 4) per component and key of one Codex `response_item` record."""
-    if record.get("type") != "response_item":
-        return None
-    payload = record.get("payload")
-    if not isinstance(payload, dict):
-        return None
-    ptype = payload.get("type")
-    raw_parts: list[tuple[str, str, int]] = []
-    if ptype == "additional_tools":
-        raw_parts = _codex_tools_parts(payload.get("tools"))
-    elif ptype == "message" and payload.get("role") in ("developer", "user"):
-        raw_parts = _codex_message_parts(str(payload["role"]), payload.get("content"))
+def _codex_sizes_to_parts(raw_parts: list[tuple[str, str, int]], divisor: int) -> dict[str, dict[str, int]] | None:
     if not raw_parts:
         return None
     sizes: dict[tuple[str, str], int] = {}
@@ -394,9 +398,90 @@ def attribute_codex_record(record: dict[str, Any]) -> dict[str, dict[str, int]] 
         sizes[(comp, key)] = sizes.get((comp, key), 0) + nbytes
     result: dict[str, dict[str, int]] = {}
     for (comp, key), nbytes in sizes.items():
-        if nbytes // 4:
-            result.setdefault(comp, {})[key] = nbytes // 4
+        if nbytes // divisor:
+            result.setdefault(comp, {})[key] = nbytes // divisor
     return result or None
+
+
+def attribute_codex_record(record: dict[str, Any]) -> dict[str, dict[str, int]] | None:
+    """Tokens per component and key of one Codex `response_item` record."""
+    if record.get("type") != "response_item":
+        return None
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    ptype = payload.get("type")
+    if ptype == "additional_tools":
+        return _codex_sizes_to_parts(_codex_tools_parts(payload.get("tools")), CODEX_TOOL_BYTES_PER_TOKEN)
+    if ptype == "message" and payload.get("role") in ("developer", "user"):
+        return _codex_sizes_to_parts(_codex_message_parts(str(payload["role"]), payload.get("content")), 4)
+    return None
+
+
+def accumulate_codex_preamble(pending: dict[str, Any] | None, record: dict[str, Any]) -> dict[str, Any] | None:
+    """Accumulate Codex preamble parts before first token_count, replacing tool snapshots and deduplicating messages."""
+    if record.get("type") != "response_item":
+        return pending
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return pending
+    ptype = payload.get("type")
+    if ptype != "additional_tools" and not (ptype == "message" and payload.get("role") in ("developer", "user")):
+        return pending
+    if isinstance(pending, dict) and ("tools" in pending or "messages" in pending or "seen" in pending):
+        state: dict[str, Any] = {
+            "tools": pending.get("tools") if isinstance(pending.get("tools"), dict) else None,
+            "messages": pending.get("messages") if isinstance(pending.get("messages"), dict) else None,
+            "seen": [item for item in (pending.get("seen") or []) if isinstance(item, str)],
+        }
+    elif isinstance(pending, dict):
+        state = {"tools": None, "messages": pending, "seen": []}
+    else:
+        state = {"tools": None, "messages": None, "seen": []}
+
+    if ptype == "additional_tools":
+        parts = _codex_sizes_to_parts(_codex_tools_parts(payload.get("tools")), CODEX_TOOL_BYTES_PER_TOKEN)
+        if parts:
+            state["tools"] = parts
+            return state
+        return pending
+    seen = state["seen"]
+    parts = _codex_sizes_to_parts(_codex_message_parts(str(payload["role"]), payload.get("content"), seen), 4)
+    if parts:
+        state["messages"] = merge_parts(state["messages"], parts)
+        return state
+    return pending
+
+
+def finalize_codex_preamble(pending: dict[str, Any] | None) -> dict[str, dict[str, int]] | None:
+    """Combine the latest Codex tool snapshot and deduplicated message blocks into one breakdown dict."""
+    if not isinstance(pending, dict) or not pending:
+        return None
+    if "tools" not in pending and "messages" not in pending and "seen" not in pending:
+        return pending
+    merged = merge_parts(pending.get("tools"), pending.get("messages") or {})
+    return merged or None
+
+
+def cap_parts_to_measured(measured: int, components: Any) -> dict[str, dict[str, int]]:
+    """Clean component counts and proportionally scale them down when their sum exceeds `measured`."""
+    cleaned: dict[str, dict[str, int]] = {}
+    if isinstance(components, dict):
+        for comp, keys in components.items():
+            if not isinstance(keys, dict):
+                continue
+            row = {str(k): _int(v) for k, v in keys.items() if _int(v)}
+            if row:
+                cleaned[str(comp)] = row
+    total = sum(val for row in cleaned.values() for val in row.values())
+    if measured <= 0 or total <= measured or not total:
+        return cleaned
+    scaled: dict[str, dict[str, int]] = {}
+    for comp, row in cleaned.items():
+        new_row = {key: (val * measured) // total for key, val in row.items() if (val * measured) // total}
+        if new_row:
+            scaled[comp] = new_row
+    return scaled
 
 
 def split_codex_parts(entries: Any) -> dict[str, list[dict[str, Any]]]:
@@ -404,10 +489,13 @@ def split_codex_parts(entries: Any) -> dict[str, list[dict[str, Any]]]:
     cli: list[dict[str, Any]] = []
     desktop: list[dict[str, Any]] = []
     for entry in _clean_entries(entries):
+        measured = _int(entry["measured"])
+        capped = cap_parts_to_measured(measured, entry["components"])
+        normalized = {"measured": measured, "cohort": entry.get("cohort"), "components": capped}
         if entry.get("cohort") == CODEX_DESKTOP_HARNESS:
-            desktop.append(entry)
+            desktop.append(normalized)
         else:
-            cli.append(entry)
+            cli.append(normalized)
     return {CODEX_CLI_HARNESS: cli, CODEX_DESKTOP_HARNESS: desktop}
 
 

@@ -132,6 +132,7 @@ console.log(JSON.stringify({
   sidebarHasWide: sidebarHtml.includes("Wide Follow-Up") && sidebarHtml.includes("Multi-File Batch") && sidebarHtml.includes("Credit"),
   webviewHasWide: webviewHtml.includes("wide_followup_blocks") && webviewHtml.includes("multi_file_blocks") && webviewHtml.includes("credit_reversals"),
   tooltipHasOutlinePulls: tooltipHtml.includes("Voluntary Outlines (cg-outline)"),
+  tooltipHasLegacyLastHit: tooltipHtml.includes("Wide Follow-Up Read Blocked"),
   v4HasOutlinePulls: v4Sidebar.includes("Voluntary Outlines (cg-outline)") && v4Webview.includes("Voluntary Outlines (cg-outline)") && v4Tooltip.includes("Voluntary Outlines (cg-outline)"),
   v4HidesLegacy: !/Wide Follow-Up|Multi-File Batch|Duplicate Re-Reads|Credits Taken Back/.test(v4Sidebar + v4Webview + v4Tooltip),
   pulseWide,
@@ -158,20 +159,17 @@ console.log(JSON.stringify({
     data = json.loads(proc.stdout.strip())
     assert data["layerKeys"] == [
         "outlines",
-        "wide_followup_blocks",
-        "multi_file_blocks",
-        "rereads_blocked",
         "ranges_trimmed",
         "cli_rewrites",
         "outline_pulls",
         "mcp_guards",
         "allowed_reads",
-        "credit_reversals",
     ]
     assert data["tooltipHasOutlinePulls"] is True
+    assert data["tooltipHasLegacyLastHit"] is True
     assert data["v4HasOutlinePulls"] is True
     assert data["v4HidesLegacy"] is True
-    assert data["retryKeys"] == ["wide_followup_retries", "multi_file_retries"]
+    assert data["retryKeys"] == []
     assert data["actualTokens"] == 0
     assert data["reductionPct"] == 100.0
     assert data["agHarness"] == {
@@ -193,8 +191,8 @@ console.log(JSON.stringify({
     assert data["webviewClampedPct"] is True
     assert data["sidebarNoDoubleMinus"] is True
     assert data["webviewNoDoubleMinus"] is True
-    assert data["sidebarHasWide"] is True
-    assert data["webviewHasWide"] is True
+    assert data["sidebarHasWide"] is False
+    assert data["webviewHasWide"] is False
     assert "(Wide)" in data["pulseWide"]
     assert "(Batch)" in data["pulseBatch"]
     assert "(Reversal)" in data["pulseRev"]
@@ -227,6 +225,8 @@ console.log(JSON.stringify({
     assert len(installed_dirs) == 1
     assert (installed_dirs[0] / "extension.js").is_file()
     assert (installed_dirs[0] / "view_model.js").is_file()
+    assert (installed_dirs[0] / "updater.js").is_file()
+    assert (installed_dirs[0] / "renderers.js").is_file()
 
 
 def test_extension_lifecycle_pulse_race_notify_latch_and_singleton_report_panel(

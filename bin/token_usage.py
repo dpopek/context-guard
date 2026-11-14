@@ -33,9 +33,11 @@ from hooks.telemetry import now_iso, read_json_object_or_quarantine, write_json_
 from bin.preamble_attribution import (  # noqa: E402
     CODEX_CLI_HARNESS,
     MalformedAttachment,
-    attribute_codex_record,
+    accumulate_codex_preamble,
     attribute_record,
+    cap_parts_to_measured,
     codex_session_traits,
+    finalize_codex_preamble,
     merge_parts,
     usage_keys,
 )
@@ -194,7 +196,7 @@ def add_preamble_parts(state: dict[str, Any], measured: int, components: dict[st
 def add_codex_preamble_parts(state: dict[str, Any], measured: int, cohort: str, components: dict[str, Any]) -> None:
     """Append one Codex main-thread session's preamble breakdown, keeping the last PREAMBLE_HISTORY."""
     history = state.setdefault("codex_preamble_parts", [])
-    history.append({"measured": measured, "cohort": cohort, "components": components})
+    history.append({"measured": measured, "cohort": cohort, "components": cap_parts_to_measured(measured, components)})
     del history[:-PREAMBLE_HISTORY]
 
 
@@ -248,9 +250,9 @@ def _event_from(
                 cursor["codex_cohort"] = cohort
             return None
         if not cursor.get("preamble_done") and not cursor.get("is_sidechain"):
-            codex_parts = attribute_codex_record(record)
-            if codex_parts:
-                cursor["codex_pending_parts"] = merge_parts(cursor.get("codex_pending_parts"), codex_parts)
+            codex_pending = accumulate_codex_preamble(cursor.get("codex_pending_parts"), record)
+            if codex_pending is not None:
+                cursor["codex_pending_parts"] = codex_pending
         model = codex_model_from_record(record)
         if model:
             cursor["model"] = model
@@ -372,6 +374,7 @@ def fold_jsonl_file(
                 if first_main and event.message_id not in seen:
                     cursor["preamble_done"] = True
                     cursor.pop("pending_parts", None)
+                    cursor.pop("codex_pending_parts", None)
                 continue
             seen.add(event.message_id)
             known[event.message_id] += 1
@@ -386,7 +389,7 @@ def fold_jsonl_file(
             parts = cursor.pop("pending_parts", None)
             if parts:
                 add_preamble_parts(state, measured, parts)
-            codex_parts = cursor.pop("codex_pending_parts", None)
+            codex_parts = finalize_codex_preamble(cursor.pop("codex_pending_parts", None))
             if harness == "codex" and codex_parts:
                 add_codex_preamble_parts(state, measured, str(cursor.get("codex_cohort") or CODEX_CLI_HARNESS), codex_parts)
     cursor["offset"] = offset + len(body)

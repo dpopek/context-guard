@@ -165,6 +165,7 @@ def test_hooks_total_loc_ceiling() -> None:
 
 
 MAX_PROD_FILE_LOC = 800
+MAX_JS_FILE_LOC = 500
 
 
 def test_production_module_loc_ceilings() -> None:
@@ -178,6 +179,19 @@ def test_production_module_loc_ceilings() -> None:
                     f"{path.relative_to(ROOT)}: {loc} LOC exceeds {MAX_PROD_FILE_LOC} LOC ceiling"
                 )
     assert violations == [], f"Production module LOC ceiling violations: {violations}"
+
+
+def test_vscode_extension_js_loc_ceilings() -> None:
+    """Extension entrypoint and extracted JS modules must exist and stay <= 500 LOC each."""
+    ext_dir = ROOT / "vscode-extension"
+    for required in ("extension.js", "view_model.js", "updater.js", "renderers.js"):
+        assert (ext_dir / required).is_file(), f"Missing modular extension file: {required}"
+    violations: list[str] = []
+    for path in sorted(ext_dir.glob("*.js")):
+        loc = len(path.read_text(encoding="utf-8").splitlines())
+        if loc > MAX_JS_FILE_LOC:
+            violations.append(f"{path.relative_to(ROOT)}: {loc} LOC exceeds {MAX_JS_FILE_LOC} LOC ceiling")
+    assert violations == [], f"VS Code extension JS LOC violations: {violations}"
 
 
 _ALLOWED_TEST_USERS = frozenset({"dev", "x", "u", "user", "example", "alice", "bob", "jan"})

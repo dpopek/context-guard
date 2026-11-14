@@ -38,6 +38,7 @@ PREAMBLE_HOME = Path.home()
 MEMORY_LOAD_LINES = 200
 MEMORY_WARN_LINES = 150
 PREAMBLE_WARN_TOKENS = 30_000
+RECENT_PREAMBLE_WINDOW = 10
 IMPORT_DEPTH = 5
 _HARNESSES = ("antigravity", "claude", "codex", "cursor")
 _IMPORT_RE = re.compile(r"(?<![\w`])@(~?[\w./-]+)")
@@ -222,17 +223,23 @@ def measure_preamble_components(home: Path, project_dir: Path) -> PreambleBreakd
 
 
 def summarize_preamble(values: list[Any]) -> dict[str, int]:
-    """Session count, median, p90 (nearest rank) and last value of a preamble history."""
+    """Session count, median, recent-window median, p90 (nearest rank) and last value of a preamble history."""
     clean = [value for value in values if isinstance(value, int) and not isinstance(value, bool)]
     if not clean:
-        return {"sessions": 0, "median": 0, "p90": 0, "last": 0}
+        return {"sessions": 0, "median": 0, "recent_median": 0, "p90": 0, "last": 0}
     ordered = sorted(clean)
     p90 = ordered[max(0, math.ceil(0.9 * len(ordered)) - 1)]
-    return {"sessions": len(ordered), "median": median(ordered), "p90": p90, "last": clean[-1]}
+    return {
+        "sessions": len(ordered),
+        "median": median(ordered),
+        "recent_median": median(clean[-RECENT_PREAMBLE_WINDOW:]),
+        "p90": p90,
+        "last": clean[-1],
+    }
 
 
 def hygiene_warnings(memory_lines: int, summaries: dict[str, dict[str, int]]) -> list[str]:
-    """Report-only warnings: a MEMORY.md index near the load limit and a large median preamble per harness."""
+    """Report-only warnings: a MEMORY.md index near the load limit and a large recent/median preamble per harness."""
     warnings = []
     if memory_lines > MEMORY_WARN_LINES:
         warnings.append(
@@ -250,9 +257,19 @@ def hygiene_warnings(memory_lines: int, summaries: dict[str, dict[str, int]]) ->
     for harness in sorted(summaries):
         if (harness == "claude" and has_claude_split) or (harness == "codex" and has_codex_split):
             continue
-        med = summaries[harness].get("median", 0)
-        if med > PREAMBLE_WARN_TOKENS:
-            warnings.append(f"Median {harness} session preamble is {med:,} tokens (above {PREAMBLE_WARN_TOKENS:,}).")
+        summary = summaries[harness]
+        has_recent = "recent_median" in summary
+        effective = summary.get("recent_median", summary.get("median", 0))
+        if effective > PREAMBLE_WARN_TOKENS:
+            if has_recent and summary.get("sessions", 0) > RECENT_PREAMBLE_WINDOW:
+                warnings.append(
+                    f"Recent {harness} session preamble median (last {RECENT_PREAMBLE_WINDOW}) is "
+                    f"{effective:,} tokens (above {PREAMBLE_WARN_TOKENS:,})."
+                )
+            else:
+                warnings.append(
+                    f"Median {harness} session preamble is {effective:,} tokens (above {PREAMBLE_WARN_TOKENS:,})."
+                )
     return warnings
 
 
@@ -650,7 +667,15 @@ def render_usage_sections(
     )
 
     summaries = _preamble_summaries(state)
-    lines.extend(["", "## Session Preamble", "", "| Harness | Sessions | Median | p90 | Last |", "|---|---:|---:|---:|---:|"])
+    lines.extend(
+        [
+            "",
+            "## Session Preamble",
+            "",
+            f"| Harness | Sessions | Median | Recent ({RECENT_PREAMBLE_WINDOW}) | p90 | Last |",
+            "|---|---:|---:|---:|---:|---:|",
+        ]
+    )
     preamble_rows: list[str] = ["antigravity"]
     if CLAUDE_CLI_HARNESS in summaries or CLAUDE_DESKTOP_HARNESS in summaries:
         preamble_rows.extend([CLAUDE_CLI_HARNESS, CLAUDE_DESKTOP_HARNESS])
@@ -665,10 +690,11 @@ def render_usage_sections(
         summary = summaries.get(harness)
         if summary and summary["sessions"]:
             lines.append(
-                f"| `{harness}` | {summary['sessions']:,} | {summary['median']:,} | {summary['p90']:,} | {summary['last']:,} |"
+                f"| `{harness}` | {summary['sessions']:,} | {summary['median']:,} | "
+                f"{summary['recent_median']:,} | {summary['p90']:,} | {summary['last']:,} |"
             )
         else:
-            lines.append(f"| `{harness}` | no data | | | |")
+            lines.append(f"| `{harness}` | no data | | | | |")
     claude_median = summaries.get("claude", {}).get("median", 0)
     attribution = _attribution(state)
     lines.extend(_breakdown_lines(attribution, claude_median, breakdown))
