@@ -440,9 +440,13 @@ def accumulate_codex_preamble(pending: dict[str, Any] | None, record: dict[str, 
         state = {"tools": None, "messages": None, "seen": []}
 
     if ptype == "additional_tools":
-        parts = _codex_sizes_to_parts(_codex_tools_parts(payload.get("tools")), CODEX_TOOL_BYTES_PER_TOKEN)
+        raw_tools = payload.get("tools")
+        parts = _codex_sizes_to_parts(_codex_tools_parts(raw_tools), CODEX_TOOL_BYTES_PER_TOKEN)
         if parts:
             state["tools"] = parts
+            return state
+        if isinstance(raw_tools, list) and state["tools"] is not None:
+            state["tools"] = None
             return state
         return pending
     seen = state["seen"]
@@ -465,6 +469,8 @@ def finalize_codex_preamble(pending: dict[str, Any] | None) -> dict[str, dict[st
 
 def cap_parts_to_measured(measured: int, components: Any) -> dict[str, dict[str, int]]:
     """Clean component counts and proportionally scale them down when their sum exceeds `measured`."""
+    if measured <= 0:
+        return {}
     cleaned: dict[str, dict[str, int]] = {}
     if isinstance(components, dict):
         for comp, keys in components.items():
@@ -474,7 +480,7 @@ def cap_parts_to_measured(measured: int, components: Any) -> dict[str, dict[str,
             if row:
                 cleaned[str(comp)] = row
     total = sum(val for row in cleaned.values() for val in row.values())
-    if measured <= 0 or total <= measured or not total:
+    if total <= measured or not total:
         return cleaned
     scaled: dict[str, dict[str, int]] = {}
     for comp, row in cleaned.items():

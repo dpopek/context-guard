@@ -211,7 +211,7 @@ function hasContextGuardHook(configPath) {
     const parsed = JSON.parse(fs.readFileSync(configPath, "utf8"));
     if (!parsed || typeof parsed !== "object" || !parsed.hooks || typeof parsed.hooks !== "object") return false;
     const serialized = JSON.stringify(parsed.hooks);
-    return serialized.includes("pre_tool_use.py") || serialized.includes("context-guard");
+    return serialized.includes("pre_tool_use.py");
   } catch (_err) {
     return false;
   }

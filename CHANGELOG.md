@@ -5,6 +5,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 
 ## [Unreleased]
 
+## [4.2.1] - 2026-11-14
+
+### Fixed
+- **IDE Codex & last-session cohorts:** Read `codex_preamble_parts` and resolve `preambleLast` to the latest cohort.
+- **IDE 30d verdict parity:** Intersect common `by_day` window, count denial repeats, and use `<0.5%` threshold.
+- **IDE refresh & doctor hardening:** Require `pre_tool_use.py` in `probeDoctor`, warn on failure, and guard non-numeric counts.
+- **Codex preamble edge cases:** Clear tool snapshot on `tools: []` and return `{}` from `cap_parts_to_measured` if `<= 0`.
+
 ## [4.2.0] - 2026-11-14
 
 ### Added

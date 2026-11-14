@@ -561,9 +561,20 @@ def test_accumulate_codex_preamble_replaces_tool_snapshots_and_deduplicates_mess
     assert "session_context" in finalized.get("other", {})
     assert "core" not in finalized.get("system_prompt", {})
 
+    empty_snap = {"type": "response_item", "payload": {"type": "additional_tools", "tools": []}}
+    assert accumulate_codex_preamble(None, empty_snap) is None
+    cleared = accumulate_codex_preamble(pending, empty_snap)
+    cleared_final = finalize_codex_preamble(cleared)
+    assert cleared_final is not None
+    assert "mcp:alpha" not in cleared_final.get("deferred_tools", {})
+    assert "mcp:demo_srv" in cleared_final["deferred_tools"]
+
 
 def test_codex_preamble_parts_never_exceed_measured_tokens(tmp_path: Path) -> None:
     import json
+
+    assert cap_parts_to_measured(0, {"skills": {"a": 50}}) == {}
+    assert cap_parts_to_measured(-10, {"skills": {"a": 50}}) == {}
 
     legacy_entry = {
         "measured": 40_000,

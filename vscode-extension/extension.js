@@ -184,6 +184,7 @@ function triggerBackgroundUsageRefresh() {
   const tryExec = (idx) => {
     if (idx >= cands.length) {
       refreshUsageInFlight = false;
+      console.warn("context-guard: background usage refresh not started: no python candidate");
       return;
     }
     const [pyBin, prefixArgs] = cands[idx];
@@ -193,7 +194,11 @@ function triggerBackgroundUsageRefresh() {
         return;
       }
       refreshUsageInFlight = false;
-      if (!err && statusBarItem) updateStatusBar();
+      if (err) {
+        console.warn(`context-guard: background usage refresh failed: ${err}`);
+        return;
+      }
+      if (statusBarItem) updateStatusBar();
     });
   };
   tryExec(0);

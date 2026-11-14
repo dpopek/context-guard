@@ -140,7 +140,7 @@ def test_probe_doctor_reads_configs_and_fails_open(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     (home_dir / ".cursor" / "hooks.json").write_text("{not-json", encoding="utf-8")
-    (home_dir / ".codex" / "hooks.json").write_text("{}", encoding="utf-8")
+    (home_dir / ".codex" / "hooks.json").write_text(json.dumps({"hooks": {"note": "context-guard"}}), encoding="utf-8")
 
     missing_root = tmp_path / "absent"
     script = r"""
@@ -195,7 +195,7 @@ def test_renderers_surface_v4_insights_with_csp_and_escaping() -> None:
         "preambleLast": {"harness": "claude<script>", "last": 19_200, "recentMedian": 18_800, "sessions": 12},
         "preambleByHarness": {
             "antigravity": {"sessions": 12, "median": 31_000, "recentMedian": 18_800, "last": 19_200},
-            "claude (cli)": {"sessions": 4, "median": 30_100, "recentMedian": 29_900, "last": 29_800},
+            "claude (cli)": {"sessions": "bad", "median": 30_100, "recentMedian": 29_900, "last": 29_800},
         },
         "sunsetVerdict": {
             "windowDays": 31,
@@ -232,3 +232,193 @@ console.log(JSON.stringify({ md, sidebar, webview, reexported: typeof ext.render
     assert "Content-Security-Policy" in res["webview"]
     assert "antigravity" in res["webview"]
     assert "claude (cli)" in res["webview"]
+    assert "NaN" not in res["webview"]
+
+
+def test_v4_insights_codex_cohorts_sunset_parity_and_refresh_runtime(tmp_path: Path) -> None:
+    stats_codex = {
+        "saved_tokens": 50_000,
+        "by_day": {"2026-10-01": {"saved_bytes": 4_000}, "2026-11-05": {"saved_bytes": 0}},
+        "last_event": {"kind": "outline_pulls", "harness": "codex", "saved_tokens": 200},
+    }
+    usage_codex = {
+        "totals": {"codex|gpt": {"input": 100_000, "cache_read": 900_000, "cache_write": 0, "events": 10, "total_only": 0}},
+        "by_day": {
+            "2026-10-01": {"codex": {"input": 100_000, "cache_read": 400_000, "cache_write": 0}},
+            "2026-11-05": {"codex": {"input": 100_000, "cache_read": 400_000, "cache_write": 0}},
+        },
+        "preamble_parts": [
+            {"measured": 30_500, "components": {"skills": {"superpowers": 2000}}},
+            {"measured": 82_000, "components": {"deferred_tools": {"mcp:ccd_session": 200}}},
+        ],
+        "codex_preamble_parts": [
+            {"measured": 22_000, "cohort": "codex (cli)", "components": {"system_prompt": {"core": 5_000}}},
+            {"measured": 41_000, "cohort": "codex (desktop)", "components": {"deferred_tools": {"mcp:app": 10_000}}},
+        ],
+    }
+    stats_claude = {
+        "saved_tokens": 10_000,
+        "by_day": {"2026-11-12": {"saved_bytes": 4_000}, "2026-11-13": {"saved_bytes": 4_000}},
+        "last_event": {"kind": "outline_pulls", "harness": "claude", "saved_tokens": 100},
+    }
+    usage_backfill = {
+        **usage_codex,
+        "started_at": "2026-09-01T00:00:00Z",
+        "by_day": {
+            "2026-09-01": {"claude": {"input": 500_000, "cache_read": 0, "cache_write": 0}},
+            "2026-11-12": {"claude": {"input": 100_000, "cache_read": 400_000, "cache_write": 0}},
+            "2026-11-13": {"claude": {"input": 100_000, "cache_read": 400_000, "cache_write": 0}},
+        },
+    }
+    stats_disjoint = {"saved_tokens": 5_000, "by_day": {"2026-11-14": {"saved_bytes": 4_000}}}
+    usage_disjoint = {
+        "by_day": {"2026-10-01": {"claude": {"input": 100_000, "cache_read": 0, "cache_write": 0}}},
+    }
+    outcomes_repeats = {
+        "schema_version": 3,
+        "by_key": {"codex|gpt|outline": {"total": 2, "repeats": 3}},
+    }
+
+    script = r"""
+const path = require("path");
+const vm = require(path.resolve(process.argv[1], "view_model.js"));
+const [sCodex, uCodex, sClaude, uBackfill, sDisjoint, uDisjoint, outRep] = process.argv.slice(2).map((s) => JSON.parse(s));
+console.log(JSON.stringify({
+  codexLowShare: vm.summarizeV4Insights(sCodex, uCodex, null, null),
+  backfillAndClaude: vm.summarizeV4Insights(sClaude, uBackfill, outRep, null),
+  disjoint: vm.summarizeV4Insights(sDisjoint, uDisjoint, null, null),
+}));
+"""
+    res = _run_node(
+        script,
+        str(EXT_DIR),
+        json.dumps(stats_codex),
+        json.dumps(usage_codex),
+        json.dumps(stats_claude),
+        json.dumps(usage_backfill),
+        json.dumps(stats_disjoint),
+        json.dumps(usage_disjoint),
+        json.dumps(outcomes_repeats),
+    )
+    codex_low = res["codexLowShare"]
+    assert codex_low["preambleByHarness"]["codex (cli)"]["last"] == 22_000
+    assert codex_low["preambleByHarness"]["codex (desktop)"]["last"] == 41_000
+    assert codex_low["preambleLast"]["harness"] == "codex (desktop)"
+    assert codex_low["preambleLast"]["last"] == 41_000
+    assert codex_low["sunsetVerdict"]["windowDays"] == 36
+    assert 0 < codex_low["sunsetVerdict"]["netSharePct"] < 0.5
+    assert codex_low["sunsetVerdict"]["status"] == "sunset_candidate"
+
+    backfill = res["backfillAndClaude"]
+    assert backfill["preambleLast"]["harness"] == "claude (desktop)"
+    assert backfill["preambleLast"]["last"] == 82_000
+    assert backfill["sunsetVerdict"]["windowDays"] == 2
+    assert backfill["sunsetVerdict"]["status"] == "collecting_30d_window"
+    assert backfill["sunsetVerdict"]["denials"] == 5
+
+    disjoint = res["disjoint"]
+    assert disjoint["sunsetVerdict"]["windowDays"] == 0
+    assert disjoint["sunsetVerdict"]["netSaved"] <= 0
+    assert disjoint["sunsetVerdict"]["status"] == "collecting_30d_window"
+
+    plugin_dir = tmp_path / "cg-plugin"
+    (plugin_dir / "bin").mkdir(parents=True)
+    (plugin_dir / "telemetry").mkdir(parents=True)
+    (plugin_dir / "plugin.json").write_text('{"version":"3.99.0"}\n', encoding="utf-8")
+    (plugin_dir / "bin" / "cg_status.py").write_text("# stub\n", encoding="utf-8")
+    (plugin_dir / "telemetry" / "stats.json").write_text('{"saved_tokens":100}\n', encoding="utf-8")
+    (plugin_dir / "telemetry" / "update.json").write_text(
+        '{"state":"up_to_date","checked_at":"2099-01-01T00:00:00Z"}\n', encoding="utf-8"
+    )
+
+    runtime_script = r"""
+const Module = require("module");
+const path = require("path");
+const fs = require("fs");
+const childProcess = require("child_process");
+
+const registered = {};
+const unwatched = [];
+const warns = [];
+const execCalls = [];
+let pendingCb = null;
+
+console.warn = (...args) => warns.push(args.join(" "));
+fs.watchFile = () => {};
+fs.unwatchFile = (target) => unwatched.push(path.basename(target));
+childProcess.execFile = (bin, args, opts, cb) => {
+  execCalls.push({ bin, args: [...args] });
+  if (args.includes("--usage")) {
+    pendingCb = cb;
+  } else {
+    cb(null, "", "");
+  }
+};
+
+const origLoad = Module._load;
+Module._load = function(request, parent, isMain) {
+  if (request === "vscode") {
+    return {
+      MarkdownString: class { constructor() { this.value = ""; } appendMarkdown(s) { this.value += s; } },
+      ThemeColor: class { constructor(id) { this.id = id; } },
+      StatusBarAlignment: { Right: 2 },
+      ViewColumn: { One: 1 },
+      ProgressLocation: { Notification: 15 },
+      window: {
+        createStatusBarItem: () => ({ show() {}, text: "", tooltip: "", name: "", command: "" }),
+        registerWebviewViewProvider: () => ({ dispose() {} }),
+        showInformationMessage: async () => undefined,
+      },
+      commands: {
+        registerCommand: (id, fn) => { registered[id] = fn; return { dispose() {} }; },
+      },
+    };
+  }
+  return origLoad.apply(this, arguments);
+};
+
+process.env.CONTEXT_GUARD_HOME = process.argv[2];
+const ext = require(path.resolve(process.argv[1], "extension.js"));
+const context = { subscriptions: [] };
+ext.activate(context);
+
+registered["contextGuard.refresh"]();
+registered["contextGuard.refresh"]();
+const afterSecondRefresh = execCalls.length;
+const firstErr = new Error("missing");
+firstErr.code = "ENOENT";
+pendingCb(firstErr);
+const afterFallback = execCalls.length;
+while (pendingCb && execCalls.length < 12) {
+  const cb = pendingCb;
+  pendingCb = null;
+  cb(new Error("boom"));
+}
+registered["contextGuard.refresh"]();
+const restartedCount = execCalls.length;
+if (pendingCb) pendingCb(null, "", "");
+ext.deactivate();
+
+console.log(JSON.stringify({
+  afterSecondRefresh,
+  afterFallback,
+  restartedCount,
+  warns,
+  unwatched,
+  lastArgs: execCalls[0] ? execCalls[0].args : [],
+}));
+"""
+    proc = subprocess.run(
+        ["node", "-e", runtime_script, str(EXT_DIR), str(plugin_dir)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+    rt = json.loads(proc.stdout.strip())
+    assert rt["afterSecondRefresh"] == 1
+    assert rt["afterFallback"] == 2
+    assert rt["restartedCount"] == rt["afterFallback"] + 1
+    assert any("context-guard:" in w for w in rt["warns"])
+    assert "--usage" in rt["lastArgs"]
+    assert {"stats.json", "update.json", "token_usage.json"}.issubset(set(rt["unwatched"]))

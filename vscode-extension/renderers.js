@@ -281,7 +281,7 @@ function renderWebviewHtml(version, stats, insights = null) {
       const preRows = preEntries
         .map(([h, row]) => {
           const r = row && typeof row === "object" ? row : {};
-          return `<tr><td><code>${escapeHtml(h)}</code></td><td>${Number(r.sessions || 0).toLocaleString()}</td><td>${formatCompactTokens(r.median)}</td><td>${formatCompactTokens(r.recentMedian)}</td><td>${formatCompactTokens(r.last)}</td></tr>`;
+          return `<tr><td><code>${escapeHtml(h)}</code></td><td>${(Number(r.sessions) || 0).toLocaleString()}</td><td>${formatCompactTokens(r.median)}</td><td>${formatCompactTokens(r.recentMedian)}</td><td>${formatCompactTokens(r.last)}</td></tr>`;
         })
         .join("\n      ");
       preambleSection = `

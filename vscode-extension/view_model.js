@@ -240,9 +240,12 @@ function summarizeSeries(series) {
 function buildPreambleInsights(stats, norm, tokenUsage) {
   const preambleRaw = tokenUsage && typeof tokenUsage.preamble === "object" ? tokenUsage.preamble : {};
   const parts = Array.isArray(tokenUsage && tokenUsage.preamble_parts) ? tokenUsage.preamble_parts : [];
+  const codexParts = Array.isArray(tokenUsage && tokenUsage.codex_preamble_parts) ? tokenUsage.codex_preamble_parts : [];
+  const codexBucket = (c) => (c === "codex (desktop)" ? "codex (desktop)" : "codex (cli)");
   const claudeCli = [];
   const claudeDesktop = [];
   const codexCohorts = {};
+  const lastCohortByBase = {};
   for (const entry of parts) {
     if (!entry || typeof entry !== "object") continue;
     const measured = clampNonNegativeInt(entry.measured);
@@ -250,13 +253,24 @@ function buildPreambleInsights(stats, norm, tokenUsage) {
     const cohort = typeof entry.cohort === "string" ? entry.cohort : "";
     const harness = typeof entry.harness === "string" ? entry.harness : "";
     if (cohort.startsWith("codex") || harness === "codex") {
-      const bucket = cohort || "codex";
+      const bucket = codexBucket(cohort);
       (codexCohorts[bucket] = codexCohorts[bucket] || []).push(measured);
+      lastCohortByBase.codex = bucket;
     } else if (hasClaudeDesktopMcp(entry.components)) {
       claudeDesktop.push(measured);
+      lastCohortByBase.claude = "claude (desktop)";
     } else {
       claudeCli.push(measured);
+      lastCohortByBase.claude = "claude (cli)";
     }
+  }
+  for (const entry of codexParts) {
+    if (!entry || typeof entry !== "object") continue;
+    const measured = clampNonNegativeInt(entry.measured);
+    if (!measured || !entry.components || typeof entry.components !== "object") continue;
+    const bucket = codexBucket(typeof entry.cohort === "string" ? entry.cohort : "");
+    (codexCohorts[bucket] = codexCohorts[bucket] || []).push(measured);
+    lastCohortByBase.codex = bucket;
   }
   const byHarness = {};
   if (claudeCli.length || claudeDesktop.length) {
@@ -267,9 +281,11 @@ function buildPreambleInsights(stats, norm, tokenUsage) {
     if (s) byHarness.claude = s;
   }
   if (Object.keys(codexCohorts).length) {
-    for (const [k, vals] of Object.entries(codexCohorts)) {
-      const s = summarizeSeries(vals);
-      if (s) byHarness[k] = s;
+    for (const key of ["codex (cli)", "codex (desktop)"]) {
+      if (codexCohorts[key]) {
+        const s = summarizeSeries(codexCohorts[key]);
+        if (s) byHarness[key] = s;
+      }
     }
   } else if (Array.isArray(preambleRaw.codex)) {
     const s = summarizeSeries(preambleRaw.codex);
@@ -284,6 +300,9 @@ function buildPreambleInsights(stats, norm, tokenUsage) {
     stats && stats.last_event && typeof stats.last_event.harness === "string" ? stats.last_event.harness : "";
   const preferred = rawLastHarness || (norm.lastEvent && norm.lastEvent.harness) || "";
   let lastKey = preferred && byHarness[preferred] ? preferred : null;
+  if (!lastKey && preferred && lastCohortByBase[preferred] && byHarness[lastCohortByBase[preferred]]) {
+    lastKey = lastCohortByBase[preferred];
+  }
   if (!lastKey && preferred) {
     lastKey = Object.keys(byHarness).find((k) => k === preferred || k.startsWith(`${preferred} (`)) || null;
   }
@@ -313,41 +332,50 @@ function summarizeCacheHit(tokenUsage) {
   return { cacheHitPct: pct, cacheHitLabel: `${pct.toFixed(1)}%` };
 }
 
+function dayDiffInclusive(since, until) {
+  if (!since || !until || until < since) return 0;
+  return Math.max(0, Math.round((Date.parse(`${until}T00:00:00Z`) - Date.parse(`${since}T00:00:00Z`)) / 86400000) + 1);
+}
+
+function sumUsageRealInput(usageByDay, usageDays, since, until) {
+  let total = 0;
+  for (const day of usageDays) {
+    if (day < since || (until && day > until)) continue;
+    for (const row of Object.values(usageByDay[day])) {
+      if (!row || typeof row !== "object") continue;
+      total += clampNonNegativeInt(row.input) + clampNonNegativeInt(row.cache_read) + clampNonNegativeInt(row.cache_write);
+    }
+  }
+  return total;
+}
+
 function computeSunsetVerdict(norm, tokenUsage, outcomes) {
   const isoRe = /^\d{4}-\d{2}-\d{2}$/;
   const usageByDay = tokenUsage && typeof tokenUsage.by_day === "object" ? tokenUsage.by_day : {};
-  const usageDays = Object.keys(usageByDay).filter((d) => isoRe.test(d)).sort();
+  const usageDays = Object.keys(usageByDay).filter((d) => isoRe.test(d) && usageByDay[d] && typeof usageByDay[d] === "object").sort();
   if (!usageDays.length) return null;
-  const startedDay =
-    typeof (tokenUsage && tokenUsage.started_at) === "string" && isoRe.test(tokenUsage.started_at.slice(0, 10))
-      ? tokenUsage.started_at.slice(0, 10)
-      : usageDays[0];
-  const since = startedDay <= usageDays[usageDays.length - 1] ? startedDay : usageDays[0];
-  const until = usageDays[usageDays.length - 1];
-  const windowDays = Math.max(
-    1,
-    Math.round((Date.parse(`${until}T00:00:00Z`) - Date.parse(`${since}T00:00:00Z`)) / 86400000) + 1
-  );
+  const statsDays = Object.keys(norm.byDay).filter((d) => isoRe.test(d) && norm.byDay[d] && typeof norm.byDay[d] === "object").sort();
+  let windowDays = 0;
   let saved = 0;
-  let hasStatsDay = false;
-  for (const [day, row] of Object.entries(norm.byDay)) {
-    if (isoRe.test(day) && day >= since && day <= until && row && typeof row === "object") {
-      saved += Math.round((Number(row.saved_bytes) || 0) / 4);
-      hasStatsDay = true;
-    }
-  }
-  if (!hasStatsDay) {
-    saved = Math.max(0, clampNonNegativeInt(norm.savedTokens) - clampNonNegativeInt(tokenUsage && tokenUsage.saved_tokens_at_start));
-  }
   let realInput = 0;
-  for (const day of usageDays) {
-    if (day < since || day > until) continue;
-    const perHarness = usageByDay[day];
-    if (!perHarness || typeof perHarness !== "object") continue;
-    for (const row of Object.values(perHarness)) {
-      if (!row || typeof row !== "object") continue;
-      realInput += clampNonNegativeInt(row.input) + clampNonNegativeInt(row.cache_read) + clampNonNegativeInt(row.cache_write);
+  if (statsDays.length) {
+    const since = statsDays[0] > usageDays[0] ? statsDays[0] : usageDays[0];
+    const until = statsDays[statsDays.length - 1] < usageDays[usageDays.length - 1] ? statsDays[statsDays.length - 1] : usageDays[usageDays.length - 1];
+    if (since <= until) {
+      windowDays = dayDiffInclusive(since, until);
+      let savedBytesSum = 0;
+      for (const d of statsDays) {
+        if (d >= since && d <= until) savedBytesSum += Math.trunc(Number(norm.byDay[d].saved_bytes) || 0);
+      }
+      saved = Math.floor(Math.max(0, savedBytesSum) / 4);
+      realInput = sumUsageRealInput(usageByDay, usageDays, since, until);
     }
+  } else {
+    const rawStart = tokenUsage && typeof tokenUsage.started_at === "string" ? tokenUsage.started_at.slice(0, 10) : "";
+    const since = isoRe.test(rawStart) ? rawStart : usageDays[0];
+    windowDays = dayDiffInclusive(since, usageDays[usageDays.length - 1]);
+    saved = Math.max(0, clampNonNegativeInt(norm.savedTokens) - clampNonNegativeInt(tokenUsage && tokenUsage.saved_tokens_at_start));
+    realInput = sumUsageRealInput(usageByDay, usageDays, since, null);
   }
   let denials = 0;
   let denialTokens = 0;
@@ -367,7 +395,7 @@ function computeSunsetVerdict(norm, tokenUsage, outcomes) {
       const kind = parts[parts.length - 1];
       if (!DENIAL_KINDS.has(kind)) continue;
       const harness = parts[0];
-      const count = clampNonNegativeInt(row.total);
+      const count = clampNonNegativeInt(row.total) + clampNonNegativeInt(row.repeats);
       if (!count) continue;
       denials += count;
       if (callsByHarness[harness] > 0 && cacheReadByHarness[harness] > 0) {
@@ -375,12 +403,12 @@ function computeSunsetVerdict(norm, tokenUsage, outcomes) {
       }
     }
   }
-  const roundedDenialTokens = Math.round(denialTokens);
+  const roundedDenialTokens = Math.floor(denialTokens);
   const netSaved = saved - roundedDenialTokens;
   const denom = realInput + Math.max(0, netSaved);
   const netSharePct = denom > 0 ? Math.round((netSaved / denom) * 10000) / 100 : 0;
   const status =
-    windowDays < TARGET_WINDOW_DAYS ? "collecting_30d_window" : netSaved <= 0 ? "sunset_candidate" : "net_positive";
+    windowDays < TARGET_WINDOW_DAYS ? "collecting_30d_window" : netSharePct < 0.5 ? "sunset_candidate" : "net_positive";
   return { windowDays, targetDays: TARGET_WINDOW_DAYS, netSaved, netSharePct, denials, denialTokens: roundedDenialTokens, status };
 }
 
