@@ -1,4 +1,4 @@
-# Context-Guard (v4.1.3)
+# Context-Guard (v4.1.4)
 
 Zero-prompt security guard, silent range-trim, machine-artifact unwrapper, and multi-harness telemetry plugin for **Google Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex CLI/App** across **macOS, Linux, and Windows**.
 
@@ -104,35 +104,42 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 
 ## Installation & Multi-Harness Setup
 
-```bash
-# 1. Clone into Antigravity Plugins Directory (or unpack dist/context-guard-v4.1.3.zip)
-git clone https://github.com/dpopek/context-guard.git ~/.gemini/config/plugins/context-guard
+Context-Guard runs from wherever you clone it: the installer points every harness hook at that checkout. Pick any directory; `~/.gemini` is needed only if you use Antigravity.
 
-# 2. Install hooks & advox.context-guard-statusbar-4.1.3 extension across all harnesses
-python3 ~/.gemini/config/plugins/context-guard/bin/install_harnesses.py --install
+```bash
+# 1. Clone anywhere (or unpack dist/context-guard-v4.1.4.zip there)
+CG_DIR=~/tools/context-guard
+git clone https://github.com/dpopek/context-guard.git "$CG_DIR"
+
+# 2. Install hooks (Claude Code, Codex, Cursor, Antigravity) & advox.context-guard-statusbar-4.1.4 extension
+python3 "$CG_DIR/bin/install_harnesses.py" --install
 
 # Check status, preview dry-run, or uninstall cleanly
-python3 ~/.gemini/config/plugins/context-guard/bin/install_harnesses.py --status
-python3 ~/.gemini/config/plugins/context-guard/bin/install_harnesses.py --install --dry-run
-python3 ~/.gemini/config/plugins/context-guard/bin/install_harnesses.py --uninstall
+python3 "$CG_DIR/bin/install_harnesses.py" --status
+python3 "$CG_DIR/bin/install_harnesses.py" --install --dry-run
+python3 "$CG_DIR/bin/install_harnesses.py" --uninstall
 ```
+
+- **Antigravity users:** clone into Antigravity's plugin directory instead (`CG_DIR=~/.gemini/config/plugins/context-guard`) so Antigravity loads it as a plugin.
+- **Moving the checkout:** hooks store the checkout path, so re-run `--install` after moving or re-cloning it.
+- `CG_DIR` is only a shell variable for these commands; `CONTEXT_GUARD_HOME` overrides the checkout location at runtime for the installer and every hook.
 
 ---
 
 ## CLI Reference (`cg_status.py` & `outline.py`)
 
 ```bash
-python3 ~/.gemini/config/plugins/context-guard/bin/cg_status.py --short
-python3 ~/.gemini/config/plugins/context-guard/bin/cg_status.py --claude-hud
-python3 ~/.gemini/config/plugins/context-guard/bin/cg_status.py --markdown
-python3 ~/.gemini/config/plugins/context-guard/bin/cg_status.py --json
-python3 ~/.gemini/config/plugins/context-guard/bin/cg_status.py --outcomes
-python3 ~/.gemini/config/plugins/context-guard/bin/cg_status.py --usage
-python3 ~/.gemini/config/plugins/context-guard/bin/cg_status.py --doctor
-python3 ~/.gemini/config/plugins/context-guard/bin/cg_status.py --json \
+python3 "$CG_DIR/bin/cg_status.py" --short
+python3 "$CG_DIR/bin/cg_status.py" --claude-hud
+python3 "$CG_DIR/bin/cg_status.py" --markdown
+python3 "$CG_DIR/bin/cg_status.py" --json
+python3 "$CG_DIR/bin/cg_status.py" --outcomes
+python3 "$CG_DIR/bin/cg_status.py" --usage
+python3 "$CG_DIR/bin/cg_status.py" --doctor
+python3 "$CG_DIR/bin/cg_status.py" --json \
   --stats-path /tmp/stats.json --outcomes-path /tmp/outcomes.json \
   --usage-path /tmp/token_usage.json --update-path /tmp/update.json
-cg-outline path/to/file.py  # or python3 .../bin/outline.py
+cg-outline path/to/file.py  # or python3 "$CG_DIR/bin/outline.py"
 ```
 
 ---

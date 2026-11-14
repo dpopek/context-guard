@@ -8,7 +8,7 @@ Live token savings telemetry, status bar indicator, SVG donut ring side panel, a
 
 **Context-Guard** is a zero-prompt security guard, silent range-trim, and multi-harness telemetry plugin for **Google Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex CLI/App** using pure Python 3.9+ standard library hooks.
 
-This companion IDE extension reads `~/.gemini/config/plugins/context-guard/telemetry/stats.json` and `update.json` in real time to surface cumulative token and cost savings directly in your editor.
+This companion IDE extension reads `telemetry/stats.json` and `update.json` from your installed Context-Guard checkout (`plugin_root.json`, `CONTEXT_GUARD_HOME`, or `~/.gemini/config/plugins/context-guard`) in real time to surface cumulative token and cost savings directly in your editor.
 
 ---
 
@@ -58,20 +58,22 @@ This companion IDE extension reads `~/.gemini/config/plugins/context-guard/telem
 ## CLI Utilities
 
 ```bash
+CG_DIR="${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}"
+
 # Short summary, Claude HUD, full Markdown report, or raw JSON
-python3 ~/.gemini/config/plugins/context-guard/bin/cg_status.py --short
-python3 ~/.gemini/config/plugins/context-guard/bin/cg_status.py --claude-hud
-python3 ~/.gemini/config/plugins/context-guard/bin/cg_status.py --markdown
-python3 ~/.gemini/config/plugins/context-guard/bin/cg_status.py --json
+python3 "$CG_DIR/bin/cg_status.py" --short
+python3 "$CG_DIR/bin/cg_status.py" --claude-hud
+python3 "$CG_DIR/bin/cg_status.py" --markdown
+python3 "$CG_DIR/bin/cg_status.py" --json
 
 # Intervention outcomes matrix, real token usage / preamble audit, and environment doctor
-python3 ~/.gemini/config/plugins/context-guard/bin/cg_status.py --outcomes
-python3 ~/.gemini/config/plugins/context-guard/bin/cg_status.py --usage
-python3 ~/.gemini/config/plugins/context-guard/bin/cg_status.py --doctor
+python3 "$CG_DIR/bin/cg_status.py" --outcomes
+python3 "$CG_DIR/bin/cg_status.py" --usage
+python3 "$CG_DIR/bin/cg_status.py" --doctor
 
 # Install, uninstall, preview (--dry-run), or check multi-harness status
-python3 ~/.gemini/config/plugins/context-guard/bin/install_harnesses.py --install
-python3 ~/.gemini/config/plugins/context-guard/bin/install_harnesses.py --install --dry-run
-python3 ~/.gemini/config/plugins/context-guard/bin/install_harnesses.py --status
-python3 ~/.gemini/config/plugins/context-guard/bin/install_harnesses.py --uninstall
+python3 "$CG_DIR/bin/install_harnesses.py" --install
+python3 "$CG_DIR/bin/install_harnesses.py" --install --dry-run
+python3 "$CG_DIR/bin/install_harnesses.py" --status
+python3 "$CG_DIR/bin/install_harnesses.py" --uninstall
 ```

@@ -5,6 +5,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 
 ## [Unreleased]
 
+## [4.1.4] - 2026-11-14
+
+### Changed
+- **Checkout-neutral docs:** Document installing from any `$CG_DIR` path in `README.md`, extension docs, and `SKILL.md`.
+- **Node 24 GitHub Actions:** Upgrade `checkout`, `setup-python`, and `setup-node` to `@v7` (`node24` runtime) in `ci.yml`.
+
 ## [4.1.3] - 2026-11-14
 
 ### Fixed

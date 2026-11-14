@@ -9,9 +9,11 @@ Use this skill when the user asks to inspect token savings, audit session preamb
 
 ## Workflow
 
+If Context-Guard is cloned outside `~/.gemini/config/plugins/context-guard`, run `bin/cg_status.py` from the checkout directory two levels above this `SKILL.md` (or set `CONTEXT_GUARD_HOME`).
+
 1. **Run the Full Markdown Token & Preamble Report:**
    ```bash
-   python3 ~/.gemini/config/plugins/context-guard/bin/cg_status.py --markdown
+   python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg_status.py" --markdown
    ```
    Review:
    - Cumulative token reduction (`saved_tokens`, `reduction_pct`, `200k` context windows saved).
@@ -22,13 +24,13 @@ Use this skill when the user asks to inspect token savings, audit session preamb
 
 2. **Inspect Intervention Outcomes (`outcomes.json`):**
    ```bash
-   python3 ~/.gemini/config/plugins/context-guard/bin/cg_status.py --outcomes
+   python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg_status.py" --outcomes
    ```
    Review the v3 (`SCHEMA_VERSION = 3`) 7-column breakdown: `Interventions`, `Targeted follow-up` %, `Full bypass` %, and `Shell bypass` % per `Harness`, `Model`, and `Kind` (`outline`, `outline_pull`, `range_trim`, `cli_rewrite`; follow-up/bypass rates apply to `outline` and `outline_pull`, and bounded Codex CLI shell reads via `sed -n`, `head`, or `tail` `<= 250` lines resolve as `targeted_followup` rather than `shell_bypass`).
 
 3. **Run Environment & Skill Hygiene Doctor:**
    ```bash
-   python3 ~/.gemini/config/plugins/context-guard/bin/cg_status.py --doctor
+   python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg_status.py" --doctor
    ```
    Verify:
    - Python runtime (`>= 3.9`), file locking (`flock`), writable telemetry directory, and harness registration (`antigravity`, `claude`, `cursor`, `codex`).
