@@ -239,7 +239,7 @@ def test_antigravity_unbounded_read_ignores_cached_lines_above_harness_cap(
         state_dir=state_dir,
     )
     assert res_unbounded == {"decision": "allow"}
-    assert load_telemetry_stats().get("ranges_trimmed", 0) == 0
+    assert load_telemetry_stats(Path(state_dir) / "telemetry_stats.json")["events"].get("ranges_trimmed", 0) == 0
 
 
 def test_telemetry_and_outcomes_resolve_default_paths_lazily(

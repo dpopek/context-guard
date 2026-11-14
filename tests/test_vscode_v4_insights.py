@@ -520,11 +520,34 @@ console.log(JSON.stringify({
   noStart: vm.summarizeV4Insights(statsNoDays, baseUsage, null, null).sunsetVerdict,
   badStart: vm.summarizeV4Insights(statsNoDays, { ...baseUsage, started_at: "2026-99-99T00:00:00Z" }, null, null).sunsetVerdict,
   validStart: vm.summarizeV4Insights(statsNoDays, { ...baseUsage, started_at: "2026-10-01T00:00:00Z" }, null, null).sunsetVerdict,
+  startedProrated: vm.summarizeV4Insights(statsNoDays, { ...baseUsage, started_at: "2026-11-10T00:00:00Z" }, outcomesNoVer, null).sunsetVerdict,
+  totalsLarger: vm.summarizeV4Insights(
+    { saved_tokens: 50000, by_day: { "2026-10-01": { saved_bytes: 100000 }, "2026-11-10": { saved_bytes: 100000 } } },
+    { ...baseUsage, totals: { "claude|opus": { input: 100000, cache_read: 1000000, cache_write: 0, events: 200 } } },
+    outcomesNoVer,
+    null,
+  ).sunsetVerdict,
   proratedUndefSchema: vm.summarizeV4Insights(statsOverlap, baseUsage, outcomesNoVer, null).sunsetVerdict,
   ignoredNullSchema: vm.summarizeV4Insights(statsOverlap, baseUsage, outcomesNullVer, null).sunsetVerdict,
 }));
 """
     res = _run_node(script, str(EXT_DIR))
+    from bin.usage_report import denial_overhead, savings_share, sunset_verdict
+
+    base_u = {
+        "totals": {"claude|opus": {"input": 100000, "cache_read": 1000000, "cache_write": 0, "events": 100}},
+        "by_day": {
+            "2026-10-01": {"claude": {"input": 50000, "cache_read": 500000, "cache_write": 0, "events": 75}},
+            "2026-11-10": {"claude": {"input": 50000, "cache_read": 500000, "cache_write": 0, "events": 25}},
+        },
+    }
+    py_started = sunset_verdict(
+        savings_share({**base_u, "started_at": "2026-11-10T00:00:00Z"}, 50000, {"saved_tokens": 50000}),
+        denial_overhead(base_u, {"by_key": {"claude|opus|outline": {"total": 10, "repeats": 0}}}),
+    )
+    assert res["startedProrated"]["netSaved"] == py_started["net_saved"] == 50000 - 2500
+    assert res["startedProrated"]["netSharePct"] == py_started["net_share_pct"]
+    assert res["totalsLarger"]["denialTokens"] == 5000
     assert res["noStart"]["windowDays"] == 0
     assert res["badStart"]["windowDays"] == 0
     assert res["validStart"]["windowDays"] == 41

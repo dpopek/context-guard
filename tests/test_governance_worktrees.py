@@ -469,3 +469,34 @@ def test_sed_readonly_check_linear_time_on_1200_slashes_and_preserves_workflow_s
         t0 = time.perf_counter()
         assert is_readonly_shell_command(pathological) is True
         assert (time.perf_counter() - t0) < 0.25
+
+
+def test_heredoc_wrappers_windows_exe_piped_heredoc_and_bypass_depth_cap(tmp_path: Path) -> None:
+    from hooks.governance_guard import check_shell_bypass_vectors, check_shell_protected_writes
+
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    payload = "from pathlib import Path\nPath('.githooks/pre-commit').write_text('x')\nPY"
+    for hdr in (
+        "timeout 30 python3 <<'PY'",
+        "timeout -k 5 -- 30 python3 <<'PY'",
+        "nice -n 10 python3 <<'PY'",
+        "env -i python3 <<'PY'",
+        "sudo -u root python3 <<'PY'",
+        "command -p python3 <<'PY'",
+        r"C:\Python312\python.exe <<'PY'",
+        "C:/Python312/python3.12.exe <<'PY'",
+        "cat <<'PY' | timeout 30 python3",
+        "cd /tmp\ncat <<'PY' | nice -n 5 python3 -",
+    ):
+        assert check_shell_protected_writes(f"{hdr}\n{payload}", cwd=str(repo), workspace_root=tmp_path) is not None, hdr
+
+    assert check_shell_bypass_vectors("command -v git") is None
+    assert check_shell_bypass_vectors("command -p -v git") is None
+    assert check_shell_bypass_vectors("command -p git commit -n -m bypass") is not None
+
+    nested = "true"
+    for _ in range(10):
+        nested = f'bash -c "{nested.replace(chr(92), chr(92) * 2).replace(chr(34), chr(92) + chr(34))}"'
+    hit = check_shell_bypass_vectors(nested)
+    assert hit is not None and "depth limit" in hit.lower()

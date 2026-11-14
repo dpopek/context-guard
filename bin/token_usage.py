@@ -315,9 +315,13 @@ def _event_from(
                         state["antigravity_last_model"] = sel_model
         if record.get("type") == "PLANNER_RESPONSE":
             state["antigravity_coverage"]["planner"] += 1
+            fag = cursor.setdefault("folded_ag_coverage", {})
+            fag["planner"] = nonneg_int(fag.get("planner")) + 1
         event = parse_antigravity_record(record, cursor.get("model") or default_model)
         if event is not None:
             state["antigravity_coverage"]["with_usage"] += 1
+            fag = cursor.setdefault("folded_ag_coverage", {})
+            fag["with_usage"] = nonneg_int(fag.get("with_usage")) + 1
             if event.model != UNKNOWN_MODEL:
                 cursor["model"] = event.model
                 if not cursor.get("is_sidechain"):
@@ -404,6 +408,9 @@ def _reconcile_rewind(state: dict[str, Any], key: str, cursor: dict[str, Any], k
             _pop_last_equal(state.get("preamble_parts"), pre["parts"])
         if "codex_parts" in pre:
             _pop_last_equal(state.get("codex_preamble_parts"), pre["codex_parts"])
+    folded_ag = cursor.get("folded_ag_coverage")
+    if isinstance(folded_ag, dict) and isinstance(state.get("antigravity_coverage"), dict):
+        _subtract_counts(state["antigravity_coverage"], folded_ag)
     old_ids = _id_list(state["seen_ids"].pop(key, None))
     known.subtract(old_ids)
     for mid in old_ids:

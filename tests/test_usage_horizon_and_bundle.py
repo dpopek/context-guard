@@ -414,3 +414,30 @@ def test_forked_claude_and_codex_rewind_reconciles_all_per_file_contributions(tm
     assert st["preamble"]["codex"] == [1200]
     assert [e["measured"] for e in st["codex_preamble_parts"]] == [1200]
 
+    # Antigravity rewind via os.replace rolls back planner/with_usage coverage counts:
+    ag_file = roots["antigravity"] / "conv-1" / ".system_generated" / "logs" / "transcript_full.jsonl"
+    ag_file.parent.mkdir(parents=True)
+    ag_tmp = ag_file.with_suffix(".tmp")
+    ag_tmp.write_text(
+        "\n".join([
+            json.dumps({"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>hi</USER_REQUEST>"}),
+            json.dumps({"step_index": 1, "type": "PLANNER_RESPONSE", "input_tokens": 100, "output_tokens": 20, "cache_read_tokens": 0}),
+            json.dumps({"step_index": 2, "type": "PLANNER_RESPONSE"}),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(ag_tmp, ag_file)
+    ingest_transcripts(st, roots)
+    assert st["antigravity_coverage"] == {"planner": 2, "with_usage": 1}
+
+    ag_tmp.write_text(
+        "\n".join([
+            json.dumps({"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>hi</USER_REQUEST>"}),
+            json.dumps({"step_index": 1, "type": "PLANNER_RESPONSE", "input_tokens": 50, "output_tokens": 5, "cache_read_tokens": 0}),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(ag_tmp, ag_file)
+    ingest_transcripts(st, roots)
+    assert st["antigravity_coverage"] == {"planner": 1, "with_usage": 1}
+

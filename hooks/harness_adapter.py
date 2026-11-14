@@ -246,7 +246,7 @@ def format_pre_tool_output(decision: dict[str, Any], norm: NormalizedToolCall) -
                 updated["notebook_path"] = overwrite["Path"]
         elif norm.canonical_tool in ("read_file", "view_file"):
             if "Path" in overwrite:
-                path_key = "path" if ("path" in updated and "file_path" not in updated) else "file_path"
+                path_key = next((k for k in ("file_path", "path", "Path") if k in updated), "file_path")
                 updated[path_key] = overwrite["Path"]
             if "StartLine" in overwrite or "EndLine" in overwrite:
                 new_start = int(overwrite.get("StartLine", norm.canonical_args.get("StartLine", 1)))

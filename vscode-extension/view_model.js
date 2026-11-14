@@ -382,11 +382,12 @@ function computeSunsetVerdict(norm, tokenUsage, outcomes) {
     const since = parseIsoDayUtcMs(rawStart) !== null ? rawStart : "";
     windowDays = since ? dayDiffInclusive(since, usageDays[usageDays.length - 1]) : 0;
     saved = Math.max(0, clampNonNegativeInt(norm.savedTokens) - clampNonNegativeInt(tokenUsage && tokenUsage.saved_tokens_at_start));
-    realInput = sumUsageWindow(usageByDay, usageDays, since, null).realInput;
+    const win = sumUsageWindow(usageByDay, usageDays, since, null);
+    realInput = win.realInput;
+    if (since) windowEvents = win.events;
   }
   let denials = 0;
   let denialTokens = 0;
-  let totalsEvents = 0;
   if (
     outcomes &&
     typeof outcomes === "object" &&
@@ -401,7 +402,6 @@ function computeSunsetVerdict(norm, tokenUsage, outcomes) {
       if (!row || typeof row !== "object") continue;
       const harness = String(tk).split("|")[0];
       const evCount = clampNonNegativeInt(row.events);
-      totalsEvents += evCount;
       callsByHarness[harness] = (callsByHarness[harness] || 0) + evCount;
       cacheReadByHarness[harness] = (cacheReadByHarness[harness] || 0) + clampNonNegativeInt(row.cache_read);
     }
@@ -419,7 +419,7 @@ function computeSunsetVerdict(norm, tokenUsage, outcomes) {
       }
     }
   }
-  const totalEvents = Math.max(totalsEvents, byDayTotalEvents);
+  const totalEvents = byDayTotalEvents;
   let roundedDenialTokens = Math.floor(denialTokens);
   if (windowEvents > 0 && windowEvents < totalEvents) {
     roundedDenialTokens = Math.floor((roundedDenialTokens * windowEvents) / totalEvents);

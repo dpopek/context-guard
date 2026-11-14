@@ -283,13 +283,13 @@ def savings_share(
     """Context-Guard saved tokens against the real input tokens of the same UTC days."""
     raw_usage_days = state.get("by_day")
     usage_by_day = (
-        {str(k): v for k, v in raw_usage_days.items() if isinstance(k, str) and len(k) == 10 and isinstance(v, dict)}
+        {str(k): v for k, v in raw_usage_days.items() if isinstance(k, str) and _ledger_day(k) is not None and isinstance(v, dict)}
         if isinstance(raw_usage_days, dict)
         else {}
     )
     raw_stats_days = stats_state.get("by_day") if isinstance(stats_state, dict) else None
     stats_by_day = (
-        {str(k): v for k, v in raw_stats_days.items() if isinstance(k, str) and len(k) == 10 and isinstance(v, dict)}
+        {str(k): v for k, v in raw_stats_days.items() if isinstance(k, str) and _ledger_day(k) is not None and isinstance(v, dict)}
         if isinstance(raw_stats_days, dict)
         else {}
     )
@@ -342,11 +342,14 @@ def savings_share(
     saved = max(0, saved_tokens_now - _row_int(state, "saved_tokens_at_start"))
     real_input = 0
     window_events = 0
-    for day, harnesses in (state.get("by_day") or {}).items():
-        if day >= since[:10] and isinstance(harnesses, dict):
+    for day, harnesses in usage_by_day.items():
+        if not since_prefix or day >= since_prefix:
             for row in harnesses.values():
+                if not isinstance(row, dict):
+                    continue
                 real_input += _row_int(row, "input") + _row_int(row, "cache_read") + _row_int(row, "cache_write")
-                window_events += _row_int(row, "events")
+                if since_prefix:
+                    window_events += _row_int(row, "events")
     until = max((d for d in usage_by_day if d >= since_prefix), default="") if since_day else ""
     denominator = real_input + saved
     share = round(saved / denominator * 100.0, 2) if denominator else 0.0

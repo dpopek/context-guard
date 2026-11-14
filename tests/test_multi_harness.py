@@ -610,3 +610,13 @@ def test_format_pre_tool_output_detects_path_key_and_respects_original_line_boun
     assert upd_end["EndLine"] == 40
     assert "offset" not in upd_end
     assert "limit" not in upd_end
+
+
+def test_non_antigravity_format_preserves_capital_path_key() -> None:
+    from hooks.harness_adapter import format_pre_tool_output, normalize_pre_tool_payload
+
+    norm = normalize_pre_tool_payload(
+        {"tool_name": "read_file", "tool_input": {"Path": "/old.py", "StartLine": 1, "EndLine": 50}, "session_id": "s4"}
+    )
+    fmt = format_pre_tool_output({"decision": "allow", "overwrite": {"Path": "/new.py"}}, norm)
+    assert fmt["hookSpecificOutput"]["updatedInput"] == {"Path": "/new.py", "StartLine": 1, "EndLine": 50}

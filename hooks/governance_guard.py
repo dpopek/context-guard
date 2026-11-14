@@ -56,7 +56,31 @@ _SCRIPT_PROTECTED_SUBSTRINGS = ("guard_manifest.json", "audit_guard_config.json"
 _SCRIPT_QUOTED_LIT_RE = re.compile(r"""['"]([^'"\n]{3,240})['"]""")
 _SHELL_VAR_REF_RE = re.compile(r"\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)")
 _LEADING_UNSET_VAR_RE = re.compile(r"^\$(?:\{[A-Za-z_]\w*\}|[A-Za-z_]\w*)(?:/|$)")
-_HEREDOC_EXEC_HEADER_RE = re.compile(r"(?:^|[;|&(`])\s*(?:[A-Za-z_]\w*=\S*\s+|(?:env|sudo|command|nohup|exec|builtin)\s+)*(?:[\w./-]+/)?(?:sh|bash|zsh|dash|ksh|python3?(?:\.\d+)?|node|ruby|perl|php|bq|eval|source)\b")
+_EXEC_HEREDOC_BINS = frozenset("sh bash zsh dash ksh node nodejs ruby perl php bq eval source . pwsh powershell".split())
+_WRAPPER_ARG_FLAGS: dict[str, frozenset[str]] = {
+    "timeout": frozenset(("-k", "-s", "--kill-after", "--signal")),
+    "nice": frozenset(("-n", "--adjustment")),
+    "sudo": frozenset("-u -g -C -D -R -T -h -p -r -t --user --group --chdir --chroot".split()),
+}
+
+
+def _is_exec_heredoc_bin(cmd_bin: str) -> bool:
+    return cmd_bin in _EXEC_HEREDOC_BINS or re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", cmd_bin) is not None
+
+
+def _unwrap_prefix_wrapper(words: list[str], idx: int, w_base: str) -> tuple[int, bool]:
+    j, arg_flags = idx, _WRAPPER_ARG_FLAGS.get(w_base, frozenset())
+    while j < len(words) and words[j].startswith("-"):
+        opt = words[j]
+        if opt == "--":
+            j += 1
+            break
+        if w_base == "command" and not opt.startswith("--") and ("v" in opt[1:] or "V" in opt[1:]):
+            return idx - 1, True
+        j += 2 if opt in arg_flags and j + 1 < len(words) else 1
+    if w_base == "timeout" and j < len(words) and re.fullmatch(r"\d+(?:\.\d+)?[smhd]?", words[j]):
+        j += 1
+    return j, False
 _BQ_PY_SDK_MARKERS = ("bigquery.client", "from google.cloud import bigquery", "google.cloud.bigquery", "read_gbq", "pandas_gbq", "to_gbq", "bigframes")
 _BQ_SUBCOMMANDS = frozenset("query head mk update cp extract load insert rm".split())
 _TRUTHY_FORBIDDEN_ENV = frozenset("HUSKY_SKIP_HOOKS PRE_COMMIT_ALLOW_NO_CONFIG ALLOW_ASSERTION_REDUCTION ALLOW_TEST_DELETION ALLOW_CUSTOM_VERIFY_CMD SKIP_AGENT_GUARD".split())
@@ -251,17 +275,13 @@ def _parse_shell_segments(command: str, include_subshells: bool = True) -> tuple
                     if m_e is not None:
                         env_pairs.append((m_e.group(1), m_e.group(2)))
                     idx += 1
+                    if w_base == "env" and words[idx - 1] == "--":
+                        break
                 idx = len(words) if is_export else idx
             elif w_base in _SHELL_PREFIX_WRAPPERS:
-                idx += 1
-                if w_base == "timeout":
-                    while idx < len(words) and words[idx].startswith("-"):
-                        idx += 2 if words[idx] in ("-k", "-s", "--kill-after", "--signal") and idx + 1 < len(words) else 1
-                    if idx < len(words) and re.fullmatch(r"\d+(?:\.\d+)?[smhd]?", words[idx]):
-                        idx += 1
-                elif w_base == "nice":
-                    while idx < len(words) and words[idx].startswith("-"):
-                        idx += 2 if words[idx] in ("-n", "--adjustment") and idx + 1 < len(words) else 1
+                idx, stop = _unwrap_prefix_wrapper(words, idx + 1, w_base)
+                if stop:
+                    break
             elif (m_l := _ENV_ASSIGN_RE.match(w)) is not None:
                 env_pairs.append((m_l.group(1), m_l.group(2)))
                 idx += 1
@@ -346,7 +366,9 @@ def _strip_heredoc_bodies(cmd: str, *, keep_exec_bodies: bool = False) -> str:
                 end_marker = None
             continue
         out.append(line)
-        if (m := _HEREDOC_START_RE.search(line)) and not (keep_exec_bodies and _HEREDOC_EXEC_HEADER_RE.search(line)):
+        if (m := _HEREDOC_START_RE.search(line)) and not (
+            keep_exec_bodies and any(seg.words and _is_exec_heredoc_bin(normalize_cmd_basename(seg.words[0])) for seg in _parse_shell_segments(line)[0])
+        ):
             end_marker = m.group(2) or m.group(3)
             allow_tabs = line[m.start() : m.end()].startswith("<<-")
     return "\n".join(out)
@@ -384,8 +406,10 @@ def _cp_dest_operands(args: tuple[str, ...]) -> list[str]:
     return targets or ([non_flags[-1]] if len(non_flags) >= 2 else non_flags)
 
 
-def check_shell_bypass_vectors(command: str) -> str | None:
+def check_shell_bypass_vectors(command: str, _depth: int = 0) -> str | None:
     """Return block reason if `command` contains git hook bypasses, forbidden env vars, mass staging, or circuit-breaker resets."""
+    if _depth > 8:
+        return "CONTEXT-GUARD GOVERNANCE BLOCK: Nested shell depth limit exceeded."
     stripped_cmd = _strip_heredoc_bodies(command, keep_exec_bodies=True) if command and command.strip() else ""
     for seg in (_parse_shell_segments(stripped_cmd)[0] if stripped_cmd else ()):
         cmd_bin = "export" if seg.is_export else (normalize_cmd_basename(seg.words[0]) if seg.words else "")
@@ -408,7 +432,7 @@ def check_shell_bypass_vectors(command: str) -> str | None:
                     return "CONTEXT-GUARD GOVERNANCE BLOCK: `--capture-baseline` is reserved for SessionStart hooks (`stop_guard_baseline_tamper`)."
                 if cmd_bin in ("python", "python3") and tok == "-c" and pos + 1 < len(seg.words) and "--capture-baseline" in seg.words[pos + 1]:
                     return "CONTEXT-GUARD GOVERNANCE BLOCK: `--capture-baseline` is reserved for SessionStart hooks (`stop_guard_baseline_tamper`)."
-                if cmd_bin in ("sh", "bash", "zsh", "dash", "ksh") and tok.startswith("-") and not tok.startswith("--") and "c" in tok[1:] and pos + 1 < len(seg.words) and (sub_hit := check_shell_bypass_vectors(seg.words[pos + 1])) is not None:
+                if cmd_bin in ("sh", "bash", "zsh", "dash", "ksh") and tok.startswith("-") and not tok.startswith("--") and "c" in tok[1:] and pos + 1 < len(seg.words) and (sub_hit := check_shell_bypass_vectors(seg.words[pos + 1], _depth=_depth + 1)) is not None:
                     return sub_hit
     return None
 
@@ -426,7 +450,9 @@ def check_shell_protected_writes(command: str, cwd: str | None = None, workspace
     eff_cwd: str | None = cwd
     shell_vars: dict[str, str] = {}
     heredoc_tail = stripped_cmd.split("\n", 1)[1] if "\n" in stripped_cmd else ""
-    for seg in _parse_shell_segments(stripped_cmd)[0]:
+    segs = _parse_shell_segments(stripped_cmd)[0]
+    has_cmd_hd = any(op in ("<<", "<<-") for s in segs for op, _ in s.redirects)
+    for seg in segs:
         eff_vars = {**shell_vars, **{k: _expand_shell_vars(v, shell_vars) for k, v in seg.env_pairs}}
         if not seg.words and seg.env_pairs:
             shell_vars.update(eff_vars)
@@ -443,8 +469,9 @@ def check_shell_protected_writes(command: str, cwd: str | None = None, workspace
             continue
         cmd_bin, args = normalize_cmd_basename(seg.words[0]), seg.words[1:]
         seg_head = " ".join((cmd_bin, *args, *(f"{op} {tgt}" for op, tgt in seg.redirects)))
-        if _INLINE_INTERP_RE.search(seg_head):
-            has_hd = any(op in ("<<", "<<-") for op, _ in seg.redirects)
+        pipe_hd = has_cmd_hd and bool(heredoc_tail) and _is_exec_heredoc_bin(cmd_bin) and (not args or args == ("-",))
+        if _INLINE_INTERP_RE.search(seg_head) or pipe_hd:
+            has_hd = pipe_hd or any(op in ("<<", "<<-") for op, _ in seg.redirects)
             seg_text = f"{seg_head}\n{heredoc_tail}" if (has_hd and heredoc_tail) else seg_head
             has_inline_write = (
                 any(ind in seg_text for ind in _SCRIPT_WRITE_INDICATORS)

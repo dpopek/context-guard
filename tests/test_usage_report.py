@@ -485,3 +485,28 @@ def test_sunset_verdict_empty_stats_without_started_at_and_denial_proration() ->
     assert verdict_prorated["net_saved"] == 20_000 - 3000
     assert verdict_prorated["window_days"] == 2
 
+    # Empty stats.by_day with invalid started_at matches missing started_at (lifetime input, unprorated denials)
+    share_bad_start = savings_share(
+        {"started_at": "2026-99-99T00:00:00Z", "by_day": {"2026-10-01": {"claude": {"input": 1000, "events": 10}}}},
+        saved_tokens_now=5000,
+        stats_state={"by_day": {"2026-99-99": {"saved_bytes": 99999}}},
+    )
+    assert share_bad_start["real_input"] == 1000
+    assert share_bad_start["window_events"] == 0
+    assert sunset_verdict(share_bad_start, {"denials": 2, "tokens": 1000})["net_saved"] == 4000
+
+    # Empty stats.by_day with valid started_at still prorates denials by started_at window events
+    share_started = savings_share(
+        {
+            "started_at": "2026-10-16T00:00:00Z",
+            "by_day": {
+                "2026-10-01": {"claude": {"input": 6000, "events": 60}},
+                "2026-11-14": {"claude": {"input": 3000, "events": 30}},
+            },
+        },
+        saved_tokens_now=20_000,
+        stats_state={"by_day": {}},
+    )
+    assert share_started["window_events"] == 30 and share_started["total_events"] == 90
+    assert sunset_verdict(share_started, {"denials": 3, "tokens": 9000})["net_saved"] == 17_000
+
