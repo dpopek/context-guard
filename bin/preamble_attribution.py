@@ -512,12 +512,27 @@ def _read_text_safe(path: Path) -> str:
         return ""
 
 
-def _skill_frontmatter(text: str) -> str:
+def extract_skill_frontmatter_summary(text: str) -> str:
+    """Extract `name:`, `description:`, and indented description continuations from SKILL.md frontmatter."""
     if not text.startswith("---"):
         return ""
     end = text.find("\n---", 3)
     block = text[3:end] if end > 0 else ""
-    return "\n".join(line for line in block.strip("\n").splitlines() if line.startswith(("name:", "description:")))
+    kept: list[str] = []
+    in_desc = False
+    for line in block.strip("\n").splitlines():
+        if line.startswith(("name:", "description:")):
+            kept.append(line)
+            in_desc = line.startswith("description:")
+        elif in_desc and line.startswith((" ", "\t")):
+            kept.append(line)
+        else:
+            in_desc = False
+    return "\n".join(kept)
+
+
+def _skill_frontmatter(text: str) -> str:
+    return extract_skill_frontmatter_summary(text)
 
 
 def _disabled_antigravity_mcp_servers(home: Path) -> set[str]:
@@ -571,6 +586,7 @@ def measure_antigravity_preamble(home: Path, project_dir: Path | None = None) ->
         sorted((home / ".gemini" / "config" / "skills").glob("*/SKILL.md"))
         + sorted((home / ".gemini" / "config" / "plugins").glob("*/skills/*/SKILL.md"))
         + sorted((home / ".gemini" / "antigravity" / "builtin" / "skills").glob("*/SKILL.md"))
+        + (sorted((project_dir / ".agents" / "skills").glob("*/SKILL.md")) if project_dir is not None else [])
     )
     skill_text = "\n".join(
         fm for fm in (_skill_frontmatter(_read_text_safe(p)) for p in skill_paths) if fm

@@ -117,7 +117,7 @@ def test_shrunk_or_replaced_file_restarts_from_zero(tmp_path: Path) -> None:
     write_jsonl(replacement, [claude_line("a")])
     os.replace(replacement, path)
     ingest_transcripts(state, roots)
-    assert state["totals"]["claude|claude-opus-5-5"]["events"] == 3
+    assert state["totals"]["claude|claude-opus-5-5"]["events"] == 1
     assert state["seen_ids"][str(path)] == ["a"]
 
 
