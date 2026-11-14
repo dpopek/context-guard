@@ -59,12 +59,19 @@ def _valid_model(raw: Any) -> str | None:
     return None
 
 
-def extract_antigravity_model_change(content: str) -> str | None:
-    """Extract the latest `<USER_SETTINGS_CHANGE>` `Model Selection` slug, ignoring `Auto`/`unknown`."""
+def _ag_settings_selection(content: str) -> str | None:
     if not isinstance(content, str) or "<USER_SETTINGS_CHANGE>" not in content:
         return None
     matches = _AG_MODEL_CHANGE_RE.findall("\n".join(_AG_SETTINGS_BLOCK_RE.findall(content)))
-    return _valid_model(matches[-1].split(". ", 1)[0].rstrip(". ").strip()) if matches else None
+    raw_slug = matches[-1].split(". ", 1)[0].rstrip(". ").strip() if matches else ""
+    norm = normalize_model_label(raw_slug) if raw_slug and not raw_slug.startswith("<") else UNKNOWN_MODEL
+    return None if norm == UNKNOWN_MODEL else norm
+
+
+def extract_antigravity_model_change(content: str) -> str | None:
+    """Extract the latest `<USER_SETTINGS_CHANGE>` `Model Selection` slug, ignoring `Auto`/`unknown`."""
+    sel = _ag_settings_selection(content)
+    return None if sel in (None, "auto") else sel
 
 
 def _antigravity_model_from_record(rec: dict[str, Any]) -> str | None:
@@ -88,11 +95,28 @@ def _is_antigravity_sidechain_start(raw_line: str) -> bool:
     return "<SYSTEM_MESSAGE>" in content and (rec.get("type") == "SYSTEM_MESSAGE" or "<USER_REQUEST>" not in content)
 
 
+def _scan_ag_lines_reverse_with_state(text: str, *, ignore_settings: bool = False) -> tuple[str | None, bool]:
+    for ln in reversed(text.splitlines()):
+        rec = _parse_json_dict(ln)
+        if not rec:
+            continue
+        if rec.get("type") == "USER_INPUT":
+            if ignore_settings:
+                continue
+            sel = _ag_settings_selection(str(rec.get("content") or ""))
+            if sel == "auto":
+                ignore_settings = True
+            elif sel is not None:
+                return sel, ignore_settings
+        else:
+            m = _antigravity_model_from_record(rec)
+            if m:
+                return m, ignore_settings
+    return None, ignore_settings
+
+
 def _scan_ag_lines_reverse(text: str) -> str | None:
-    return next(
-        (m for ln in reversed(text.splitlines()) for r in (_parse_json_dict(ln),) if r for m in (_antigravity_model_from_record(r),) if m),
-        None,
-    )
+    return _scan_ag_lines_reverse_with_state(text)[0]
 
 
 def _antigravity_model_in_transcript(path: Path, *, ignore_sidechain: bool = False) -> tuple[str | None, bool]:
@@ -112,7 +136,7 @@ def _antigravity_model_in_transcript(path: Path, *, ignore_sidechain: bool = Fal
             fh.seek(start)
             raw_tail = fh.read()
             tail_b = raw_tail if start == 0 else (raw_tail[1:] if raw_tail[:1] == b"\n" else raw_tail.partition(b"\n")[2])
-            found = _scan_ag_lines_reverse(tail_b.decode("utf-8", errors="replace"))
+            found, saw_auto = _scan_ag_lines_reverse_with_state(tail_b.decode("utf-8", errors="replace"))
             if found:
                 return found, False
             fh.seek(0)
@@ -120,7 +144,8 @@ def _antigravity_model_in_transcript(path: Path, *, ignore_sidechain: bool = Fal
     except OSError:
         return None, False
     nl = raw_head.rfind(b"\n")
-    return (_scan_ag_lines_reverse(raw_head[: nl + 1].decode("utf-8", errors="replace")) if nl != -1 else None), False
+    head = raw_head[: nl + 1].decode("utf-8", errors="replace") if nl != -1 else ""
+    return (_scan_ag_lines_reverse_with_state(head, ignore_settings=saw_auto)[0] if head else None), False
 
 
 def detect_antigravity_model(
@@ -186,17 +211,29 @@ def detect_claude_model(transcript_path: str | None) -> str:
     return UNKNOWN_MODEL
 
 
+def _turn_context_model(line: str) -> str | None:
+    rec = _parse_json_dict(line)
+    payload = rec.get("payload") if rec and rec.get("type") == "turn_context" else None
+    if isinstance(payload, dict) and isinstance(payload.get("model"), str) and payload["model"].strip():
+        return payload["model"]
+    return None
+
+
 def _model_from_rollout(rollout: Path) -> str | None:
+    for line in reversed(_read_tail(rollout).splitlines()):
+        found = _turn_context_model(line)
+        if found:
+            return found
     try:
         with rollout.open("r", encoding="utf-8", errors="replace") as fh:
+            latest: str | None = None
             for _, line in zip(range(200), fh):
-                rec = _parse_json_dict(line)
-                payload = rec.get("payload") if rec and rec.get("type") == "turn_context" else None
-                if isinstance(payload, dict) and isinstance(payload.get("model"), str):
-                    return payload["model"]
+                found = _turn_context_model(line)
+                if found:
+                    latest = found
+            return latest
     except OSError:
-        pass
-    return None
+        return None
 
 
 def detect_codex_model(session_id: str | None, sessions_dir: Path | None = None, config_path: Path | None = None) -> str:

@@ -104,25 +104,20 @@ def inspect_transcript_checkpoint(
         if not os.path.isfile(canon):
             return TranscriptScan(0, 0, None)
         st = os.stat(canon)
-        if (
+        valid_cursor = (
             isinstance(cursor, dict)
             and cursor.get("path") == canon
             and int(cursor.get("inode") or 0) == st.st_ino
             and st.st_size >= int(cursor.get("offset") or 0)
-        ):
-            start_offset = int(cursor.get("offset") or 0)
-            last_cp_step = int(cursor.get("last_cp_step") or 0)
-            cp_end_offset = int(cursor.get("cp_end_offset") or 0)
-            full_offset = int(cursor.get("full_offset") or 0)
-            full_cp_offset = int(cursor.get("full_cp_offset") or 0)
-            is_subagent = bool(cursor.get("is_subagent", False))
-        else:
-            start_offset = 0
-            last_cp_step = 0
-            cp_end_offset = 0
-            full_offset = 0
-            full_cp_offset = 0
-            is_subagent = False
+        )
+        c = cursor if valid_cursor and isinstance(cursor, dict) else {}
+        start_offset = int(c.get("offset") or 0)
+        last_cp_step = int(c.get("last_cp_step") or 0)
+        cp_end_offset = int(c.get("cp_end_offset") or 0)
+        full_offset = int(c.get("full_offset") or 0)
+        full_cp_offset = int(c.get("full_cp_offset") or 0)
+        full_inode = int(c.get("full_inode") or 0)
+        is_subagent = bool(c.get("is_subagent", False))
 
         new_offset, last_cp_step, cp_end_offset, is_subagent = scan_jsonl_incremental(
             canon, start_offset, last_cp_step, cp_end_offset, is_subagent=is_subagent
@@ -130,12 +125,14 @@ def inspect_transcript_checkpoint(
         compact_bytes = max(0, new_offset - cp_end_offset)
 
         full_bytes = 0
+        next_full_inode = 0
         full_candidate = Path(canon).with_name(ANTIGRAVITY_FULL_TRANSCRIPT_NAME)
         if full_candidate.is_file():
             full_canon = os.path.realpath(str(full_candidate))
             if full_canon != canon:
                 full_st = os.stat(full_canon)
-                if full_st.st_size < full_offset:
+                next_full_inode = full_st.st_ino
+                if full_st.st_size < full_offset or next_full_inode != full_inode:
                     full_offset = 0
                     full_cp_offset = 0
                 full_offset, full_cp_step, full_cp_offset, full_is_subagent = scan_jsonl_incremental(
@@ -144,6 +141,12 @@ def inspect_transcript_checkpoint(
                 last_cp_step = max(last_cp_step, full_cp_step)
                 is_subagent = is_subagent or full_is_subagent
                 full_bytes = max(0, full_offset - full_cp_offset)
+            else:
+                full_offset = 0
+                full_cp_offset = 0
+        else:
+            full_offset = 0
+            full_cp_offset = 0
 
         next_cursor = {
             "path": canon,
@@ -153,6 +156,7 @@ def inspect_transcript_checkpoint(
             "cp_end_offset": cp_end_offset,
             "full_offset": full_offset,
             "full_cp_offset": full_cp_offset,
+            "full_inode": next_full_inode,
             "is_subagent": is_subagent,
         }
         return TranscriptScan(last_cp_step, max(compact_bytes, full_bytes), next_cursor)

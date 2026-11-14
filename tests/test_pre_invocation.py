@@ -507,3 +507,42 @@ def test_real_subagent_system_message_step0_and_parent_system_message_later(
         (parent_dir / ".context_guard_state.json").read_text(encoding="utf-8")
     )
     assert parent_state["transcript_cursor"]["is_subagent"] is False
+
+
+def test_full_transcript_inode_change_resets_full_offset(
+    tmp_path: Path,
+) -> None:
+    import os
+
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir(parents=True)
+    compact = logs_dir / "transcript.jsonl"
+    full_file = logs_dir / "transcript_full.jsonl"
+    compact.write_text(json.dumps({"step_index": 1, "type": "USER_INPUT"}) + "\n", encoding="utf-8")
+    full_file.write_text(
+        json.dumps({"step_index": 2, "type": "CHECKPOINT"}) + "\n" + "x" * 200 + "\n",
+        encoding="utf-8",
+    )
+
+    scan_1 = inspect_transcript_checkpoint(str(compact), None)
+    assert scan_1.cursor is not None
+    assert scan_1.last_cp_step == 2
+    assert scan_1.cursor["full_inode"] == full_file.stat().st_ino
+
+    # Replace transcript_full.jsonl with a larger file (or simulate inode rotation via stale full_inode)
+    # containing a checkpoint at byte 0 (< previous full_offset) so only an inode-triggered reset to 0 sees it.
+    replacement = logs_dir / "transcript_full.jsonl.new"
+    replacement.write_text(
+        json.dumps({"step_index": 9, "type": "CHECKPOINT"}) + "\n" + "y" * 400 + "\n",
+        encoding="utf-8",
+    )
+    os.replace(replacement, full_file)
+
+    stale_cursor = dict(scan_1.cursor)
+    if full_file.stat().st_ino == stale_cursor["full_inode"]:
+        stale_cursor["full_inode"] = int(stale_cursor["full_inode"]) + 99999
+
+    scan_2 = inspect_transcript_checkpoint(str(compact), stale_cursor)
+    assert scan_2.cursor is not None
+    assert scan_2.last_cp_step == 9
+    assert scan_2.cursor["full_inode"] == full_file.stat().st_ino

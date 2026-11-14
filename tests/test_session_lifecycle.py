@@ -444,3 +444,32 @@ def test_transcript_jsonl_outline_after_narrow_read_includes_requested_span_and_
     assert res_wide["decision"] == "deny"
     assert "CONTEXT-GUARD AUTO-OUTLINE" in res_wide["reason"]
     assert "L21: step_index=20 type=PLANNER_RESPONSE source=MODEL tools=[read_file]" in res_wide["reason"]
+
+
+def test_prune_state_on_rewind_clears_transcript_cursor_on_partial_rewind() -> None:
+    state_gt: dict[str, Any] = {
+        "last_checkpoint_step": 10,
+        "transcript_cursor": {"offset": 500, "last_cp_step": 10},
+        "files": {},
+    }
+    assert prune_state_on_rewind(state_gt, current_step=5, inclusive=True) is True
+    assert "transcript_cursor" not in state_gt
+    assert state_gt["last_checkpoint_step"] == 0
+
+    state_eq: dict[str, Any] = {
+        "last_checkpoint_step": 5,
+        "transcript_cursor": {"offset": 500, "last_cp_step": 5},
+        "files": {},
+    }
+    assert prune_state_on_rewind(state_eq, current_step=5, inclusive=True) is True
+    assert "transcript_cursor" not in state_eq
+    assert state_eq["last_checkpoint_step"] == 0
+
+    state_lt: dict[str, Any] = {
+        "last_checkpoint_step": 3,
+        "transcript_cursor": {"offset": 500, "last_cp_step": 3},
+        "files": {},
+    }
+    assert prune_state_on_rewind(state_lt, current_step=5, inclusive=True) is False
+    assert "transcript_cursor" in state_lt
+    assert state_lt["last_checkpoint_step"] == 3

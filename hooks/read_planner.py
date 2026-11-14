@@ -14,7 +14,7 @@ from hooks.json_outliners import (
 from hooks.outcomes import estimate_delivered_end_line
 from hooks.session_lifecycle import prune_state_on_rewind
 from hooks.state_store import locked_state, merge_intervals, warn
-from hooks.telemetry import BINARY_MEDIA_EXTENSIONS, cap_end_line_for_harness, measure_slice_bytes
+from hooks.telemetry import BINARY_MEDIA_EXTENSIONS, HARNESS_READ_CAPS, cap_end_line_for_harness, measure_slice_bytes
 
 TRANSCRIPT_OUTLINE_LINE_THRESHOLD = 8
 FOLLOWUP_TARGETED_MAX_LINES = 250
@@ -274,8 +274,13 @@ def handle_file_read_verdict(
 
         read_target = redirect_path or canon
         target_lines = count_file_lines_streaming(read_target) or 0
+        probe_end = (
+            min(target_lines, HARNESS_READ_CAPS.get(harness, (target_lines, 0))[0])
+            if (start_line == 1 and end_line == -1 and target_lines > 0)
+            else end_line
+        )
         trimmed = (
-            trim_partially_covered_range(reads, start_line, end_line, target_lines=target_lines)
+            trim_partially_covered_range(reads, start_line, probe_end, target_lines=target_lines)
             if can_trim and byte_offset == 0
             else None
         )

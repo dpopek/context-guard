@@ -718,3 +718,34 @@ def test_twg_stdout_json_auto_outline_workitem_get_query_and_escape_hatch(
     )
     assert res_small_escape == {"decision": "allow"}
     assert not (small_dir / "stdout_formatted.json").exists()
+
+
+def test_mcp_step_outline_splits_windows_path_and_unwraps_results_and_values(
+    tmp_path: Path,
+) -> None:
+    from hooks.json_outliners import unwrap_and_outline_mcp_output
+
+    win_step = tmp_path / ".system_generated" / "steps" / "10"
+    win_step.mkdir(parents=True)
+    win_out = win_step / "output.txt"
+    py_body = "\n".join(f"def fn_{i}():\n    # {'x' * 30}\n    return {i}" for i in range(450))
+    win_out.write_text(
+        json.dumps({"file_path": r"C:\repo\sub\BigWinModule.py", "content": py_body}),
+        encoding="utf-8",
+    )
+    win_res = unwrap_and_outline_mcp_output(win_out, win_out.stat().st_size)
+    assert win_res is not None
+    _, win_outline, win_unwrapped = win_res
+    assert win_unwrapped == os.path.realpath(str(win_step / "BigWinModule.py"))
+    assert "def fn_0" in win_outline
+
+    for idx, key in enumerate(("results", "values")):
+        sdir = tmp_path / ".system_generated" / "steps" / f"2{idx}"
+        sdir.mkdir(parents=True)
+        out_f = sdir / "output.txt"
+        rows = [{"id": i, "label": f"row-{i}", "blob": "x" * 700} for i in range(25)]
+        out_f.write_text(json.dumps({key: rows}), encoding="utf-8")
+        res_coll = unwrap_and_outline_mcp_output(out_f, out_f.stat().st_size)
+        assert res_coll is not None
+        _, outline_txt, _ = res_coll
+        assert "MCP JSON collection (25 items" in outline_txt
