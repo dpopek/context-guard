@@ -1,0 +1,19 @@
+{
+  "name": "context-guard",
+  "displayName": "Context-Guard",
+  "version": "4.1.2",
+  "license": "MIT",
+  "description": "Lightweight security guard and silent token-trim plugin for Antigravity, Claude Code, Cursor, and OpenAI Codex: silent overlap trimming, MCP/TWG/transcript outlining, Local-First GitLab & BigQuery Zero-Trust guards, governance protections, and preamble attribution.",
+  "logo": "assets/logo.svg",
+  "author": {
+    "name": "Advox",
+    "url": "https://github.com/dpopek/context-guard"
+  },
+  "homepage": "https://github.com/dpopek/context-guard",
+  "repository": "https://github.com/dpopek/context-guard",
+  "suggestedPrompts": [
+    "Show my Context-Guard token savings and intervention breakdown",
+    "Audit real token usage and session preamble overhead across harnesses",
+    "Check Context-Guard multi-harness installation status"
+  ]
+}

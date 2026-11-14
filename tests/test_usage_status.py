@@ -1,0 +1,364 @@
+"""cg_status shows real token usage only on --markdown, --json and --usage."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import bin.cg_status as cg_status
+from bin import token_usage
+
+
+def seed_claude_transcript() -> None:
+    path = token_usage.TRANSCRIPT_ROOTS["claude"] / "proj" / "s.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = {
+        "type": "assistant",
+        "timestamp": "2026-11-01T10:00:00Z",
+        "message": {"id": "m1", "model": "claude-opus-5-5", "usage": {"input_tokens": 5, "cache_read_input_tokens": 95}},
+    }
+    path.write_text(json.dumps(line) + "\n", encoding="utf-8")
+
+
+def test_usage_flag_prints_only_usage_sections(capsys) -> None:
+    seed_claude_transcript()
+    assert cg_status.main(["--usage"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("## Token Usage (real, from transcripts)")
+    assert "| `claude` | claude-opus-5-5 | 1 | 5 | 95 | 0 | 0 | 95.0% |" in out
+    assert "Token Savings Report" not in out
+
+
+def test_markdown_appends_usage_sections(capsys) -> None:
+    seed_claude_transcript()
+    assert cg_status.main(["--markdown"]) == 0
+    out = capsys.readouterr().out
+    assert "Token Savings Report" in out
+    assert "## Session Preamble" in out
+
+
+def test_json_carries_token_usage(capsys) -> None:
+    seed_claude_transcript()
+    assert cg_status.main(["--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["token_usage"]["totals"]["claude|claude-opus-5-5"]["events"] == 1
+    assert "saved_tokens" in payload
+
+
+def test_usage_path_flag_selects_the_ledger(tmp_path: Path, capsys) -> None:
+    ledger = tmp_path / "custom" / "token_usage.json"
+    assert cg_status.main(["--usage", "--usage-path", str(ledger)]) == 0
+    capsys.readouterr()
+    assert ledger.is_file()
+
+
+def test_short_hud_and_outcomes_never_ingest(monkeypatch, capsys) -> None:
+    calls: list[tuple] = []
+    monkeypatch.setattr(token_usage, "refresh_usage", lambda *args, **kwargs: calls.append(args))
+    for argv in (["--short"], ["--claude-hud"], ["--outcomes"]):
+        assert cg_status.main(argv) == 0
+    capsys.readouterr()
+    assert calls == []
+
+
+def test_usage_failure_shows_error_class_and_keeps_other_sections(monkeypatch, capsys) -> None:
+    def _broken(*_args, **_kwargs):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(token_usage, "refresh_usage", _broken)
+    assert cg_status.main(["--markdown"]) == 0
+    out = capsys.readouterr().out
+    assert "Token Savings Report" in out
+    assert "_Unavailable: OSError_" in out
+    assert cg_status.main(["--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["token_usage"] == {"error": "OSError"}
+
+
+def test_non_oserror_usage_failure_keeps_the_report(monkeypatch, capsys) -> None:
+    def _broken(*_args, **_kwargs):
+        raise AttributeError("boom")
+
+    monkeypatch.setattr(token_usage, "refresh_usage", _broken)
+    assert cg_status.main(["--markdown"]) == 0
+    out = capsys.readouterr().out
+    assert "Token Savings Report" in out
+    assert "_Unavailable: AttributeError_" in out
+    assert "CG: n/a" not in out
+    assert cg_status.main(["--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["token_usage"] == {"error": "AttributeError"}
+
+
+def test_cg_status_doctor_reports_healthy_environment_and_harnesses(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    plugin_root = tmp_path / "plugin"
+    (plugin_root / "hooks").mkdir(parents=True)
+    (plugin_root / "telemetry").mkdir(parents=True)
+    (plugin_root / "hooks" / "hooks.json").write_text("{}", encoding="utf-8")
+    (plugin_root / "plugin.json").write_text('{"version": "0.0.0-test"}', encoding="utf-8")
+    claude_cfg = tmp_path / "settings.json"
+    cursor_cfg = tmp_path / "cursor_hooks.json"
+    codex_cfg = tmp_path / "codex_hooks.json"
+    for cfg in (claude_cfg, cursor_cfg, codex_cfg):
+        cfg.write_text('{"command": "/path/to/hooks/pre_tool_use.py"}', encoding="utf-8")
+
+    report = cg_status.run_doctor(
+        plugin_root=plugin_root,
+        claude_settings_path=claude_cfg,
+        cursor_hooks_path=cursor_cfg,
+        codex_hooks_path=codex_cfg,
+    )
+    assert report["ok"] is True
+    assert report["python"]["ok"] is True
+    assert report["flock"]["ok"] is True
+    assert report["telemetry_dir"]["ok"] is True
+    assert report["harnesses"] == {
+        "antigravity": True,
+        "claude": True,
+        "cursor": True,
+        "codex": True,
+    }
+    rendered = cg_status.render_doctor_report(report)
+    assert "# Context-Guard Doctor" in rendered
+    assert "OK" in rendered
+
+    monkeypatch.setattr(cg_status, "ROOT", plugin_root)
+    assert cg_status.main(["--doctor"]) == 0
+    cli_out = capsys.readouterr().out
+    assert "# Context-Guard Doctor" in cli_out
+
+
+def test_cg_status_doctor_detects_unwritable_telemetry_dir(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    plugin_root = tmp_path / "broken_plugin"
+    # Create telemetry as a regular file so mkdir(telemetry) fails with OSError
+    plugin_root.mkdir(parents=True)
+    (plugin_root / "telemetry").write_text("not a dir", encoding="utf-8")
+    report = cg_status.run_doctor(plugin_root=plugin_root)
+    assert report["telemetry_dir"]["ok"] is False
+    assert report["harnesses"]["antigravity"] is False
+    assert report["ok"] is False
+    rendered = cg_status.render_doctor_report(report)
+    assert "FAIL" in rendered
+
+    monkeypatch.setattr(cg_status, "ROOT", plugin_root)
+    assert cg_status.main(["--doctor"]) == 1
+    assert "FAIL" in capsys.readouterr().out
+
+
+def test_normalize_line_bounds_unifies_start_end_offset_limit_and_inverted_bounds() -> None:
+    from hooks.harness_adapter import normalize_line_bounds
+
+    assert normalize_line_bounds(10, 25) == (10, 25, False)
+    assert normalize_line_bounds(0, -1) == (1, -1, False)
+    assert normalize_line_bounds(20, 10) == (20, -1, True)
+    assert normalize_line_bounds(
+        None, None, offset_raw=15, limit_raw=10, has_start_key=False, has_end_key=False
+    ) == (15, 24, False)
+
+
+def test_bin_modules_bootstrap_sys_path_independently(tmp_path: Path) -> None:
+    import subprocess
+    import sys
+
+    repo_root = Path(__file__).resolve().parent.parent
+    for rel in ("bin/harness_status.py", "bin/usage_report.py"):
+        proc = subprocess.run(
+            [sys.executable, str(repo_root / rel)],
+            cwd=str(tmp_path),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, f"{rel} failed: {proc.stderr}"
+
+
+def test_checkout_without_local_stats_warns_when_installed_telemetry_exists(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    fake_home = tmp_path / "home"
+    installed_root = fake_home / ".gemini" / "config" / "plugins" / "context-guard"
+    (installed_root / "telemetry").mkdir(parents=True)
+    (installed_root / "telemetry" / "stats.json").write_text('{"saved_tokens": 12345}', encoding="utf-8")
+
+    checkout_root = tmp_path / "dev-checkout"
+    (checkout_root / "telemetry").mkdir(parents=True)
+    # Even if an orphaned token_usage.json exists in the checkout, missing stats.json must still warn.
+    (checkout_root / "telemetry" / "token_usage.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("CONTEXT_GUARD_HOME", raising=False)
+    monkeypatch.setattr(cg_status, "resolve_plugin_root", lambda default_root=None: checkout_root)
+
+    msg = cg_status.detect_checkout_telemetry_mismatch()
+    assert msg is not None
+    assert str(checkout_root.resolve()) in msg
+    assert "CONTEXT_GUARD_HOME" in msg
+
+    assert cg_status.main(["--json"]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["saved_tokens"] == 0
+    assert "context-guard: running from checkout" in captured.err
+    assert "CONTEXT_GUARD_HOME" in captured.err
+
+
+def test_checkout_warning_suppressed_with_env_explicit_paths_or_local_stats(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    fake_home = tmp_path / "home"
+    installed_root = fake_home / ".gemini" / "config" / "plugins" / "context-guard"
+    (installed_root / "telemetry").mkdir(parents=True)
+    (installed_root / "telemetry" / "stats.json").write_text('{"saved_tokens": 99}', encoding="utf-8")
+
+    checkout_root = tmp_path / "dev-checkout"
+    (checkout_root / "telemetry").mkdir(parents=True)
+
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setattr(cg_status, "resolve_plugin_root", lambda default_root=None: checkout_root)
+
+    # 1. Suppressed when CONTEXT_GUARD_HOME is explicitly set.
+    monkeypatch.setenv("CONTEXT_GUARD_HOME", str(checkout_root))
+    assert cg_status.detect_checkout_telemetry_mismatch() is None
+
+    # 2. Suppressed when explicit CLI path flag is passed.
+    monkeypatch.delenv("CONTEXT_GUARD_HOME", raising=False)
+    custom_stats = tmp_path / "custom_stats.json"
+    assert cg_status.main(["--short", "--stats-path", str(custom_stats)]) == 0
+    assert capsys.readouterr().err == ""
+
+    # 3. Suppressed when active root IS the installed plugin root.
+    assert cg_status.detect_checkout_telemetry_mismatch(plugin_root=installed_root, home_dir=fake_home) is None
+
+    # 4. Suppressed once checkout has its own stats.json.
+    (checkout_root / "telemetry" / "stats.json").write_text('{"saved_tokens": 1}', encoding="utf-8")
+    assert cg_status.detect_checkout_telemetry_mismatch() is None
+
+
+def test_refresh_usage_migrates_legacy_antigravity_and_codex_preserving_claude(tmp_path: Path) -> None:
+    roots = {name: tmp_path / name for name in ("antigravity", "claude", "codex", "cursor")}
+    for r in roots.values():
+        r.mkdir(parents=True)
+
+    claude_file = roots["claude"] / "proj" / "s1.jsonl"
+    claude_file.parent.mkdir(parents=True)
+    claude_file.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "timestamp": "2026-11-12T10:00:00Z",
+                "message": {"id": "c1", "model": "claude-opus-5-5", "usage": {"input_tokens": 500}},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    claude_stat = claude_file.stat()
+
+    ag_file = roots["antigravity"] / "conv1" / ".system_generated" / "logs" / "transcript_full.jsonl"
+    ag_file.parent.mkdir(parents=True)
+    ag_file.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "step_index": 0,
+                        "type": "USER_INPUT",
+                        "content": "<USER_REQUEST>\nhi\n</USER_REQUEST>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 4 Carbon (Medium).\n</USER_SETTINGS_CHANGE>",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": "2026-11-12T12:00:00Z",
+                        "input_tokens": 18000,
+                        "output_tokens": 120,
+                        "cache_read_tokens": 0,
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    ag_stat = ag_file.stat()
+
+    codex_file = roots["codex"] / "2026" / "11" / "12" / "rollout-1.jsonl"
+    codex_file.parent.mkdir(parents=True)
+    codex_file.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "session_meta", "payload": {"originator": "Codex Desktop", "source": "vscode"}}),
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "x" * 400}]},
+                    }
+                ),
+                json.dumps({"type": "turn_context", "payload": {"model": "gpt-5-codex"}}),
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-11-12T12:05:00Z",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {
+                                "last_token_usage": {"input_tokens": 3000, "cached_input_tokens": 1000, "output_tokens": 50},
+                                "total_token_usage": {"input_tokens": 3000, "output_tokens": 50, "total_tokens": 3050},
+                            },
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    codex_stat = codex_file.stat()
+
+    ledger = tmp_path / "token_usage.json"
+    legacy_payload = {
+        "cursors": {
+            str(claude_file): {"inode": claude_stat.st_ino, "offset": claude_stat.st_size, "model": None, "preamble_done": True},
+            str(ag_file): {"inode": ag_stat.st_ino, "offset": ag_stat.st_size, "model": None, "preamble_done": True},
+            str(codex_file): {"inode": codex_stat.st_ino, "offset": codex_stat.st_size, "model": None, "preamble_done": True},
+        },
+        "seen_ids": {str(claude_file): ["c1"]},
+        "cursor_estimates": {},
+        "totals": {
+            "claude|claude-opus-5-5": {"input": 500, "output": 0, "cache_read": 0, "cache_write": 0, "events": 1, "total_only": 0},
+            "antigravity|unknown": {"input": 100, "output": 0, "cache_read": 0, "cache_write": 0, "events": 1, "total_only": 0},
+        },
+        "by_day": {
+            "2026-11-12": {
+                "claude": {"input": 500, "output": 0, "cache_read": 0, "cache_write": 0, "events": 1, "total_only": 0},
+                "antigravity": {"input": 100, "output": 0, "cache_read": 0, "cache_write": 0, "events": 1, "total_only": 0},
+            }
+        },
+        "preamble": {"claude": [500], "antigravity": [100]},
+        "preamble_parts": [],
+        "codex_preamble_parts": [],
+        "component_use": {},
+        "component_use_since": "2026-11-09",
+        "backlog": {},
+        "antigravity_coverage": {"planner": 1, "with_usage": 1},
+        "skipped_lines": 0,
+        "saved_tokens_at_start": 120,
+        "started_at": "2026-11-09T18:00:00+00:00",
+        "updated_at": "2026-11-12T18:00:00+00:00",
+    }
+    ledger.write_text(json.dumps(legacy_payload), encoding="utf-8")
+
+    state = token_usage.refresh_usage(state_path=ledger, roots=roots, saved_tokens_now=999)
+    assert state["schema_version"] == token_usage.USAGE_SCHEMA_VERSION
+    assert state["schema_version"] == 3
+    assert state["started_at"] == "2026-11-09T18:00:00+00:00"
+    assert state["saved_tokens_at_start"] == 120
+    assert state["totals"]["claude|claude-opus-5-5"]["events"] == 1
+    assert "antigravity|unknown" not in state["totals"]
+    assert "antigravity|gemini4carbonmedium" in state["totals"]
+    assert len(state["codex_preamble_parts"]) == 1
+    assert state["codex_preamble_parts"][0]["cohort"] == "codex (desktop)"
+
+
+

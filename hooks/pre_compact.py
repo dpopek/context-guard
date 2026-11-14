@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""PreCompact hook for Claude Code, Cursor, and OpenAI Codex to reset Context-Guard read cache."""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+_PLUGIN_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PLUGIN_ROOT not in sys.path:
+    sys.path.insert(0, _PLUGIN_ROOT)
+
+from hooks.session_lifecycle import apply_compaction_boundary  # noqa: E402
+from hooks.state_store import (  # noqa: E402
+    emit_json_and_sanitize_stdio,
+    locked_state,
+    resolve_state_dir,
+    state_file_in,
+    warn,
+)
+
+
+def handle_pre_compact(
+    payload: dict[str, Any],
+    state_dir: str | None = None,
+) -> dict[str, Any]:
+    """Clear cached file reads and outlines in the session ledger when native auto-compaction triggers."""
+    try:
+        state_dir_path = resolve_state_dir(payload, state_dir)
+        if not state_file_in(state_dir_path).exists():
+            return {}
+        with locked_state(state_dir_path) as txn:
+            apply_compaction_boundary(txn.state, checkpoint_step=None)
+            txn.dirty = True
+    except OSError as exc:
+        warn(f"pre_compact skipped: {type(exc).__name__}: {exc}")
+    return {}
+
+
+def main() -> int:
+    """CLI entrypoint reading PreCompact JSON from stdin and printing `{}` to stdout."""
+    out_obj: dict[str, Any] = {}
+    try:
+        raw_input = sys.stdin.read()
+        payload = json.loads(raw_input) if raw_input and raw_input.strip() else {}
+        if not isinstance(payload, dict):
+            payload = {}
+        out_obj = handle_pre_compact(payload)
+    except Exception as exc:  # noqa: BLE001 - hook CLI must fail open
+        warn(f"pre_compact main failed: {type(exc).__name__}: {exc}")
+        out_obj = {}
+    return emit_json_and_sanitize_stdio(out_obj)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

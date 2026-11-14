@@ -1,0 +1,90 @@
+{
+  "name": "context-guard-statusbar",
+  "displayName": "Context-Guard Token Savings",
+  "description": "Live token savings counter and side panel for Context-Guard across Antigravity IDE and Cursor IDE.",
+  "version": "4.1.2",
+  "license": "MIT",
+  "publisher": "advox",
+  "icon": "icon.png",
+  "homepage": "https://github.com/dpopek/context-guard#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dpopek/context-guard.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "extensionKind": [
+    "ui",
+    "workspace"
+  ],
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "*"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "contextGuard.showReport",
+        "title": "Context-Guard: Show Token Savings Report",
+        "icon": "$(graph)"
+      },
+      {
+        "command": "contextGuard.refresh",
+        "title": "Context-Guard: Refresh Token Savings",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "contextGuard.update",
+        "title": "Context-Guard: Update",
+        "icon": "$(cloud-download)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "contextGuard",
+          "title": "Context-Guard Token Savings",
+          "icon": "icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "contextGuard": [
+        {
+          "type": "webview",
+          "id": "contextGuard.sidebarView",
+          "name": "Token Savings"
+        }
+      ],
+      "explorer": [
+        {
+          "type": "webview",
+          "id": "contextGuard.explorerView",
+          "name": "Context-Guard Savings"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "contextGuard.refresh",
+          "when": "view == contextGuard.sidebarView || view == contextGuard.explorerView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "contextGuard.showReport",
+          "when": "view == contextGuard.sidebarView || view == contextGuard.explorerView",
+          "group": "navigation@2"
+        }
+      ]
+    }
+  },
+  "__metadata": {
+    "targetPlatform": "universal"
+  }
+}

@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Outline-pull discoverability: the `cg-outline` PATH shim and a marked rule block in instruction files.
+
+Both are owned by markers: the installer never edits text outside its block and never replaces
+or removes a `cg-outline` it did not write.
+"""
+from __future__ import annotations
+
+import os
+import shlex
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+from typing import Callable, Sequence
+
+BLOCK_START = "<!-- context-guard:outline-pull:start -->"
+BLOCK_END = "<!-- context-guard:outline-pull:end -->"
+BLOCK_BODY = (
+    "Before reading a source file longer than ~400 lines, run `cg-outline <path>` "
+    "(symbols with `L<start>-L<end>` ranges), then read only the ranges you need."
+)
+_BLOCK = f"{BLOCK_START}\n{BLOCK_BODY}\n{BLOCK_END}\n"
+
+SHIM_NAME = "cg-outline"
+SHIM_MARKER = "# context-guard:cg-outline"
+IS_WINDOWS: bool = os.name == "nt"
+DEFAULT_SHIM_BIN_DIR = Path.home() / ".local" / "bin"
+DEFAULT_INSTRUCTION_FILES = (
+    Path.home() / ".codex" / "AGENTS.md",
+    Path.home() / ".gemini" / "GEMINI.md",
+    Path.home() / ".claude" / "CLAUDE.md",
+)
+
+
+def _write(path: Path, content: str, mode: int | None = None) -> None:
+    """Atomic replace; without `mode`, the first change to an existing file leaves a `.bak` beside it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    backup = path.with_name(path.name + ".bak")
+    if mode is None and path.exists() and not backup.exists():
+        shutil.copy2(path, backup)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            fh.write(content)
+        if mode is not None:
+            os.chmod(tmp, mode)
+        elif path.exists():
+            shutil.copymode(path, tmp)
+        os.replace(tmp, str(path))
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _read(path: Path) -> str:
+    """File text with its line endings untouched, so text outside the block stays byte-identical."""
+    with open(path, encoding="utf-8", newline="") as fh:
+        return fh.read()
+
+
+def _resolved(path: Path) -> Path:
+    """The file a symlinked instruction file points at: the link itself is never replaced."""
+    return Path(os.path.realpath(str(path)))
+
+
+def _block_span(text: str) -> tuple[int, int] | None:
+    """`(start, end)` of the block including its trailing newline; `(start, -1)` when unterminated."""
+    start = text.find(BLOCK_START)
+    if start < 0:
+        return None
+    end = text.find(BLOCK_END, start)
+    if end < 0:
+        return start, -1
+    end += len(BLOCK_END)
+    if text[end : end + 2] == "\r\n":
+        return start, end + 2
+    return start, end + 1 if text[end : end + 1] == "\n" else end
+
+
+def upsert_block(path: Path, dry_run: bool = False) -> str:
+    """Ensure exactly one canonical block: `created`, `updated`, `unchanged` or a `skipped (...)` reason."""
+    path = _resolved(path)
+    existed = path.exists()
+    text = _read(path) if existed else ""
+    span = _block_span(text)
+    if span is None:
+        gap = "" if not text else ("\n" if text.endswith("\n") else "\n\n")
+        new_text = text + gap + _BLOCK
+    elif span[1] < 0:
+        return "skipped (unterminated block)"
+    else:
+        new_text = text[:span[0]] + _BLOCK + text[span[1]:]
+    if new_text == text:
+        return "unchanged"
+    if not dry_run:
+        _write(path, new_text)
+    return "updated" if existed else "created"
+
+
+def remove_block(path: Path, dry_run: bool = False) -> bool:
+    """Remove the block and the blank line that separated it; True when the file held one."""
+    path = _resolved(path)
+    if not path.exists():
+        return False
+    text = _read(path)
+    span = _block_span(text)
+    if span is None or span[1] < 0:
+        return False
+    head = text[:span[0]]
+    if head.endswith("\n\n"):
+        head = head[:-1]
+    if not dry_run:
+        _write(path, head + text[span[1]:])
+    return True
+
+
+def _shim_text(plugin_root: Path) -> str:
+    script = Path(plugin_root) / "bin" / "outline.py"
+    return (
+        "#!/bin/sh\n"
+        f"{SHIM_MARKER} (managed by install_harnesses.py)\n"
+        f'exec {shlex.quote(sys.executable)} {shlex.quote(str(script))} "$@"\n'
+    )
+
+
+def shim_installed(bin_dir: Path) -> bool:
+    """True when `bin_dir/cg-outline` exists and was written by this installer."""
+    shim = Path(bin_dir) / SHIM_NAME
+    try:
+        return shim.is_file() and SHIM_MARKER in shim.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+
+
+def on_path(bin_dir: Path) -> bool:
+    """True when `bin_dir` is one of the `PATH` entries."""
+    target = os.path.normcase(os.path.realpath(str(bin_dir)))
+    entries = os.environ.get("PATH", "").split(os.pathsep)
+    return any(entry and os.path.normcase(os.path.realpath(entry)) == target for entry in entries)
+
+
+def install_shim(bin_dir: Path, plugin_root: Path, dry_run: bool = False) -> str:
+    """Write the executable `cg-outline` shim: `created`, `updated`, `unchanged` or `skipped (...)`."""
+    if IS_WINDOWS:
+        return "skipped (windows)"
+    shim = Path(bin_dir) / SHIM_NAME
+    existed = shim.exists() or shim.is_symlink()
+    if existed and not shim_installed(bin_dir):
+        return "skipped (foreign file)"
+    content = _shim_text(plugin_root)
+    if existed and shim.read_text(encoding="utf-8") == content and os.access(shim, os.X_OK):
+        return "unchanged"
+    if not dry_run:
+        _write(shim, content, mode=0o755)
+    return "updated" if existed else "created"
+
+
+def remove_shim(bin_dir: Path, dry_run: bool = False) -> bool:
+    """Remove the shim if this installer wrote it; True when it did."""
+    if not shim_installed(bin_dir):
+        return False
+    if not dry_run:
+        (Path(bin_dir) / SHIM_NAME).unlink()
+    return True
+
+
+_NOT_REQUESTED = "skipped (not requested)"
+
+
+def _guarded(step: Callable[[], str]) -> str:
+    """Run one shim or instruction-file step; a failure becomes its status, never an installer crash."""
+    try:
+        return step()
+    except (OSError, ValueError) as exc:
+        return f"error ({type(exc).__name__})"
+
+
+def _upsert_status(path: Path, dry_run: bool) -> str:
+    if not path.parent.is_dir():
+        return "skipped (no harness directory)"
+    return _guarded(lambda: upsert_block(path, dry_run=dry_run))
+
+
+def install_outline_pull(
+    plugin_root: Path,
+    use_defaults: bool,
+    shim_bin_dir: Path | None,
+    instruction_files: Sequence[Path] | None,
+    dry_run: bool,
+) -> dict[str, str]:
+    """Install the shim and the rule block; real-home defaults only when `use_defaults` is set.
+
+    The rule is written only when the shim is usable (installed and on `PATH`): a rule naming a
+    command the shell cannot find would cost every session a failed call.
+    """
+    if use_defaults:
+        shim_bin_dir = shim_bin_dir or DEFAULT_SHIM_BIN_DIR
+        instruction_files = DEFAULT_INSTRUCTION_FILES if instruction_files is None else instruction_files
+    shim_status, usable = _NOT_REQUESTED, False
+    if shim_bin_dir is not None:
+        bin_dir = shim_bin_dir
+        shim_status = _guarded(lambda: install_shim(bin_dir, Path(plugin_root), dry_run=dry_run))
+        installed = not shim_status.startswith(("skipped", "error"))
+        usable = installed and on_path(bin_dir)
+        if installed and not usable:
+            shim_status += " (not_on_path)"
+    if not instruction_files:
+        block_status = _NOT_REQUESTED
+    elif not usable:
+        block_status = "skipped (shim unavailable)"
+    else:
+        block_status = ", ".join(_upsert_status(path, dry_run) for path in instruction_files)
+    return {"cg_outline_shim": shim_status, "instruction_block": block_status}
+
+
+def _removal_status(removed: Callable[[], bool]) -> str:
+    return _guarded(lambda: "removed" if removed() else "absent")
+
+
+def uninstall_outline_pull(
+    use_defaults: bool,
+    shim_bin_dir: Path | None,
+    instruction_files: Sequence[Path] | None,
+    dry_run: bool,
+) -> dict[str, str]:
+    """Remove the shim and the rule blocks this installer wrote."""
+    if use_defaults:
+        shim_bin_dir = shim_bin_dir or DEFAULT_SHIM_BIN_DIR
+        instruction_files = DEFAULT_INSTRUCTION_FILES if instruction_files is None else instruction_files
+    shim_status = _NOT_REQUESTED
+    if shim_bin_dir is not None:
+        bin_dir = shim_bin_dir
+        shim_status = _removal_status(lambda: remove_shim(bin_dir, dry_run=dry_run))
+    blocks = [
+        _removal_status(lambda p=path: remove_block(p, dry_run=dry_run))  # type: ignore[misc]
+        for path in instruction_files or ()
+    ]
+    return {"cg_outline_shim": shim_status, "instruction_block": ", ".join(blocks) or _NOT_REQUESTED}
