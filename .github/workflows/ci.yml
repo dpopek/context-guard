@@ -7,6 +7,9 @@ on:
   pull_request:
     branches: [main, master]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     name: ${{ matrix.os }} (Python ${{ matrix.python-version }})
@@ -41,6 +44,7 @@ jobs:
         run: |
           python -m mypy hooks bin tests
           python -m ruff check hooks bin tests
+          node --check vscode-extension/extension.js vscode-extension/view_model.js vscode-extension/updater.js vscode-extension/renderers.js
 
       - name: Run full test suite
         run: python -m pytest -q tests/

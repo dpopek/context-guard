@@ -6,20 +6,12 @@ import json
 import os
 from pathlib import Path
 
+from hooks.local_repo_guard import load_guard_config
+
 ROOT = Path(__file__).resolve().parent.parent
 
-REQUIRED_CONFIG_KEYS = (
-    "workspace_root",
-    "repo_map_path",
-    "repo_map_doc",
-    "restricted_bq_datasets",
-    "allowed_bq_views_dataset",
-    "allowed_bq_views_hint",
-    "bq_schema_doc",
-    "allow_bq_raw_ddl_maintenance",
-    "allow_governance_mutations",
-    "enforce_governance_policy",
-    "model_labels",
+REQUIRED_CONFIG_KEYS = tuple(
+    k for k in load_guard_config(Path("/nonexistent_cfg.json")) if k != "config_error"
 )
 
 

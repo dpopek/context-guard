@@ -766,7 +766,7 @@ def test_inline_shell_mutations_baseline_tamper_and_readonly_edge_vectors(tmp_pa
     edit_sub = {"session_id": "s-sub", "cwd": str(sub_repo), "tool_name": "Edit", "tool_input": {"file_path": str(sub_repo / "notes.md")}}
     assert_allowed(evaluate_hook(edit_sub, state_dir=sub_state, cli_harness="claude"), "claude")
     assert json.loads((Path(sub_state) / STATE_FILENAME).read_text(encoding="utf-8")).get("mutated_repos") == ["legacy/storefront-m1"]
-    win_cmd = r"sed -i '' 's/a/b/' C:\Users\runner\repo\scripts\audit\ai_slop_scanner.py"
+    win_cmd = r"sed -i '' 's/a/b/' C:\Users\alice\repo\scripts\audit\ai_slop_scanner.py"
     assert_denied(evaluate_hook(_shell_payload("claude", win_cmd, cwd=str(ws_root)), state_dir=state_dir), "claude", "governance")
 
 

@@ -2,7 +2,8 @@
 set -euo pipefail
 
 REMOTE_URL="${2:-}"
-if [[ "$REMOTE_URL" != *github.com* ]]; then
+REMOTE_LOWER="$(printf '%s' "$REMOTE_URL" | tr '[:upper:]' '[:lower:]')"
+if [[ "$REMOTE_LOWER" != *github.com* ]]; then
   exit 0
 fi
 

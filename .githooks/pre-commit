@@ -32,6 +32,9 @@ if [[ "${ALLOW_NO_DOC_UPDATE:-0}" != "1" ]]; then
 fi
 
 # 3. Always run mechanical documentation sync, conciseness, module boundary & static type checks.
+if echo "$STAGED" | grep -Eq '^vscode-extension/.*\.js$' && command -v node >/dev/null 2>&1; then
+  node --check vscode-extension/extension.js vscode-extension/view_model.js vscode-extension/updater.js vscode-extension/renderers.js
+fi
 if command -v mypy >/dev/null 2>&1; then
   mypy hooks bin tests
 fi

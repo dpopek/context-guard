@@ -708,6 +708,7 @@ def test_updater_guards_windows_hide_9009_settled_and_hook_path(
     plugin_ver = json.loads((ROOT / "plugin.json").read_text(encoding="utf-8"))["version"]
     assert manifest["version"] == plugin_ver
     assert manifest["publisher"] == "advox"
+    assert manifest["activationEvents"] == ["onStartupFinished"]
 
     plugin_dir = tmp_path / "cg-upd"
     (plugin_dir / "bin").mkdir(parents=True)

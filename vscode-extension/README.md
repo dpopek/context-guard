@@ -8,7 +8,7 @@ Live token savings telemetry, status bar indicator, SVG donut ring side panel, a
 
 **Context-Guard** is a zero-prompt security guard, silent range-trim, and multi-harness telemetry plugin for **Google Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex CLI/App** using pure Python 3.9+ standard library hooks.
 
-This companion IDE extension reads `telemetry/stats.json`, `token_usage.json`, `outcomes.json`, and `update.json` from your installed Context-Guard checkout in real time to surface token savings and v4.x insights in your editor.
+This companion IDE extension reads `telemetry/stats.json`, `token_usage.json`, `outcomes.json`, and `update.json` from your installed Context-Guard checkout (auto-refreshing missing or stale `token_usage.json` via `cg_status.py --usage`) to surface token savings and v4.x insights in your editor.
 
 ---
 
@@ -17,7 +17,7 @@ This companion IDE extension reads `telemetry/stats.json`, `token_usage.json`, `
 ### 1. Live Status Bar Pill & 4-Second Intervention Pulse
 - **Idle Pill:** Shows `$(shield) -<saved> · <pct>%` in the status bar (plus `$(cloud-download)` when an update or installer run is pending).
 - **Live Pulse:** Flashes `$(zap) -<delta> (<layer>) · <pct>%` for 4 seconds whenever a `PreToolUse` intervention saves tokens.
-- **Rich Hover Breakdown:** Displays saved/baseline tokens, API cost saved (`≈ $USD`), `Cache Hit %`, `Preamble (Last)` with `Recent (10)`, `Doctor`, and 30-day `sunset_verdict`.
+- **Rich Hover Breakdown:** Displays saved/baseline tokens, API cost saved (`≈ $USD`), `Cache Hit %`, `Preamble (Last)` with `Recent (10)`, `Doctor` (`--doctor` parity), and 30-day `sunset_verdict`.
 
 ### 2. Activity Bar & Explorer Side Panels (`SVG Donut Ring`)
 - **Activity Bar View (`Token Savings`)** and **Explorer Section (`Context-Guard Savings`)**:
@@ -26,7 +26,8 @@ This companion IDE extension reads `telemetry/stats.json`, `token_usage.json`, `
   - **By Harness** progress bars and **By Protection Layer** breakdown across v4.x layers.
 
 ### 3. Interactive Token Savings Report (`contextGuard.showReport`)
-- Open from the status bar or Command Palette (**`Context-Guard: Show Token Savings Report`**) for full `Cache Hit %`, `Session Preamble (Last)`, `Doctor`, and `sunset_verdict` tables.
+- Open from the status bar or Command Palette (**`Context-Guard: Show Token Savings Report`**) for `Cache Hit %`, `Preamble (Last)`, `Doctor` (`--doctor` parity), and `sunset_verdict` tables.
+- Automatically refreshes missing or stale (`>= 10 min`) `token_usage.json` in the background via `cg_status.py --usage` on startup, sidebar open, and report view.
 
 ### 4. Safe One-Click Release Updates (`contextGuard.update`)
 - Checks `origin` for newer `vX.Y.Z` release tags in the background at most once per 24 hours.

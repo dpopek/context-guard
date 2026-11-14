@@ -363,6 +363,14 @@ def test_exported_rules_agents_md_and_root_agents_md_enforce_universal_isolation
             assert antigravity_home_re.search(src) is None, (
                 f"Hardcoded ~/Antigravity workspace path found in {py_path.relative_to(ROOT)}"
             )
+    js_home_subpath_re = re.compile(
+        r"""(?:os\.homedir\(\)|homeDir|effectiveHome|~/|~\\)[^;\n]*["'](?:Antigravity|workspace)["']|~[/\\](?:Antigravity|workspace)\b"""
+    )
+    for js_path in sorted((ROOT / "vscode-extension").glob("*.js")):
+        js_src = js_path.read_text(encoding="utf-8")
+        assert js_home_subpath_re.search(js_src) is None, (
+            f"Hardcoded home subpath found in {js_path.relative_to(ROOT)}"
+        )
 
 
 def test_npm_and_pnpm_test_commands_are_not_silenced() -> None:

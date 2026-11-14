@@ -1,4 +1,4 @@
-# Context-Guard (v4.2.1)
+# Context-Guard (v4.3.0)
 
 Zero-prompt security guard, silent range-trim, machine-artifact unwrapper, and multi-harness telemetry plugin for **Google Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex CLI/App** across **macOS, Linux, and Windows**.
 
@@ -23,7 +23,7 @@ Source code and Markdown reads never block; `cg-outline <path>` handles on-deman
 
 | Target Type | Trigger Threshold | Action & Output |
 | :--- | :--- | :--- |
-| **GitLab `get_file_contents` MCP** (`.system_generated/steps/<N>/output.txt`) | `>= 16 KB` 1-line JSON envelope | Unwraps `"content"` to `output_unwrapped.<ext>`; redirects follow-ups automatically. |
+| **GitLab `get_file_contents` MCP** (`.system_generated/steps/<N>/output.txt`) | `>= 16 KB` 1-line JSON envelope | Unwraps `"content"` to sibling `<safe_name>` (`output_formatted.json` for tabular/list JSON); redirects follow-ups automatically. |
 | **BigQuery Tabular MCP** (`execute_sql*`, `get_query_results`) | `>= 16 KB` JSON with `rows[]` | Unwraps to `output_formatted.json`; returns row count, schema, and 3-row preview. |
 | **Generic JSON List/Items MCP** | `>= 16 KB` JSON array or `items`/`results`/`values` | Unwraps to `output_formatted.json`; returns item count, keys, and sample preview. |
 | **TWG Jira & Confluence** (`/twg/*/stdout.json`, `stdout.compact.json`) | `>= 6 KB` (`6,144` B; inline `< 6 KB`) | Summarizes issues/fields (`required=True` first) and extracts ADF plain text to sibling file. |
@@ -70,7 +70,7 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 | `hooks/pre_tool_use.py` | Hook Entry | Orchestrates fail-closed guards, silent `range_trim`, CLI rewrites, and telemetry. |
 | `hooks/pre_invocation.py` | Hook Entry | Antigravity incremental `O(delta)` transcript scanner and two-stage auto-compact sensor. |
 | `hooks/pre_compact.py` | Hook Entry | Claude Code, Cursor, and Codex `PreCompact` / `preCompact` read-cache reset hook. |
-| `hooks/post_tool_use.py` | Hook Entry | `PostToolUse` / `postToolUse` hook recording shell output bytes and token usage. |
+| `hooks/post_tool_use.py` | Hook Entry | `PostToolUse` / `postToolUse` hook measuring shell output bytes. |
 | `hooks/harness_adapter.py` | Normalization | Normalizes tool payloads (`Read`, `Bash`, `exec_command`, `apply_patch`), permission modes, and verdicts. |
 | `hooks/read_planner.py` | Core Engine | Silent `range_trim` overlap trimmer, slice caps, and machine-artifact outline planner. |
 | `hooks/shell_parser.py` | Core Engine | Lossless quiet CLI flag rewriter, voluntary `cg-outline` detector, and bounded shell-read analyzer. |
@@ -110,11 +110,11 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 Context-Guard runs from wherever you clone it: the installer points every harness hook at that checkout. Pick any directory; `~/.gemini` is needed only if you use Antigravity.
 
 ```bash
-# 1. Clone anywhere (or unpack dist/context-guard-v4.2.1.zip there)
+# 1. Clone anywhere (or unpack dist/context-guard-v4.3.0.zip there)
 CG_DIR=~/tools/context-guard
 git clone https://github.com/dpopek/context-guard.git "$CG_DIR"
 
-# 2. Install hooks (Claude Code, Codex, Cursor, Antigravity) & advox.context-guard-statusbar-4.2.1 extension
+# 2. Install hooks (Claude Code, Codex, Cursor, Antigravity) & advox.context-guard-statusbar-4.3.0 extension
 python3 "$CG_DIR/bin/install_harnesses.py" --install
 
 # Check status, preview dry-run, or uninstall cleanly

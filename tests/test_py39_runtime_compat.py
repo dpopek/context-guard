@@ -61,11 +61,13 @@ def test_ast_no_python310_only_runtime_constructs() -> None:
     offenders: list[str] = []
     match_cls = getattr(ast, "Match", None)
 
-    for path in sorted([*ROOT.glob("hooks/*.py"), *ROOT.glob("bin/*.py")]):
+    for path in sorted([*ROOT.glob("hooks/*.py"), *ROOT.glob("bin/*.py"), *ROOT.glob("tests/*.py")]):
         rel = path.relative_to(ROOT)
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         has_future = _has_future_annotations(tree)
 
+        if path.name != "__init__.py" and not has_future:
+            offenders.append(f"{rel}:1 missing 'from __future__ import annotations'")
         if not has_future:
             for ann in _iter_annotation_nodes(tree):
                 if _contains_bitor(ann):

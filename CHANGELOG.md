@@ -5,6 +5,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 
 ## [Unreleased]
 
+## [4.3.0] - 2026-11-14
+
+### Added
+- **Command normalizer (`hooks/file_io.py`):** Exported `normalize_cmd_basename` handling POSIX/Windows paths and `.exe`/`.cmd`/`.bat`.
+- **Lexical Codex TOML sync (`bin/codex_toml.py`):** Extracted cycle-free TOML scanner preserving multiline strings, arrays, and comments.
+- **Doctor & CI/AST gates:** Added `verify_harness_hooks`, win32 `python3` stub checks, `node --check`, and Windows/attribute AST gates.
+
+### Changed
+- **Eager MCP matcher (`hooks.json`):** Added `mcp_gitlab_.*` and BigQuery MCP server patterns to `PreToolUse` matchers.
+- **IDE activation & CI permissions:** Restricted `activationEvents` to `["onStartupFinished"]` and scoped CI to `contents: read`.
+- **Outliner compaction (`hooks/json_outliners.py`):** Slimmed `hooks/*.py` to `6,710` LOC and generalized `items`/`results`/`values` lists.
+
+### Fixed
+- **SQL & shell guards:** Added GoogleSQL `strip_sql_comments`, `sh -c`/`timeout`/`env` recursion, `eff_cwd` heredocs, and O(N) `sed`.
+- **Multi-harness adapters:** Extracted Antigravity `cwd`, fixed Cursor `"path"` `updatedInput`, and split Windows `raw_name` envelopes.
+- **Model & read planner accuracy:** Stopped Antigravity scan `to Auto`, scanned Codex tails first, and capped unbounded overlap probes.
+- **Installer & Windows CLI:** Preserved symlinks via `realpath`, emitted RFC 8089 URIs, and replaced `select` stdin with daemon threads.
+- **Rewind telemetry & sunset:** Reconciled per-file rewinds/forks, parsed multiline skill YAML, and prorated `sunset_verdict` denials.
+- **IDE extension hardening:** Guarded `NaN`/dates, escaped Markdown prose, cached JSON/doctor probes, and auto-refreshed stale usage.
+
 ## [4.2.1] - 2026-11-14
 
 ### Fixed

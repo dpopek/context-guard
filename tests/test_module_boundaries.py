@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 from pathlib import Path
 
@@ -11,23 +12,75 @@ from hooks.local_repo_guard import GENERIC_REPO_BASENAMES
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def _private_cross_imports() -> list[str]:
+def _private_cross_imports_in_source(
+    rel: str, src: str, prod_modules: set[str]
+) -> list[str]:
     offenders: list[str] = []
-    for path in sorted([*ROOT.glob("hooks/*.py"), *ROOT.glob("bin/*.py")]):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.ImportFrom):
-                continue
-            if (node.module or "").split(".")[0] not in ("hooks", "bin"):
+    tree = ast.parse(src, filename=rel)
+    pkg = rel.split("/")[0]
+    module_aliases: set[str] = set()
+    pkg_aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if top in ("hooks", "bin"):
+                    if alias.asname:
+                        module_aliases.add(alias.asname)
+                    elif "." not in alias.name:
+                        pkg_aliases.add(alias.name)
+                    else:
+                        pkg_aliases.add(top)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level > 0:
+                base = (
+                    f"{pkg}.{node.module}"
+                    if node.level == 1 and node.module
+                    else (pkg if node.level == 1 else (node.module or ""))
+                )
+            else:
+                base = node.module or ""
+            if base.split(".")[0] not in ("hooks", "bin"):
                 continue
             for alias in node.names:
                 if alias.name.startswith("_") or (alias.asname or "").startswith("_"):
-                    offenders.append(f"{path.relative_to(ROOT)}:{node.lineno} {alias.name}")
+                    offenders.append(f"{rel}:{node.lineno} {alias.name}")
+                elif base in ("hooks", "bin") and alias.name in prod_modules:
+                    module_aliases.add(alias.asname or alias.name)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr.startswith("_") and not node.attr.startswith("__"):
+            val = node.value
+            if isinstance(val, ast.Name) and val.id in module_aliases:
+                offenders.append(f"{rel}:{node.lineno} {val.id}.{node.attr}")
+            elif (
+                isinstance(val, ast.Attribute)
+                and isinstance(val.value, ast.Name)
+                and val.value.id in pkg_aliases
+                and val.attr in prod_modules
+            ):
+                offenders.append(f"{rel}:{node.lineno} {val.value.id}.{val.attr}.{node.attr}")
+    return offenders
+
+
+def _private_cross_imports() -> list[str]:
+    prod_modules = {p.stem for folder in ("hooks", "bin") for p in (ROOT / folder).glob("*.py")} | {
+        "hooks",
+        "bin",
+    }
+    offenders: list[str] = []
+    for path in sorted([*ROOT.glob("hooks/*.py"), *ROOT.glob("bin/*.py")]):
+        rel = path.relative_to(ROOT).as_posix()
+        offenders.extend(_private_cross_imports_in_source(rel, path.read_text(encoding="utf-8"), prod_modules))
     return offenders
 
 
 def test_no_private_names_cross_module_boundaries() -> None:
     assert _private_cross_imports() == []
+    sample = "from hooks import file_io\nimport hooks.config\nfile_io._priv()\nhooks.config._priv()\n"
+    assert _private_cross_imports_in_source("bin/demo.py", sample, {"file_io", "config", "hooks", "bin"}) == [
+        "bin/demo.py:3 file_io._priv",
+        "bin/demo.py:4 hooks.config._priv",
+    ]
 
 
 def test_one_operator_diagnostic() -> None:
@@ -199,6 +252,10 @@ _GENERIC_CI_USERS = frozenset(
     {"runner", "ubuntu", "root", "vscode", "codespace", "docker", "builder", "dev", "user", "test", "admin"}
 )
 _USER_PATH_RE = re.compile(r"(?<![A-Za-z0-9_])/(?:Users|home)/([A-Za-z0-9._-]+)")
+_WIN_USER_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_])[A-Za-z]:(?:[/\\]|\\\\)Users(?:[/\\]|\\\\)([A-Za-z0-9._-]+)",
+    re.IGNORECASE,
+)
 _GCP_PROJECT_PROD_RE = re.compile(
     r"\b[a-z][a-z0-9]+-[a-z][a-z0-9]+-\d{5,}(?:-[a-z0-9]+)?\b", re.IGNORECASE
 )
@@ -270,10 +327,11 @@ def _load_operator_private_terms() -> frozenset[str]:
 def _find_privacy_leak(
     content: str, *, allow_test_fixtures: bool, dynamic_terms: frozenset[str]
 ) -> str | None:
-    for m in _USER_PATH_RE.finditer(content):
-        uname = m.group(1)
-        if not allow_test_fixtures or uname.lower() not in _ALLOWED_TEST_USERS:
-            return m.group(0)
+    for rx in (_USER_PATH_RE, _WIN_USER_PATH_RE):
+        for m in rx.finditer(content):
+            uname = m.group(1)
+            if not allow_test_fixtures or uname.lower() not in _ALLOWED_TEST_USERS:
+                return m.group(0)
     gcp_re = _GCP_PROJECT_TEST_RE if allow_test_fixtures else _GCP_PROJECT_PROD_RE
     for rx in (gcp_re, _LOCAL_EMAIL_RE, _ATLASSIAN_RE):
         hit = rx.search(content)
@@ -295,6 +353,20 @@ def _find_privacy_leak(
     return None
 
 
+def _iter_project_svg_files(root: Path) -> list[Path]:
+    svg_files = sorted(p for p in root.glob("*.svg") if p.is_file())
+    skip_dirs = frozenset({"venv", ".venv", "node_modules", "__pycache__"})
+    for child in sorted(root.iterdir()):
+        if not child.is_dir() or child.name.startswith(".") or child.name in skip_dirs:
+            continue
+        for dirpath, dirnames, filenames in os.walk(child):
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and d not in skip_dirs)
+            for fname in sorted(filenames):
+                if fname.endswith(".svg"):
+                    svg_files.append(Path(dirpath) / fname)
+    return svg_files
+
+
 def test_outline_loc_ceiling_and_zero_hardcoded_user_paths() -> None:
     outline_py = ROOT / "hooks" / "outline.py"
     loc = len(outline_py.read_text(encoding="utf-8").splitlines())
@@ -306,6 +378,14 @@ def test_outline_loc_ceiling_and_zero_hardcoded_user_paths() -> None:
     assert _find_privacy_leak(
         "/Users/" + "jdoe_real/repo", allow_test_fixtures=True, dynamic_terms=frozenset()
     )
+    assert _find_privacy_leak(
+        "C:\\Users\\" + "jdoe_real\\repo", allow_test_fixtures=True, dynamic_terms=frozenset()
+    )
+    assert _find_privacy_leak(
+        "c:/users/" + "jdoe_real/repo", allow_test_fixtures=True, dynamic_terms=frozenset()
+    )
+    assert _find_privacy_leak(r"c:\users\alice\repo", allow_test_fixtures=False, dynamic_terms=frozenset())
+    assert _find_privacy_leak(r"c:\users\alice\repo", allow_test_fixtures=True, dynamic_terms=frozenset()) is None
     assert _find_privacy_leak("/Users/dev/repo", allow_test_fixtures=False, dynamic_terms=frozenset())
     assert _find_privacy_leak("/Users/dev/repo", allow_test_fixtures=True, dynamic_terms=frozenset()) is None
     assert _find_privacy_leak(
@@ -332,15 +412,20 @@ def test_outline_loc_ceiling_and_zero_hardcoded_user_paths() -> None:
             assert leak is None, (
                 f"Forbidden personal/company token '{leak}' found in {src_file.relative_to(ROOT)}"
             )
-    for root_doc in ("README.md", "AGENTS.md", "CHANGELOG.md", "plugin.json", "hooks.json", "LICENSE"):
-        doc_path = ROOT / root_doc
+    extra_prod_files = [
+        *(ROOT / rel for rel in ("README.md", "AGENTS.md", "CHANGELOG.md", "plugin.json", "hooks.json", "LICENSE", "pyproject.toml")),
+        *(p for p in sorted((ROOT / ".githooks").glob("*")) if p.is_file()),
+        *sorted((ROOT / ".github" / "workflows").glob("*.yml")),
+        *_iter_project_svg_files(ROOT),
+    ]
+    for doc_path in extra_prod_files:
         if doc_path.is_file():
             doc_leak = _find_privacy_leak(
                 doc_path.read_text(encoding="utf-8"),
                 allow_test_fixtures=False,
                 dynamic_terms=dynamic_terms,
             )
-            assert doc_leak is None, f"Forbidden personal/company token '{doc_leak}' found in {root_doc}"
+            assert doc_leak is None, f"Forbidden personal/company token '{doc_leak}' found in {doc_path.relative_to(ROOT)}"
 
 
 
