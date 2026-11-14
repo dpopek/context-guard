@@ -422,3 +422,342 @@ console.log(JSON.stringify({
     assert any("context-guard:" in w for w in rt["warns"])
     assert "--usage" in rt["lastArgs"]
     assert {"stats.json", "update.json", "token_usage.json"}.issubset(set(rt["unwatched"]))
+
+
+def test_view_model_finite_non_neg_iso_days_zero_series_and_canonical_order() -> None:
+    script = r"""
+const path = require("path");
+const vm = require(path.resolve(process.argv[1], "view_model.js"));
+const ext = require(path.resolve(process.argv[1], "extension.js"));
+const badNorm = vm.normalizeStats({
+  saved_tokens: Infinity,
+  baseline_tokens: true,
+  actual_tokens: Infinity,
+  reduction_pct: Infinity,
+  by_harness: { antigravity: { hits: true, baseline_tokens: Infinity, saved_tokens: NaN } },
+  last_event: { kind: "outlines", harness: "claude", saved_tokens: Infinity },
+});
+const usage = {
+  preamble: { cursor: [100], custom: [50], antigravity: [0, 100, 200], zero_only: [0], bad: [null, true, false, -5] },
+  preamble_parts: [
+    { measured: 30000, components: { skills: { a: 1 } } },
+    { measured: 40000, components: { deferred_tools: { "mcp:ccd_x": 1 } } },
+  ],
+  codex_preamble_parts: [
+    { measured: 20000, cohort: "codex (cli)", components: { system_prompt: { c: 1 } } },
+    { measured: 25000, cohort: "codex (desktop)", components: { system_prompt: { c: 1 } } },
+  ],
+};
+const insights = vm.summarizeV4Insights({}, usage, null, null);
+console.log(JSON.stringify({
+  hasExports: typeof vm.finiteNonNeg === "function" && vm.finiteNonNeg === ext.finiteNonNeg
+    && typeof vm.parseIsoDayUtcMs === "function" && vm.parseIsoDayUtcMs === ext.parseIsoDayUtcMs,
+  fnn: [vm.finiteNonNeg(true), vm.finiteNonNeg(false), vm.finiteNonNeg(NaN), vm.finiteNonNeg(Infinity),
+        vm.finiteNonNeg(-Infinity), vm.finiteNonNeg(-5), vm.finiteNonNeg(0), vm.finiteNonNeg("abc"),
+        vm.finiteNonNeg(42.5), vm.finiteNonNeg("12")],
+  badNorm,
+  compactInf: vm.formatCompactTokens(Infinity),
+  idleInf: vm.formatStatusBarIdleText({ saved_tokens: Infinity, reduction_pct: true }),
+  idleBool: vm.formatStatusBarIdleText({ saved_tokens: true, reduction_pct: 50 }),
+  pulseInf: vm.formatStatusBarPulseText({ reduction_pct: Infinity }, NaN, "outlines"),
+  ctxInf: vm.formatContextWindows(Infinity),
+  gaugeInf: vm.formatBlockGauge(Infinity),
+  costInf: vm.estimateCostUsd(Infinity),
+  days: [vm.parseIsoDayUtcMs("2026-11-14") !== null, vm.parseIsoDayUtcMs("2024-02-29") !== null,
+         vm.parseIsoDayUtcMs("2026-99-99"), vm.parseIsoDayUtcMs("2026-02-29"), vm.parseIsoDayUtcMs("2026-02-30"),
+         vm.parseIsoDayUtcMs("bad"), vm.parseIsoDayUtcMs(null)],
+  zeroMedian: insights.preambleByHarness.antigravity,
+  zeroOnly: insights.preambleByHarness.zero_only,
+  badDropped: "bad" in insights.preambleByHarness,
+  harnessKeys: Object.keys(insights.preambleByHarness),
+  layerNoLegacy: vm.isLayerVisible({ key: "outlines", legacy: true }, {}, false),
+}));
+"""
+    res = _run_node(script, str(EXT_DIR))
+    assert res["hasExports"] is True
+    assert res["fnn"] == [0, 0, 0, 0, 0, 0, 0, 0, 42.5, 12]
+    assert res["badNorm"]["savedTokens"] == 0
+    assert res["badNorm"]["baselineTokens"] == 0
+    assert res["badNorm"]["actualTokens"] == 0
+    assert res["badNorm"]["reductionPct"] == 0
+    assert res["badNorm"]["harnesses"]["antigravity"] == {
+        "hits": 0, "baselineTokens": 0, "savedTokens": 0, "reductionPct": 0
+    }
+    assert res["badNorm"]["lastEvent"]["savedTokens"] == 0
+    assert res["compactInf"] == "0"
+    assert res["idleInf"] == "$(shield) 0 tok · 0%"
+    assert res["idleBool"] == "$(shield) 0 tok · 0%"
+    assert res["pulseInf"] == "$(zap) -0 (Outline) · 0%"
+    assert res["ctxInf"] == "0.0"
+    assert res["gaugeInf"] == "▱▱▱▱▱"
+    assert res["costInf"] == "0.00"
+    assert res["days"] == [True, True, None, None, None, None, None]
+    assert res["zeroMedian"] == {"sessions": 3, "median": 100, "recentMedian": 100, "last": 200}
+    assert res["zeroOnly"] == {"sessions": 1, "median": 0, "recentMedian": 0, "last": 0}
+    assert res["badDropped"] is False
+    assert res["harnessKeys"] == [
+        "antigravity", "claude (cli)", "claude (desktop)", "codex (cli)", "codex (desktop)", "cursor", "custom", "zero_only"
+    ]
+    assert res["layerNoLegacy"] is True
+
+
+def test_sunset_verdict_python_parity_proration_missing_start_and_schema() -> None:
+    script = r"""
+const path = require("path");
+const vm = require(path.resolve(process.argv[1], "view_model.js"));
+const baseUsage = {
+  totals: { "claude|opus": { input: 100000, cache_read: 1000000, cache_write: 0, events: 100 } },
+  by_day: {
+    "2026-10-01": { claude: { input: 50000, cache_read: 500000, cache_write: 0, events: 75 } },
+    "2026-11-10": { claude: { input: 50000, cache_read: 500000, cache_write: 0, events: 25 } },
+  },
+};
+const statsNoDays = { saved_tokens: 50000 };
+const statsOverlap = { saved_tokens: 50000, by_day: { "2026-11-10": { saved_bytes: 200000 }, "2026-99-99": { saved_bytes: 999999 } } };
+const outcomesNoVer = { by_key: { "claude|opus|outline": { total: 10, repeats: 0 } } };
+const outcomesNullVer = { schema_version: null, by_key: { "claude|opus|outline": { total: 10, repeats: 0 } } };
+console.log(JSON.stringify({
+  noStart: vm.summarizeV4Insights(statsNoDays, baseUsage, null, null).sunsetVerdict,
+  badStart: vm.summarizeV4Insights(statsNoDays, { ...baseUsage, started_at: "2026-99-99T00:00:00Z" }, null, null).sunsetVerdict,
+  validStart: vm.summarizeV4Insights(statsNoDays, { ...baseUsage, started_at: "2026-10-01T00:00:00Z" }, null, null).sunsetVerdict,
+  proratedUndefSchema: vm.summarizeV4Insights(statsOverlap, baseUsage, outcomesNoVer, null).sunsetVerdict,
+  ignoredNullSchema: vm.summarizeV4Insights(statsOverlap, baseUsage, outcomesNullVer, null).sunsetVerdict,
+}));
+"""
+    res = _run_node(script, str(EXT_DIR))
+    assert res["noStart"]["windowDays"] == 0
+    assert res["badStart"]["windowDays"] == 0
+    assert res["validStart"]["windowDays"] == 41
+    assert res["proratedUndefSchema"]["windowDays"] == 1
+    assert res["proratedUndefSchema"]["denials"] == 10
+    assert res["proratedUndefSchema"]["denialTokens"] == 2500
+    assert res["proratedUndefSchema"]["netSaved"] == 50000 - 2500
+    assert res["ignoredNullSchema"]["denials"] == 0
+    assert res["ignoredNullSchema"]["denialTokens"] == 0
+
+
+def test_renderers_tooltip_escaping_and_non_finite_verdict_guards() -> None:
+    script = r"""
+const path = require("path");
+const vscode = require("vscode");
+const vm = require(path.resolve(process.argv[1], "view_model.js"));
+const renderers = require(path.resolve(process.argv[1], "renderers.js"));
+const ext = require(path.resolve(process.argv[1], "extension.js"));
+const stats = {
+  saved_tokens: 1000,
+  baseline_tokens: 2000,
+  reduction_pct: 50,
+  installed_at: "2026-11[x](command:contextGuard.update)",
+};
+const insights = {
+  cacheHitLabel: "90.0%",
+  doctor: { statusLabel: "OK (4/4)" },
+  sunsetVerdict: { windowDays: NaN, targetDays: 30, netSaved: Infinity, status: "collecting_30d_window" },
+};
+const mdEmpty = renderers.buildTooltipMarkdown(vscode.MarkdownString, "3.99.0[pwn](command:contextGuard.update)<img src=x>", null).value;
+const mdFull = renderers.buildTooltipMarkdown(vscode.MarkdownString, "3.99.0[pwn](command:contextGuard.update)<img src=x>", stats, "", insights).value;
+const sidebar = renderers.renderSidebarHtml("3.99.0", stats, insights);
+const webview = renderers.renderWebviewHtml("3.99.0", stats, insights);
+console.log(JSON.stringify({
+  exported: typeof vm.escapeMarkdownText === "function" && vm.escapeMarkdownText === ext.escapeMarkdownText
+    && typeof renderers.escapeMarkdownText === "function",
+  mdEmpty,
+  mdFull,
+  sidebar,
+  webview,
+  codeSpan: vm.escapeMarkdownCodeSpan("a`b\rc\nd&<e>"),
+}));
+"""
+    res = _run_node(script, str(EXT_DIR))
+    assert res["exported"] is True
+    for text in (res["mdEmpty"], res["mdFull"]):
+        assert "[pwn](command:" not in text
+        assert "<img" not in text
+    assert "[x](command:" not in res["mdFull"]
+    for out in (res["mdFull"], res["sidebar"], res["webview"]):
+        assert "NaN" not in out
+        assert "Infinity" not in out
+    assert "&amp;&lt;e&gt;" in res["codeSpan"]
+
+
+def test_extension_json_cache_doctor_ttl_stale_usage_refresh_and_update_promise(tmp_path: Path) -> None:
+    plugin_dir = tmp_path / "cg-cache"
+    (plugin_dir / "bin").mkdir(parents=True)
+    (plugin_dir / "telemetry").mkdir(parents=True)
+    (plugin_dir / "plugin.json").write_text('{"version":"3.99.0"}\n', encoding="utf-8")
+    (plugin_dir / "hooks.json").write_text("{}\n", encoding="utf-8")
+    (plugin_dir / "bin" / "cg_status.py").write_text("# stub\n", encoding="utf-8")
+    (plugin_dir / "telemetry" / "stats.json").write_text('{"saved_tokens":100,"baseline_tokens":200}\n', encoding="utf-8")
+    (plugin_dir / "telemetry" / "update.json").write_text('{"state":"current","checked_at":"2099-01-01T00:00:00Z"}\n', encoding="utf-8")
+    usage_path = plugin_dir / "telemetry" / "token_usage.json"
+    usage_path.write_text('{"totals":{},"by_day":{}}\n', encoding="utf-8")
+
+    script = r"""
+const Module = require("module");
+const path = require("path");
+const fs = require("fs");
+const childProcess = require("child_process");
+
+const registered = {};
+let sidebarProvider = null;
+const execCalls = [];
+let statProbeCount = 0;
+let readStatsCount = 0;
+let fakeNow = 1000000;
+Date.now = () => fakeNow;
+
+const origReadFileSync = fs.readFileSync.bind(fs);
+fs.readFileSync = (p, enc) => {
+  if (String(p).endsWith("stats.json")) readStatsCount += 1;
+  return origReadFileSync(p, enc);
+};
+const origExistsSync = fs.existsSync.bind(fs);
+fs.existsSync = (p) => {
+  if (String(p).endsWith("plugin.json")) statProbeCount += 1;
+  return origExistsSync(p);
+};
+fs.watchFile = () => {};
+fs.unwatchFile = () => {};
+childProcess.execFile = (bin, args, opts, cb) => {
+  execCalls.push({ bin, args: [...args], opts: { ...opts } });
+  if (cb) cb(null, "", "");
+};
+
+const origLoad = Module._load;
+Module._load = function(request, parent, isMain) {
+  if (request === "vscode") {
+    return {
+      MarkdownString: class { constructor() { this.value = ""; } appendMarkdown(s) { this.value += s; } },
+      ThemeColor: class { constructor(id) { this.id = id; } },
+      StatusBarAlignment: { Right: 2 },
+      ViewColumn: { One: 1 },
+      ProgressLocation: { Notification: 15 },
+      window: {
+        createStatusBarItem: () => ({ show() {}, text: "", tooltip: "", name: "", command: "" }),
+        registerWebviewViewProvider: (id, prov) => { if (id === "contextGuard.sidebarView") sidebarProvider = prov; return { dispose() {} }; },
+        createWebviewPanel: () => ({ webview: { html: "" }, onDidDispose() {}, reveal() {} }),
+        showInformationMessage: async () => undefined,
+        showErrorMessage: async () => undefined,
+        withProgress: async (_o, fn) => fn(),
+      },
+      commands: { registerCommand: (id, fn) => { registered[id] = fn; return { dispose() {} }; }, executeCommand: () => {} },
+    };
+  }
+  return origLoad.apply(this, arguments);
+};
+
+process.env.CONTEXT_GUARD_HOME = process.argv[2];
+const ext = require(path.resolve(process.argv[1], "extension.js"));
+const statsPath = path.join(process.argv[2], "telemetry", "stats.json");
+const usagePath = path.join(process.argv[2], "telemetry", "token_usage.json");
+
+(async () => {
+  const freshAtMs = fs.statSync(usagePath).mtimeMs;
+  fakeNow = freshAtMs + 1000;
+  const ctx = { subscriptions: [], globalState: { get: () => false, update: async () => {} } };
+  ext.activate(ctx);
+  const execAfterFreshActivate = execCalls.length;
+  ext.updateStatusBar();
+  const readAfterCacheHit = readStatsCount;
+  const probesAfterCacheHit = statProbeCount;
+
+  fakeNow = freshAtMs + 31000;
+  ext.updateStatusBar();
+  const probesAfterTtlExpiry = statProbeCount;
+
+  fs.writeFileSync(statsPath, '{"saved_tokens":250,"baseline_tokens":500}\n');
+  ext.updateStatusBar();
+  const readAfterOverwrite = readStatsCount;
+  fs.unlinkSync(statsPath);
+  const afterUnlink = ext.updateStatusBar();
+
+  fakeNow = freshAtMs + 700000;
+  let visCb = null;
+  sidebarProvider.resolveWebviewView({
+    webview: { options: {}, html: "" },
+    visible: true,
+    onDidDispose() {},
+    onDidChangeVisibility(cb) { visCb = cb; },
+  });
+  const execAfterStaleSidebar = execCalls.length;
+  visCb();
+  const execAfterVisibility = execCalls.length;
+  registered["contextGuard.showReport"]();
+  const execAfterShowReport = execCalls.length;
+
+  const probesBeforeRefresh = statProbeCount;
+  registered["contextGuard.refresh"]();
+  const probesAfterRefresh = statProbeCount;
+
+  const updatePromise = registered["contextGuard.update"]();
+  const isPromise = updatePromise && typeof updatePromise.then === "function";
+  const updateResult = await updatePromise;
+
+  const updatePath = path.join(process.argv[2], "telemetry", "update.json");
+  fs.writeFileSync(updatePath, '{"state":"install_pending","local":"3.99.0","checked_at":"2099-01-01T00:00:00Z"}\n');
+  const probesBeforeRunUpdate = statProbeCount;
+  const runUpdateOk = await registered["contextGuard.update"]();
+  const probesAfterRunUpdate = statProbeCount;
+
+  fs.writeFileSync(statsPath, '{"saved_tokens":250,"baseline_tokens":500}\n');
+  ext.updateStatusBar();
+  ext.deactivate();
+  const readsBeforeReactivate = readStatsCount;
+  const probesBeforeReactivate = statProbeCount;
+  ext.activate(ctx);
+  const readsAfterReactivate = readStatsCount;
+  const probesAfterReactivate = statProbeCount;
+  ext.deactivate();
+
+  console.log(JSON.stringify({
+    execAfterFreshActivate,
+    readAfterCacheHit,
+    probesAfterCacheHit,
+    probesAfterTtlExpiry,
+    readAfterOverwrite,
+    afterUnlinkNull: afterUnlink.stats === null,
+    execAfterStaleSidebar,
+    execAfterVisibility,
+    execAfterShowReport,
+    probesBeforeRefresh,
+    probesAfterRefresh,
+    isPromise,
+    updateResult,
+    runUpdateOk,
+    probesBeforeRunUpdate,
+    probesAfterRunUpdate,
+    readsBeforeReactivate,
+    readsAfterReactivate,
+    probesBeforeReactivate,
+    probesAfterReactivate,
+    allUsageWindowsHide: execCalls.filter((c) => c.args.includes("--usage")).every((c) => c.opts.windowsHide === true),
+  }));
+})();
+"""
+    proc = subprocess.run(
+        ["node", "-e", script, str(EXT_DIR), str(plugin_dir)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    res = json.loads(proc.stdout.strip())
+    assert res["execAfterFreshActivate"] == 0
+    assert res["readAfterCacheHit"] == 1
+    assert res["probesAfterCacheHit"] == 1
+    assert res["probesAfterTtlExpiry"] == 2
+    assert res["readAfterOverwrite"] == 2
+    assert res["afterUnlinkNull"] is True
+    assert res["execAfterStaleSidebar"] == 1
+    assert res["execAfterVisibility"] == 2
+    assert res["execAfterShowReport"] == 3
+    assert res["probesAfterRefresh"] > res["probesBeforeRefresh"]
+    assert res["isPromise"] is True
+    assert res["updateResult"] is False
+    assert res["runUpdateOk"] is True
+    assert res["probesAfterRunUpdate"] > res["probesBeforeRunUpdate"]
+    assert res["readsAfterReactivate"] > res["readsBeforeReactivate"]
+    assert res["probesAfterReactivate"] > res["probesBeforeReactivate"]
+    assert res["allUsageWindowsHide"] is True
+
