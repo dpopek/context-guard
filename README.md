@@ -1,4 +1,4 @@
-# Context-Guard (v4.1.2)
+# Context-Guard (v4.1.3)
 
 Zero-prompt security guard, silent range-trim, machine-artifact unwrapper, and multi-harness telemetry plugin for **Google Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex CLI/App** across **macOS, Linux, and Windows**.
 
@@ -105,10 +105,10 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 ## Installation & Multi-Harness Setup
 
 ```bash
-# 1. Clone into Antigravity Plugins Directory (or unpack dist/context-guard-v4.1.2.zip)
+# 1. Clone into Antigravity Plugins Directory (or unpack dist/context-guard-v4.1.3.zip)
 git clone https://github.com/dpopek/context-guard.git ~/.gemini/config/plugins/context-guard
 
-# 2. Install hooks & advox.context-guard-statusbar-4.1.2 extension across all harnesses
+# 2. Install hooks & advox.context-guard-statusbar-4.1.3 extension across all harnesses
 python3 ~/.gemini/config/plugins/context-guard/bin/install_harnesses.py --install
 
 # Check status, preview dry-run, or uninstall cleanly

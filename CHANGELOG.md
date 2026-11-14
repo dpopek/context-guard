@@ -5,6 +5,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 
 ## [Unreleased]
 
+## [4.1.3] - 2026-11-14
+
+### Fixed
+- **Windows shell tokenization:** Preserve backslashes on Windows/drive paths and strip .exe/.cmd/.bat in shell_parser.
+- **Windows test isolation:** Mirror HOME to USERPROFILE in test fixtures and guard NTFS-invalid filenames in tests.
+
+### Added
+- **Public push guard:** Added executable .githooks/pre-push blocking pre-orphan branches and .local emails on GitHub.
+
 ## [4.1.2] - 2026-11-14
 
 ### Added

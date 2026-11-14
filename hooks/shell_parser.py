@@ -17,7 +17,8 @@ _SED_CLAUSE_PLUS_RE = re.compile(r"^(\d+)\s*,\s*\+\s*(\d+)\s*p$")
 _SED_CLAUSE_EOF_RE = re.compile(r"^(\d+)\s*,\s*\$\s*p$")
 _SED_CLAUSE_QUIT_RE = re.compile(r"^\d+\s*q$")
 _SHELL_OUTLINE_CMD_RE = re.compile(
-    r"^\s*(?:(?:[\w./:\\-]+[\\/])?python3?(?:\.\d+)?\s+(?:-[a-zA-Z0-9]+\s+)*)?(?:[~$\w./:\\-]+[\\/])?(?:outline\.py|cg-outline)\s+\S+"
+    r"^\s*(?:(?:[\w./:\\-]+[\\/])?python3?(?:\.\d+)?(?:\.exe)?\s+(?:-[a-zA-Z0-9]+\s+)*)?(?:[~$\w./:\\-]+[\\/])?(?:outline\.py|cg-outline(?:\.(?:exe|cmd|bat))?)\s+\S+",
+    re.IGNORECASE,
 )
 _PYTEST_SINGLE_CMD_RE = re.compile(
     r"^\s*(?:(?:poetry|uv|pipenv|pdm)\s+run\s+)?(?:(?:[\w./-]+/)?pytest|(?:[\w./-]+/)?python3?(?:\.\d+)?\s+-m\s+pytest)(?:\s+.*)?$"
@@ -56,7 +57,50 @@ def split_leading_cd_prefix(command: str) -> tuple[str, str]:
     return (match.group(1), match.group(2)) if match else ("", command)
 
 
+def _cmd_basename(token: str) -> str:
+    name = token.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    for ext in (".exe", ".cmd", ".bat"):
+        if name.endswith(ext):
+            return name[: -len(ext)]
+    return name
+
+
 def _split_tokens(text: str) -> list[str] | None:
+    if "\\" in text:
+        out: list[str] = []
+        has_drive, tok_len, quote, i, n = False, 0, "", 0, len(text)
+        while i < n:
+            ch = text[i]
+            if quote:
+                out.append(ch)
+                if ch == "\\" and quote == '"' and i + 1 < n:
+                    i += 1
+                    out.append(text[i])
+                elif ch == quote:
+                    quote = ""
+            elif ch in ("'", '"'):
+                quote = ch
+                out.append(ch)
+            elif ch.isspace() or ch in "|&;()<>=":
+                has_drive, tok_len = False, 0
+                out.append(ch)
+            elif ch == "\\" and i + 1 < n:
+                nxt = text[i + 1]
+                if nxt == "\\":
+                    out.append("\\\\\\\\" if os.name == "nt" and tok_len == 0 else "\\\\")
+                elif (has_drive or os.name == "nt") and not nxt.isspace() and nxt not in "\"'|&;<>()$`":
+                    out.append("\\\\" + nxt)
+                else:
+                    out.append("\\" + nxt)
+                tok_len += 1
+                i += 1
+            else:
+                if tok_len == 1 and ch == ":" and out[-1].isalpha():
+                    has_drive = True
+                tok_len += 1
+                out.append(ch)
+            i += 1
+        text = "".join(out)
     try:
         return shlex.split(text)
     except ValueError:
@@ -176,14 +220,14 @@ def extract_outline_pull_targets(command_line: str, cwd: str | None = None) -> l
     tokens = _split_tokens(remainder)
     if not tokens:
         return []
-    idx = next((i for i, t in enumerate(tokens) if t.replace("\\", "/").rsplit("/", 1)[-1] in ("outline.py", "cg-outline")), -1)
+    idx = next((i for i, t in enumerate(tokens) if _cmd_basename(t) in ("outline.py", "cg-outline")), -1)
     return _resolve_shell_targets(tokens[idx + 1 :], _effective_cwd(cd_prefix, cwd)) if idx >= 0 else []
 
 
 def is_unbounded_shell_dump(command_line: str) -> bool:
     """Return True iff the first pipeline segment invokes an unbounded shell file dumper."""
     tokens = _split_tokens(_first_pipeline_segment(split_leading_cd_prefix(command_line)[1]))
-    return bool(tokens and tokens[0].replace("\\", "/").rsplit("/", 1)[-1] in _UNBOUNDED_SHELL_DUMP_BINS)
+    return bool(tokens and _cmd_basename(tokens[0]) in _UNBOUNDED_SHELL_DUMP_BINS)
 
 
 def extract_shell_read_targets(command_line: str, cwd: str | None = None) -> list[str]:
@@ -192,7 +236,7 @@ def extract_shell_read_targets(command_line: str, cwd: str | None = None) -> lis
     tokens = _split_tokens(_first_pipeline_segment(remainder))
     if not tokens:
         return []
-    bin_name = tokens[0].replace("\\", "/").rsplit("/", 1)[-1]
+    bin_name = _cmd_basename(tokens[0])
     if bin_name not in _SHELL_READER_BINS or (bin_name == "sed" and _is_sed_in_place(tokens[1:])):
         return []
     return _resolve_shell_targets(tokens[1:], _effective_cwd(cd_prefix, cwd))
@@ -316,7 +360,7 @@ def is_bounded_shell_read(command_line: str, total_lines: int | None = None, max
         tokens = _split_tokens(seg)
         if not tokens:
             return False
-        cmd = tokens[0].replace("\\", "/").rsplit("/", 1)[-1]
+        cmd = _cmd_basename(tokens[0])
         if cmd in ("cat", "nl", "bat"):
             continue
         eff_total = total_lines if upstream_is_raw else bound
@@ -356,7 +400,7 @@ def _grep_should_inject_file_excludes(args_str: str) -> bool:
 
 def _grep_targets_excluded_dir(args_str: str) -> bool:
     tokens = _split_tokens(args_str)
-    return True if tokens is None else any(_GREP_EXCLUDED_DIRS.intersection(t.split("/")) for t in [t for t in tokens if not t.startswith("-")][1:])
+    return True if tokens is None else any(_GREP_EXCLUDED_DIRS.intersection(t.replace("\\", "/").split("/")) for t in [t for t in tokens if not t.startswith("-")][1:])
 
 
 def _twg_has_relative_file_arg(args_str: str) -> bool:

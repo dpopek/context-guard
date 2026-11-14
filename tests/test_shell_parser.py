@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import ntpath
 import os
 import random
 import statistics
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from hooks import pre_tool_use as ptu, shell_parser
 from hooks.shell_output import classify_family
 from hooks.shell_parser import (
     extract_outline_pull_targets,
     extract_shell_read_targets,
+    is_bounded_shell_read,
     is_outline_pull,
     is_unbounded_shell_dump,
     rewrite_quiet_cli_flags,
@@ -106,10 +109,16 @@ def test_extract_shell_read_targets_and_unbounded_dump_detection(tmp_path: Path)
     assert extract_shell_read_targets(f"pytest {a_py}") == []
     assert extract_shell_read_targets('cat "unterminated') == []
 
-    pipe_py = sub / "a|b.py"
-    pipe_py.write_text("p = 1\n", encoding="utf-8")
-    assert is_unbounded_shell_dump(f'cat "{pipe_py}"') is True
-    assert extract_shell_read_targets(f'cat "{pipe_py}"') == [os.path.realpath(pipe_py)]
+    space_py = sub / "a b.py"
+    space_py.write_text("s = 1\n", encoding="utf-8")
+    assert is_unbounded_shell_dump(f'cat "{space_py}"') is True
+    assert extract_shell_read_targets(f'cat "{space_py}"') == [os.path.realpath(space_py)]
+
+    if os.name != "nt":
+        pipe_py = sub / "a|b.py"
+        pipe_py.write_text("p = 1\n", encoding="utf-8")
+        assert is_unbounded_shell_dump(f'cat "{pipe_py}"') is True
+        assert extract_shell_read_targets(f'cat "{pipe_py}"') == [os.path.realpath(pipe_py)]
     assert extract_shell_read_targets(f"awk -F'|' '{{print $1}}' {a_py}") == [os.path.realpath(a_py)]
     assert extract_shell_read_targets(f"sed -n '/a|b/p' {a_py}") == [os.path.realpath(a_py)]
     assert extract_shell_read_targets(f"cat {a_py} > {b_py}") == [os.path.realpath(a_py)]
@@ -320,3 +329,44 @@ def test_shell_parser_and_read_planner_hot_path_latency_budget(tmp_path: Path) -
     budget_ms = 25.0 if os.name == "nt" else 10.0
     assert median_ms < budget_ms, f"Hot-path median latency {median_ms:.2f} ms exceeded {budget_ms} ms budget"
     assert len(Path(shell_parser.__file__).read_text(encoding="utf-8").splitlines()) <= 800
+
+
+def test_windows_backslash_paths_in_shell_commands(monkeypatch) -> None:
+    win_mod = r"C:\Users\alice\AppData\Local\Temp\mod.py"
+    win_root = r"C:\Users\alice\Temp"
+    win_a = rf"{win_root}\a.py"
+    win_pkg_a = rf"{win_root}\pkg\a.py"
+    win_other = rf"{win_root}\other.py"
+    win_pipe = rf"{win_root}\a|b.py"
+
+    assert is_outline_pull(rf"cg-outline {win_mod}") is True
+    assert is_outline_pull(rf"cg-outline.cmd {win_mod}") is True
+    assert is_outline_pull(rf"C:\Python313\python.exe C:\Users\alice\hooks\outline.py {win_mod}") is True
+    assert is_unbounded_shell_dump(rf"cat {win_mod}") is True
+    assert is_unbounded_shell_dump(rf"CAT.EXE {win_mod}") is True
+    assert is_bounded_shell_read(rf"sed -n '1,40p' {win_mod}") is True
+    assert is_bounded_shell_read(rf"head.exe -n 20 {win_mod}") is True
+
+    existing_win_paths = {win_a, win_pkg_a, win_other, win_pipe}
+    fake_nt_os = SimpleNamespace(
+        name="nt",
+        path=SimpleNamespace(
+            expanduser=ntpath.expanduser,
+            isabs=ntpath.isabs,
+            join=ntpath.join,
+            realpath=ntpath.normpath,
+            isfile=lambda p: p in existing_win_paths,
+            basename=ntpath.basename,
+        ),
+    )
+    monkeypatch.setattr(shell_parser, "os", fake_nt_os)
+
+    assert extract_outline_pull_targets(rf"cg-outline.cmd {win_a}", cwd=win_root) == [win_a]
+    assert extract_shell_read_targets(rf"cat {win_a}") == [win_a]
+    assert extract_shell_read_targets(rf"CAT.EXE {win_a}") == [win_a]
+    assert extract_shell_read_targets(f'cat "{win_pipe}"') == [win_pipe]
+    assert extract_shell_read_targets(rf"cd {win_root} && cat pkg\a.py") == [win_pkg_a]
+    assert extract_shell_read_targets(rf"cat {win_a} < {win_other}") == [win_a]
+    assert extract_shell_read_targets(rf"cat <{win_other}") == []
+    assert extract_shell_read_targets(rf"sed -e 's/i/x/' {win_a}") == [win_a]
+    assert extract_shell_read_targets(rf"sed -i.bak 's/i/x/' {win_a}") == []

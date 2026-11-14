@@ -143,10 +143,11 @@ def test_readme_and_plugin_description_conciseness_budgets() -> None:
     desc = plugin_json.get("description", "")
     assert 80 <= len(desc) <= 300, f"plugin.json description should be 80..300 chars, got {len(desc)}"
 
-    pre_commit = ROOT / ".githooks" / "pre-commit"
-    assert pre_commit.is_file(), "Missing .githooks/pre-commit doc-sync enforcement hook"
-    assert os.access(pre_commit, os.X_OK), ".githooks/pre-commit must be executable"
-    pre_commit_text = pre_commit.read_text(encoding="utf-8")
+    for hook_name in ("pre-commit", "pre-push"):
+        hook_path = ROOT / ".githooks" / hook_name
+        assert hook_path.is_file(), f"Missing .githooks/{hook_name} guard hook"
+        assert os.access(hook_path, os.X_OK), f".githooks/{hook_name} must be executable"
+    pre_commit_text = (ROOT / ".githooks" / "pre-commit").read_text(encoding="utf-8")
     assert "tests/test_version_source.py" in pre_commit_text
     assert "tests/test_module_boundaries.py" in pre_commit_text
 

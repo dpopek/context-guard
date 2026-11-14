@@ -187,6 +187,7 @@ def test_checkout_without_local_stats_warns_when_installed_telemetry_exists(
     (checkout_root / "telemetry" / "token_usage.json").write_text("{}", encoding="utf-8")
 
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
     monkeypatch.delenv("CONTEXT_GUARD_HOME", raising=False)
     monkeypatch.setattr(cg_status, "resolve_plugin_root", lambda default_root=None: checkout_root)
 
@@ -214,6 +215,7 @@ def test_checkout_warning_suppressed_with_env_explicit_paths_or_local_stats(
     (checkout_root / "telemetry").mkdir(parents=True)
 
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
     monkeypatch.setattr(cg_status, "resolve_plugin_root", lambda default_root=None: checkout_root)
 
     # 1. Suppressed when CONTEXT_GUARD_HOME is explicitly set.

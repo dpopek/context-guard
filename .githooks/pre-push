@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REMOTE_URL="${2:-}"
+if [[ "$REMOTE_URL" != *github.com* ]]; then
+  exit 0
+fi
+
+PUBLIC_ROOT="b90043f81b72ec1f5fcc961d7e3b891b5db76823"
+if ! git cat-file -e "${PUBLIC_ROOT}^{commit}" 2>/dev/null; then
+  exit 0
+fi
+
+while read -r local_ref local_sha remote_ref _remote_sha; do
+  if [[ -z "${local_sha:-}" || "$local_sha" =~ ^0+$ ]]; then
+    continue
+  fi
+  commit_sha="$(git rev-parse "${local_sha}^{commit}" 2>/dev/null || true)"
+  if [[ -z "$commit_sha" ]]; then
+    continue
+  fi
+  if ! git merge-base --is-ancestor "$PUBLIC_ROOT" "$commit_sha"; then
+    echo "[context-guard pre-push] ERROR: Ref '$local_ref' ($commit_sha) does not descend from public root $PUBLIC_ROOT." >&2
+    echo "[context-guard pre-push] Refusing to push pre-orphan or un-sanitized history to public GitHub." >&2
+    exit 1
+  fi
+  if git log --format='%ae%n%ce' "${PUBLIC_ROOT}..${commit_sha}" | grep -Eiq '\.local$'; then
+    echo "[context-guard pre-push] ERROR: Ref '$local_ref' contains commit(s) with a '.local' author/committer email." >&2
+    exit 1
+  fi
+done

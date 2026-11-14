@@ -18,6 +18,7 @@ def _isolate_telemetry_ledgers(
     """Keep calls without an explicit path (including child subprocesses) away from live ~/.gemini and checkout ledgers."""
     isolated_home = tmp_path_factory.mktemp("isolated-home")
     monkeypatch.setenv("HOME", str(isolated_home))
+    monkeypatch.setenv("USERPROFILE", str(isolated_home))
     monkeypatch.setenv(
         "CONTEXT_GUARD_HOME",
         str(isolated_home / ".gemini" / "config" / "plugins" / "context-guard"),
