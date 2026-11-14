@@ -10,7 +10,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "run_command|read_file|view_file|edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file|call_mcp_tool",
+        "matcher": "run_command|read_file|view_file|edit_file|write_file|replace_file_content|multi_replace_file_content|write_to_file|call_mcp_tool|mcp_gitlab_.*|mcp_bigquery_.*|mcp_data-agent-kit-plugin_dak-bigquery_.*|mcp_datacloud_bigquery_remote_.*",
         "hooks": [
           {
             "type": "command",

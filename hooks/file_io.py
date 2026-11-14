@@ -110,3 +110,12 @@ def compute_file_sha256(path: str) -> str | None:
         return digest.hexdigest()
     except OSError:
         return None
+
+
+def normalize_cmd_basename(token: str) -> str:
+    """Return lowercase command basename with path prefixes and Windows executable suffixes stripped."""
+    name = token.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    for ext in (".exe", ".cmd", ".bat"):
+        if name.endswith(ext):
+            return name[: -len(ext)]
+    return name

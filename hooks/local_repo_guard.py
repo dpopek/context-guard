@@ -10,51 +10,24 @@ from typing import Any
 from hooks.config import DEFAULT_USER_CONFIG_PATH, KNOWN_HARNESSES, cached_raw_config_status
 from hooks.state_store import StateTxn, locked_state
 
-GITLAB_REPO_LOOKUP_TOOLS = frozenset(
-    {
-        "search_repositories",
-        "list_projects",
-        "get_project",
-        "get_repository_tree",
-        "get_file_contents",
-        "get_branch",
-        "list_branches",
-        "get_commit",
-        "get_file_blame",
-    }
-)
-BIGQUERY_MCP_SERVERS = frozenset(
-    {
-        "bigquery",
-        "data-agent-kit-plugin_dak-bigquery",
-        "datacloud_bigquery_remote",
-    }
-)
+GITLAB_REPO_LOOKUP_TOOLS = frozenset({
+    "search_repositories", "list_projects", "get_project", "get_repository_tree",
+    "get_file_contents", "get_branch", "list_branches", "get_commit", "get_file_blame",
+})
+BIGQUERY_MCP_SERVERS = frozenset({"bigquery", "data-agent-kit-plugin_dak-bigquery", "datacloud_bigquery_remote"})
 BIGQUERY_SQL_TOOLS = frozenset({"execute_sql_readonly", "execute_sql"})
-_SQL_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
-_SQL_LINE_COMMENT_RE = re.compile(r"--[^\n]*")
 
 
 def load_guard_config(config_path: Path | None = None) -> dict[str, Any]:
     """Load optional workspace and BigQuery guard configuration from disk or env."""
     default_cfg: dict[str, Any] = {
-        "workspace_root": None,
-        "repo_map_path": None,
-        "repo_map_doc": "",
-        "restricted_bq_datasets": (),
-        "allowed_bq_views_dataset": "",
-        "allowed_bq_views_hint": "",
-        "bq_schema_doc": "",
-        "allow_bq_raw_ddl_maintenance": False,
-        "allow_governance_mutations": False,
-        "enforce_governance_policy": False,
-        "model_labels": {},
-        "config_error": None,
+        "workspace_root": None, "repo_map_path": None, "repo_map_doc": "",
+        "restricted_bq_datasets": (), "allowed_bq_views_dataset": "", "allowed_bq_views_hint": "",
+        "bq_schema_doc": "", "allow_bq_raw_ddl_maintenance": False,
+        "allow_governance_mutations": False, "enforce_governance_policy": False,
+        "model_labels": {}, "config_error": None,
     }
-    raw, config_err = cached_raw_config_status(
-        config_path,
-        default_path=DEFAULT_USER_CONFIG_PATH,
-    )
+    raw, config_err = cached_raw_config_status(config_path, default_path=DEFAULT_USER_CONFIG_PATH)
     if config_err is not None:
         return {**default_cfg, "config_error": config_err}
     if raw is None:
@@ -63,100 +36,53 @@ def load_guard_config(config_path: Path | None = None) -> dict[str, Any]:
     if "restricted_bq_datasets" in raw and raw["restricted_bq_datasets"] is not None:
         rds = raw["restricted_bq_datasets"]
         if not isinstance(rds, list) or any(not isinstance(d, str) or not d.strip() for d in rds):
-            return {
-                **default_cfg,
-                "config_error": "invalid 'restricted_bq_datasets': expected list of non-empty strings",
-            }
+            return {**default_cfg, "config_error": "invalid 'restricted_bq_datasets': expected list of non-empty strings"}
     for str_key in (
-        "allowed_bq_views_dataset",
-        "allowed_bq_views_hint",
-        "bq_schema_doc",
-        "workspace_root",
-        "repo_map_path",
-        "repo_map_doc",
+        "allowed_bq_views_dataset", "allowed_bq_views_hint", "bq_schema_doc",
+        "workspace_root", "repo_map_path", "repo_map_doc",
     ):
         if str_key in raw and raw[str_key] is not None and not isinstance(raw[str_key], str):
-            return {
-                **default_cfg,
-                "config_error": f"invalid '{str_key}': expected string",
-            }
-    for bool_key in (
-        "allow_bq_raw_ddl_maintenance",
-        "allow_governance_mutations",
-        "enforce_governance_policy",
-    ):
+            return {**default_cfg, "config_error": f"invalid '{str_key}': expected string"}
+    for bool_key in ("allow_bq_raw_ddl_maintenance", "allow_governance_mutations", "enforce_governance_policy"):
         if bool_key in raw and raw[bool_key] is not None and not isinstance(raw[bool_key], bool):
-            return {
-                **default_cfg,
-                "config_error": f"invalid '{bool_key}': expected boolean",
-            }
+            return {**default_cfg, "config_error": f"invalid '{bool_key}': expected boolean"}
 
-    ws_raw = raw.get("workspace_root")
-    workspace_root = (
-        Path(ws_raw).expanduser() if isinstance(ws_raw, str) and ws_raw.strip() else None
-    )
-    map_raw = raw.get("repo_map_path")
+    ws_raw, map_raw, doc_raw = raw.get("workspace_root"), raw.get("repo_map_path"), raw.get("repo_map_doc")
+    workspace_root = Path(ws_raw).expanduser() if isinstance(ws_raw, str) and ws_raw.strip() else None
     repo_map_path = (
-        Path(map_raw).expanduser()
-        if isinstance(map_raw, str) and map_raw.strip()
+        Path(map_raw).expanduser() if isinstance(map_raw, str) and map_raw.strip()
         else (workspace_root / "docs" / "local_repository_map.json" if workspace_root else None)
     )
-    doc_raw = raw.get("repo_map_doc")
     repo_map_doc = (
-        doc_raw.strip()
-        if isinstance(doc_raw, str) and doc_raw.strip()
+        doc_raw.strip() if isinstance(doc_raw, str) and doc_raw.strip()
         else (str(workspace_root / "docs" / "local_repository_map.md") if workspace_root else "")
     )
     raw_datasets = raw.get("restricted_bq_datasets")
-    restricted_bq_datasets = (
-        tuple(d.strip() for d in raw_datasets if isinstance(d, str) and d.strip())
-        if isinstance(raw_datasets, list)
-        else ()
-    )
-    views_ds = raw.get("allowed_bq_views_dataset")
+    restricted_bq_datasets = tuple(d.strip() for d in raw_datasets if isinstance(d, str) and d.strip()) if isinstance(raw_datasets, list) else ()
+    views_ds, views_hint = raw.get("allowed_bq_views_dataset"), raw.get("allowed_bq_views_hint")
     allowed_bq_views_dataset = views_ds.strip() if isinstance(views_ds, str) else ""
-    views_hint = raw.get("allowed_bq_views_hint")
     allowed_bq_views_hint = (
-        views_hint.strip()
-        if isinstance(views_hint, str) and views_hint.strip()
+        views_hint.strip() if isinstance(views_hint, str) and views_hint.strip()
         else (f"{allowed_bq_views_dataset}.*" if allowed_bq_views_dataset else "authorized views")
     )
-    schema_raw = raw.get("bq_schema_doc")
+    schema_raw, labels_raw = raw.get("bq_schema_doc"), raw.get("model_labels")
     bq_schema_doc = schema_raw.strip() if isinstance(schema_raw, str) else ""
-    labels_raw = raw.get("model_labels")
     model_labels = (
-        {
-            harness: value.strip()
-            for harness, value in labels_raw.items()
-            if harness in KNOWN_HARNESSES and isinstance(value, str) and value.strip()
-        }
-        if isinstance(labels_raw, dict)
-        else {}
+        {h: v.strip() for h, v in labels_raw.items() if h in KNOWN_HARNESSES and isinstance(v, str) and v.strip()}
+        if isinstance(labels_raw, dict) else {}
     )
-
-    allow_bq_raw_ddl_maintenance = raw.get("allow_bq_raw_ddl_maintenance") is True
-    allow_governance_mutations = raw.get("allow_governance_mutations") is True
-    enforce_governance_policy = raw.get("enforce_governance_policy") is True
-
     return {
-        "workspace_root": workspace_root,
-        "repo_map_path": repo_map_path,
-        "repo_map_doc": repo_map_doc,
-        "restricted_bq_datasets": restricted_bq_datasets,
-        "allowed_bq_views_dataset": allowed_bq_views_dataset,
-        "allowed_bq_views_hint": allowed_bq_views_hint,
-        "bq_schema_doc": bq_schema_doc,
-        "allow_bq_raw_ddl_maintenance": allow_bq_raw_ddl_maintenance,
-        "allow_governance_mutations": allow_governance_mutations,
-        "enforce_governance_policy": enforce_governance_policy,
-        "model_labels": model_labels,
-        "config_error": None,
+        "workspace_root": workspace_root, "repo_map_path": repo_map_path, "repo_map_doc": repo_map_doc,
+        "restricted_bq_datasets": restricted_bq_datasets, "allowed_bq_views_dataset": allowed_bq_views_dataset,
+        "allowed_bq_views_hint": allowed_bq_views_hint, "bq_schema_doc": bq_schema_doc,
+        "allow_bq_raw_ddl_maintenance": raw.get("allow_bq_raw_ddl_maintenance") is True,
+        "allow_governance_mutations": raw.get("allow_governance_mutations") is True,
+        "enforce_governance_policy": raw.get("enforce_governance_policy") is True,
+        "model_labels": model_labels, "config_error": None,
     }
 
 
-def extract_gitlab_lookup_target(
-    tool_name: str, args: dict[str, Any]
-) -> tuple[str, dict[str, Any]] | None:
+def extract_gitlab_lookup_target(tool_name: str, args: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
     """Return (gitlab_tool_name, tool_arguments) if tool_call is a GitLab repo/file lookup."""
     if tool_name == "call_mcp_tool":
         server = str(args.get("ServerName") or "").strip().lower()
@@ -195,45 +121,20 @@ def _load_local_repositories(map_path: Path | None) -> list[dict[str, Any]]:
         return []
 
 
-GENERIC_REPO_BASENAMES = frozenset(
-    {
-        "project",
-        "backend",
-        "frontend",
-        "production",
-        "stage",
-        "test",
-        "upgradetest",
-        "maintenance",
-        "image",
-        "docker",
-        "native",
-        "meta",
-        "charts",
-        "ci-cd",
-        "ci-cd.yml",
-        "traefik",
-        "docker-swarm",
-        "kubernetes",
-    }
-)
+GENERIC_REPO_BASENAMES = frozenset({
+    "project", "backend", "frontend", "production", "stage", "test", "upgradetest",
+    "maintenance", "image", "docker", "native", "meta", "charts", "ci-cd",
+    "ci-cd.yml", "traefik", "docker-swarm", "kubernetes",
+})
 
 
-def find_matching_local_repos(
-    query_terms: list[str], repos: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
+def find_matching_local_repos(query_terms: list[str], repos: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Match query terms against local repository remote_slug, name, canonical_name, relative_path, and aliases."""
     if not query_terms or not repos:
         return []
-
     exact_matches: list[dict[str, Any]] = []
     substring_matches: list[dict[str, Any]] = []
-
-    norm_terms = [
-        t.replace("\\", "/").lower().strip("/").removesuffix(".git")
-        for t in query_terms
-        if t.strip()
-    ]
+    norm_terms = [t.replace("\\", "/").lower().strip("/").removesuffix(".git") for t in query_terms if t.strip()]
     if not norm_terms:
         return []
 
@@ -277,28 +178,20 @@ def _record_retry_hatch(txn: StateTxn, allowed_list: list[Any], query_sig: str) 
 
 
 def gate_gitlab_local_first(
-    state_dir_path: Path,
-    gitlab_tool: str,
-    tool_args: dict[str, Any],
-    map_path: Path | None = None,
-    config_path: Path | None = None,
+    state_dir_path: Path, gitlab_tool: str, tool_args: dict[str, Any],
+    map_path: Path | None = None, config_path: Path | None = None,
 ) -> dict[str, Any]:
     """Enforce Local-First repository resolution before allowing GitLab MCP repo/file lookups."""
     cfg = load_guard_config(config_path)
     config_error = cfg.get("config_error")
     if isinstance(config_error, str) and config_error:
-        return {
-            "decision": "deny",
-            "reason": f"CONTEXT-GUARD GITLAB CONFIG ERROR (fail-closed): {config_error}",
-        }
+        return {"decision": "deny", "reason": f"CONTEXT-GUARD GITLAB CONFIG ERROR (fail-closed): {config_error}"}
     effective_map_path = map_path or cfg["repo_map_path"]
     repos = _load_local_repositories(effective_map_path)
     if not repos:
         return {"decision": "allow"}
 
-    ws_root = cfg["workspace_root"] or (
-        effective_map_path.parent.parent if effective_map_path else Path.cwd()
-    )
+    ws_root = cfg["workspace_root"] or (effective_map_path.parent.parent if effective_map_path else Path.cwd())
     repo_map_doc = cfg["repo_map_doc"] or str(effective_map_path)
 
     query_terms = _extract_query_terms(tool_args)
@@ -318,19 +211,13 @@ def gate_gitlab_local_first(
             matches = find_matching_local_repos(query_terms, repos)
             if matches:
                 if not _record_retry_hatch(txn, allowed_list, query_sig):
-                    # Unsaved, the promised retry would be denied again forever: fail open,
-                    # like the OSError path below.
+                    # Unsaved, the promised retry would be denied again forever: fail open, like the OSError path below.
                     return {"decision": "allow"}
                 formatted_matches = []
                 for m in matches[:4]:
-                    rel = m.get("relative_path") or m.get("local_path")
-                    cat = m.get("category") or ""
-                    canon = m.get("canonical_name") or m.get("name")
-                    slug = m.get("remote_slug") or ""
-                    formatted_matches.append(
-                        f"  - `{ws_root}/{rel}` "
-                        f"(alias: `{ws_root}/repos/{cat}/{canon}`, remote: `{slug}`)"
-                    )
+                    rel, cat = m.get("relative_path") or m.get("local_path"), m.get("category") or ""
+                    canon, slug = m.get("canonical_name") or m.get("name"), m.get("remote_slug") or ""
+                    formatted_matches.append(f"  - `{ws_root}/{rel}` (alias: `{ws_root}/repos/{cat}/{canon}`, remote: `{slug}`)")
                 match_block = "\n".join(formatted_matches)
                 return {
                     "decision": "deny",
@@ -391,9 +278,7 @@ def is_bigquery_sql_tool_call(tool_name: str, args: Any) -> bool:
     return _match_eager_bigquery_sql_tool(tool_name) is not None
 
 
-def extract_bigquery_sql_target(
-    tool_name: str, args: dict[str, Any]
-) -> tuple[str, str] | None:
+def extract_bigquery_sql_target(tool_name: str, args: dict[str, Any]) -> tuple[str, str] | None:
     """Return (bq_tool_name, sql_query) if tool_call is a BigQuery SQL execution."""
     if tool_name == "call_mcp_tool":
         server = str(args.get("ServerName") or "").strip().lower()
@@ -417,29 +302,59 @@ def extract_bigquery_sql_target(
 
 
 def strip_sql_comments(sql_query: str) -> str:
-    """Remove block and line comments from SQL before pattern matching."""
-    no_block = _SQL_BLOCK_COMMENT_RE.sub(" ", sql_query)
-    return _SQL_LINE_COMMENT_RE.sub(" ", no_block)
-
-
-_strip_sql_comments = strip_sql_comments
+    """Remove block and line comments outside SQL string literals and backtick identifiers."""
+    out: list[str] = []
+    i, n = 0, len(sql_query)
+    while i < n:
+        ch = sql_query[i]
+        if ch in "rRbB" and (i == 0 or not (sql_query[i - 1].isalnum() or sql_query[i - 1] == "_")):
+            if i + 2 < n and sql_query[i : i + 2].lower() in ("rb", "br") and sql_query[i + 2] in "'\"":
+                out.append(sql_query[i : i + 2])
+                i += 2
+                continue
+            if i + 1 < n and sql_query[i + 1] in "'\"":
+                out.append(ch)
+                i += 1
+                continue
+        if ch in "'\"`":
+            delim = sql_query[i : i + 3] if ch != "`" and sql_query[i : i + 3] in ("'''", '"""') else ch
+            out.append(delim)
+            i += len(delim)
+            while i < n:
+                if sql_query[i] == "\\":
+                    step = 2 if i + 1 < n else 1
+                    out.append(sql_query[i : i + step])
+                    i += step
+                elif sql_query.startswith(delim, i):
+                    out.append(delim)
+                    i += len(delim)
+                    break
+                else:
+                    out.append(sql_query[i])
+                    i += 1
+        elif sql_query.startswith("--", i) or ch == "#":
+            end = sql_query.find("\n", i)
+            out.append(" ")
+            i = n if end == -1 else end + 1
+        elif sql_query.startswith("/*", i):
+            end = sql_query.find("*/", i + 2)
+            out.append(" ")
+            i = n if end == -1 else end + 2
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
 
 
 def gate_bigquery_ai_views(
-    state_dir_path: Path,
-    bq_tool: str,
-    sql_query: str,
-    config_path: Path | None = None,
+    state_dir_path: Path, bq_tool: str, sql_query: str, config_path: Path | None = None,
 ) -> dict[str, Any]:
     """Enforce hard Zero-Trust BigQuery views isolation against configured restricted raw datasets."""
     _ = state_dir_path
     cfg = load_guard_config(config_path)
     config_error = cfg.get("config_error")
     if isinstance(config_error, str) and config_error:
-        return {
-            "decision": "deny",
-            "reason": f"CONTEXT-GUARD BIGQUERY CONFIG ERROR (fail-closed): {config_error}",
-        }
+        return {"decision": "deny", "reason": f"CONTEXT-GUARD BIGQUERY CONFIG ERROR (fail-closed): {config_error}"}
     restricted_datasets: tuple[str, ...] = cfg["restricted_bq_datasets"]
     if not restricted_datasets or cfg.get("allow_bq_raw_ddl_maintenance") is True:
         return {"decision": "allow"}
@@ -456,9 +371,7 @@ def gate_bigquery_ai_views(
         return {"decision": "allow"}
 
     ds_label = ", ".join(f"`{ds}`" for ds in restricted_datasets)
-    schema_line = (
-        f"See `{cfg['bq_schema_doc']}` for full column schemas.\n" if cfg["bq_schema_doc"] else ""
-    )
+    schema_line = f"See `{cfg['bq_schema_doc']}` for full column schemas.\n" if cfg["bq_schema_doc"] else ""
     return {
         "decision": "deny",
         "reason": (

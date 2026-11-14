@@ -354,3 +354,118 @@ def test_legacy_unversioned_mutated_repos_self_heals_on_read_shell_and_write(
     write_state = json.loads((state_write / STATE_FILENAME).read_text(encoding="utf-8"))
     assert write_state.get("mutated_repos") == ["gamma-worker"]
     assert write_state.get("mutated_repos_schema") == 2
+
+
+def test_google_cloud_bigquery_from_import_and_nested_shell_bq_recursion() -> None:
+    from hooks.governance_guard import check_shell_bigquery_raw
+
+    bq_cfg = {"restricted_bq_datasets": ("raw_orders",), "allowed_bq_views_hint": "ai_views.*"}
+    for blocked in (
+        'python3 -c "from google.cloud.bigquery import Client; Client().query(\'SELECT * FROM raw_orders.t\')"',
+        'bash -c "bq query --dataset_id=raw_orders \'SELECT * FROM t\'"',
+        'sh -lc "bq query \'SELECT * FROM raw_orders.t\'"',
+        r'C:\Google\BQ.CMD query "SELECT * FROM raw_orders.t"',
+    ):
+        hit = check_shell_bigquery_raw(blocked, bq_cfg)
+        assert hit is not None and "ai-views block" in hit.lower(), f"Expected BQ block for {blocked!r}"
+    assert check_shell_bigquery_raw('bash -c "bq query --dataset_id=ai_views \'SELECT 1\'"', bq_cfg) is None
+
+
+def test_nested_shell_depth_limit_fails_closed_for_writes_and_bigquery(tmp_path: Path) -> None:
+    from hooks.governance_guard import check_shell_bigquery_raw, check_shell_protected_writes
+
+    def _nest(levels: int, inner: str) -> str:
+        cmd = inner
+        for _ in range(levels):
+            escaped = cmd.replace("\\", "\\\\").replace('"', '\\"')
+            cmd = f'bash -c "{escaped}"'
+        return cmd
+
+    deep_10 = _nest(10, "echo ok")
+    write_hit = check_shell_protected_writes(deep_10, cwd=str(tmp_path), workspace_root=tmp_path)
+    bq_hit = check_shell_bigquery_raw(deep_10, {"restricted_bq_datasets": ("raw_orders",)})
+    assert write_hit is not None and "nested shell depth limit exceeded" in write_hit.lower()
+    assert bq_hit is not None and "nested shell depth limit exceeded" in bq_hit.lower()
+
+    shallow_4 = _nest(4, "echo ok")
+    assert check_shell_protected_writes(shallow_4, cwd=str(tmp_path), workspace_root=tmp_path) is None
+    assert check_shell_bigquery_raw(shallow_4, {"restricted_bq_datasets": ("raw_orders",)}) is None
+
+
+def test_wrapper_commands_timeout_nice_env_and_windows_cmd_basenames(tmp_path: Path) -> None:
+    from hooks.governance_guard import (
+        check_shell_bypass_vectors,
+        check_shell_protected_writes,
+        is_readonly_shell_command,
+    )
+
+    ws_root = tmp_path / "workspace"
+    repo = ws_root / "guarded"
+    (repo / ".git").mkdir(parents=True)
+    for bypassed in (
+        "timeout 10 git commit --no-verify -m x",
+        "timeout -s KILL 5 git commit --no-verify -m x",
+        "nice -n 10 git commit --no-verify -m x",
+        "env -i SKIP=1 git commit -m x",
+        r"C:\Git\bin\GIT.EXE commit --no-verify -m x",
+    ):
+        assert check_shell_bypass_vectors(bypassed) is not None, f"Expected bypass block for {bypassed!r}"
+
+    for write_cmd in (
+        "timeout -s KILL 5 rm -f .githooks/pre-commit",
+        "nice -n 10 rm -f .githooks/pre-commit",
+        r"C:\bin\RM.EXE -f .githooks/pre-commit",
+    ):
+        assert check_shell_protected_writes(write_cmd, cwd=str(repo), workspace_root=ws_root) is not None, write_cmd
+
+    assert is_readonly_shell_command(r"C:\bin\CAT.EXE app.py") is True
+
+
+def test_inline_script_and_heredoc_writes_follow_cd_effective_cwd(tmp_path: Path) -> None:
+    from hooks.governance_guard import check_shell_protected_writes
+
+    ws_root = tmp_path / "workspace"
+    guarded = ws_root / "guarded-repo"
+    unguarded = ws_root / "unguarded-repo"
+    (guarded / ".git").mkdir(parents=True)
+    (guarded / "guard_manifest.json").write_text("{}", encoding="utf-8")
+    (unguarded / ".git").mkdir(parents=True)
+
+    cd_to_guarded_inline = (
+        f"cd {guarded} && python3 -c \"from pathlib import Path; "
+        "Path('scripts/audit/ai_slop_scanner.py').write_text('x')\""
+    )
+    assert check_shell_protected_writes(cd_to_guarded_inline, cwd=str(unguarded), workspace_root=ws_root) is not None
+
+    cd_to_unguarded_inline = (
+        f"cd {unguarded} && python3 -c \"from pathlib import Path; "
+        "Path('scripts/audit/custom_check.py').write_text('x')\""
+    )
+    assert check_shell_protected_writes(cd_to_unguarded_inline, cwd=str(guarded), workspace_root=ws_root) is None
+
+    cd_to_guarded_heredoc = (
+        f"cd {guarded} && python3 <<'PY'\n"
+        "from pathlib import Path\n"
+        "Path('scripts/audit/ai_slop_scanner.py').write_text('x')\n"
+        "PY"
+    )
+    assert check_shell_protected_writes(cd_to_guarded_heredoc, cwd=str(unguarded), workspace_root=ws_root) is not None
+
+    direct_heredoc = "python3 <<'PY'\nopen('.githooks/pre-commit', 'w').write('x')\nPY"
+    assert check_shell_protected_writes(direct_heredoc, cwd=str(guarded), workspace_root=ws_root) is not None
+
+
+def test_sed_readonly_check_linear_time_on_1200_slashes_and_preserves_workflow_subst() -> None:
+    import time
+    from hooks.governance_guard import is_readonly_shell_command
+
+    assert is_readonly_shell_command("sed -n 's/workflow/task/gp' app.py") is True
+    assert is_readonly_shell_command("sed -n 's/a/b/w out.txt' app.py") is False
+
+    for pathological in (
+        f"sed -n '{'s' + '/' * 1200}' app.py",
+        f"sed -n '{'s/' + chr(92) * 34}' app.py",
+    ):
+        t0 = time.perf_counter()
+        assert is_readonly_shell_command(pathological) is True
+        assert (time.perf_counter() - t0) < 0.25

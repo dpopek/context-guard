@@ -7,6 +7,8 @@ import re
 import shlex
 from typing import Iterator
 
+from hooks.file_io import normalize_cmd_basename
+
 _LEADING_CD_PREFIX_RE = re.compile(r"^(\s*cd\s+(?:\"[^\"]+\"|'[^']+'|[^;&|<>`\n]+?)\s*(?:&&|;)\s*)(.+)$", re.DOTALL)
 _SHELL_CHAIN_OPERATORS = (";", "&&", "||", "|", "\n", "`", "$(")
 _SHELL_REDIRECTION_OPERATORS = (">", "<")
@@ -43,9 +45,9 @@ _GREP_EXCLUDED_BASENAMES = frozenset({"package-lock.json", "pnpm-lock.yaml", "ya
 _GREP_EXCLUDED_SUFFIXES = (".min.js", ".min.css", ".map")
 _GREP_BIN_RE = re.compile(r"^((?:[\w./-]+/)?grep)\s+(.+)$", re.DOTALL)
 _GREP_RECURSIVE_FLAG_RE = re.compile(r"(?:^|\s)(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)(?:\s|$)")
-_QUOTED_STRING_RE = re.compile(r"""(?:"(?:\\.|[^"\\])*"|'[^']*')""")
 _TWG_NONCANONICAL_RE = re.compile(
-    r"^\s*(?:TWG_AGENT_DEFAULTS=\S+\s+)*(?:~|/Users/[^/\s]+|/home/[^/\s]+)?(?:/\.local/bin/)?twg(\s+.*)?$", re.DOTALL
+    r"^\s*(?:TWG_AGENT_DEFAULTS=\S+\s+)*(?:(?:~|/Users/[^/\s]+|/home/[^/\s]+)/\.local/bin/)?twg(\s+.*)?$",
+    re.DOTALL,
 )
 _SHELL_READER_BINS = frozenset({"cat", "head", "tail", "sed", "awk", "less", "bat", "nl"})
 _UNBOUNDED_SHELL_DUMP_BINS = frozenset({"cat", "less", "bat", "nl"})
@@ -55,14 +57,6 @@ def split_leading_cd_prefix(command: str) -> tuple[str, str]:
     """Split a leading `cd <dir> && ...` or `cd <dir>; ...` prefix from the remainder."""
     match = _LEADING_CD_PREFIX_RE.match(command)
     return (match.group(1), match.group(2)) if match else ("", command)
-
-
-def _cmd_basename(token: str) -> str:
-    name = token.replace("\\", "/").rsplit("/", 1)[-1].lower()
-    for ext in (".exe", ".cmd", ".bat"):
-        if name.endswith(ext):
-            return name[: -len(ext)]
-    return name
 
 
 def _split_tokens(text: str) -> list[str] | None:
@@ -133,6 +127,10 @@ def _iter_unquoted(text: str) -> Iterator[tuple[int, str]]:
             quote = ch
         else:
             yield idx, ch
+
+
+def _unquoted_text(text: str) -> str:
+    return "".join(ch for _, ch in _iter_unquoted(text))
 
 
 def _first_statement(text: str) -> str:
@@ -207,7 +205,7 @@ def _is_sed_in_place(args: list[str]) -> bool:
 def is_outline_pull(command_line: str) -> bool:
     """Return True iff single command asks the outline CLI (`cg-outline` / `outline.py`) for a file skeleton."""
     _, remainder = split_leading_cd_prefix(command_line)
-    if any(op in _QUOTED_STRING_RE.sub(" ", remainder) for op in _SHELL_CHAIN_OPERATORS + _SHELL_REDIRECTION_OPERATORS):
+    if any(op in _unquoted_text(remainder) for op in _SHELL_CHAIN_OPERATORS + _SHELL_REDIRECTION_OPERATORS):
         return False
     return bool(_SHELL_OUTLINE_CMD_RE.match(remainder.strip()))
 
@@ -220,14 +218,14 @@ def extract_outline_pull_targets(command_line: str, cwd: str | None = None) -> l
     tokens = _split_tokens(remainder)
     if not tokens:
         return []
-    idx = next((i for i, t in enumerate(tokens) if _cmd_basename(t) in ("outline.py", "cg-outline")), -1)
+    idx = next((i for i, t in enumerate(tokens) if normalize_cmd_basename(t) in ("outline.py", "cg-outline")), -1)
     return _resolve_shell_targets(tokens[idx + 1 :], _effective_cwd(cd_prefix, cwd)) if idx >= 0 else []
 
 
 def is_unbounded_shell_dump(command_line: str) -> bool:
     """Return True iff the first pipeline segment invokes an unbounded shell file dumper."""
     tokens = _split_tokens(_first_pipeline_segment(split_leading_cd_prefix(command_line)[1]))
-    return bool(tokens and _cmd_basename(tokens[0]) in _UNBOUNDED_SHELL_DUMP_BINS)
+    return bool(tokens and normalize_cmd_basename(tokens[0]) in _UNBOUNDED_SHELL_DUMP_BINS)
 
 
 def extract_shell_read_targets(command_line: str, cwd: str | None = None) -> list[str]:
@@ -236,7 +234,7 @@ def extract_shell_read_targets(command_line: str, cwd: str | None = None) -> lis
     tokens = _split_tokens(_first_pipeline_segment(remainder))
     if not tokens:
         return []
-    bin_name = _cmd_basename(tokens[0])
+    bin_name = normalize_cmd_basename(tokens[0])
     if bin_name not in _SHELL_READER_BINS or (bin_name == "sed" and _is_sed_in_place(tokens[1:])):
         return []
     return _resolve_shell_targets(tokens[1:], _effective_cwd(cd_prefix, cwd))
@@ -360,7 +358,7 @@ def is_bounded_shell_read(command_line: str, total_lines: int | None = None, max
         tokens = _split_tokens(seg)
         if not tokens:
             return False
-        cmd = _cmd_basename(tokens[0])
+        cmd = normalize_cmd_basename(tokens[0])
         if cmd in ("cat", "nl", "bat"):
             continue
         eff_total = total_lines if upstream_is_raw else bound
@@ -417,7 +415,7 @@ def rewrite_quiet_cli_flags(command_line: str) -> str | None:
     """Append output-trimming flags to single-statement test runners, bare git status, or recursive grep."""
     cd_prefix, remainder = split_leading_cd_prefix(command_line.strip())
     stripped = remainder.strip()
-    if any(op in _QUOTED_STRING_RE.sub(" ", stripped) for op in (*_SHELL_CHAIN_OPERATORS, "&", *_SHELL_REDIRECTION_OPERATORS)):
+    if any(op in _unquoted_text(stripped) for op in (*_SHELL_CHAIN_OPERATORS, "&", *_SHELL_REDIRECTION_OPERATORS)):
         return None
     twg_match = _TWG_NONCANONICAL_RE.match(stripped)
     if twg_match and "$(" not in stripped and (cd_prefix or (not stripped.startswith("twg ") and stripped != "twg")):
@@ -428,7 +426,7 @@ def rewrite_quiet_cli_flags(command_line: str) -> str | None:
     grep_match = _GREP_BIN_RE.match(stripped)
     if grep_match:
         raw_args = grep_match.group(2)
-        unquoted_args = f" {_QUOTED_STRING_RE.sub(' ', raw_args)} "
+        unquoted_args = f" {_unquoted_text(raw_args)} "
         if _GREP_RECURSIVE_FLAG_RE.search(unquoted_args) and "--exclude-dir" not in unquoted_args and not _grep_targets_excluded_dir(raw_args):
             extra = f" {_GREP_FILE_EXCLUDE_FLAGS}" if _grep_should_inject_file_excludes(raw_args) else ""
             return f"{cd_prefix}{grep_match.group(1)} {_GREP_CACHE_EXCLUDE_FLAGS}{extra} {raw_args}"

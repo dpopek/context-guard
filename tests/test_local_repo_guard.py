@@ -685,3 +685,70 @@ def test_resolve_user_config_path_supports_xdg_and_windows_appdata(tmp_path: Pat
     assert len(matched) == 1
     assert matched[0]["canonical_name"] == "service_orders"
 
+
+def test_normalize_cmd_basename_handles_posix_windows_and_extensions() -> None:
+    from hooks.file_io import normalize_cmd_basename
+
+    assert normalize_cmd_basename("git") == "git"
+    assert normalize_cmd_basename("/usr/bin/git") == "git"
+    assert normalize_cmd_basename(r"C:\Windows\System32\CMD.EXE") == "cmd"
+    assert normalize_cmd_basename(r"C:\tools\cg-outline.cmd") == "cg-outline"
+    assert normalize_cmd_basename("PYTEST.BAT") == "pytest"
+    assert normalize_cmd_basename("python3.11.exe") == "python3.11"
+    assert normalize_cmd_basename("") == ""
+
+
+def test_hooks_json_matcher_covers_gitlab_and_all_bigquery_mcp_servers() -> None:
+    import re
+    from hooks.local_repo_guard import BIGQUERY_MCP_SERVERS
+
+    hooks_cfg = json.loads((Path(__file__).resolve().parent.parent / "hooks.json").read_text(encoding="utf-8"))
+    pre_tool = hooks_cfg["context-guard"]["PreToolUse"][0]
+    matcher = pre_tool["matcher"]
+    assert pre_tool["hooks"][0]["command"] == "python3 ./hooks/pre_tool_use.py"
+    assert re.fullmatch(matcher, "mcp_gitlab_search_repositories") is not None
+    for srv in BIGQUERY_MCP_SERVERS:
+        assert re.fullmatch(matcher, f"mcp_{srv}_execute_sql") is not None
+        assert re.fullmatch(matcher, f"mcp_{srv}_execute_sql_readonly") is not None
+
+
+def test_strip_sql_comments_handles_googlesql_prefixes_escapes_and_comments(tmp_path: Path) -> None:
+    from hooks.local_repo_guard import gate_bigquery_ai_views, strip_sql_comments
+
+    cfg = tmp_path / "config.json"
+    cfg.write_text(
+        json.dumps({"restricted_bq_datasets": ["raw_orders"], "allowed_bq_views_dataset": "ai_views"}),
+        encoding="utf-8",
+    )
+    state_dir = tmp_path / "state"
+
+    # Comments outside literals are stripped (replaced with spaces)
+    safe_sql = (
+        "SELECT * FROM ai_views.v_orders\n"
+        "-- SELECT * FROM raw_orders.orders\n"
+        "# SELECT * FROM raw_orders.orders\n"
+        "/* raw_orders.orders */"
+    )
+    cleaned_safe = strip_sql_comments(safe_sql)
+    assert "raw_orders" not in cleaned_safe
+    assert gate_bigquery_ai_views(state_dir, "execute_sql_readonly", safe_sql, config_path=cfg)["decision"] == "allow"
+
+    # Quoted literals (including raw/bytes prefixes, escaped backslashes, triple quotes, backticks)
+    # must not open/close on '--', '#', '/*', or '\\' and hide subsequent raw_orders references.
+    bypass_queries = (
+        "SELECT '-- not comment' FROM raw_orders.orders",
+        'SELECT "-- not comment" FROM raw_orders.orders',
+        "SELECT '/*' FROM raw_orders.orders WHERE x = '*/'",
+        r"SELECT '\\' FROM raw_orders.orders",
+        r"SELECT r'\\' FROM raw_orders.orders",
+        r'SELECT R"\\" FROM raw_orders.orders',
+        r"SELECT rb'\\', br'\\' FROM raw_orders.orders",
+        r"SELECT r'\'' FROM raw_orders.orders",
+        "SELECT '''-- keep\n/* keep */''' FROM raw_orders.orders",
+        'SELECT R"""# keep\n-- keep""" FROM raw_orders.orders',
+        r"SELECT `col\\` FROM raw_orders.orders",
+    )
+    for sql in bypass_queries:
+        res = gate_bigquery_ai_views(state_dir, "execute_sql_readonly", sql, config_path=cfg)
+        assert res["decision"] == "deny", f"Bypass query unexpectedly allowed: {sql!r}"
+

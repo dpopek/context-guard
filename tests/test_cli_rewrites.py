@@ -519,3 +519,22 @@ def test_pre_tool_use_main_cli_and_telemetry_resilience(
             "updatedInput": {"command": "git status -sb"},
         }
     }
+
+
+def test_twg_noncanonical_re_does_not_mangle_similar_prefixes_or_home_paths() -> None:
+    assert rewrite_quiet_cli_flags("~twg status") is None
+    assert rewrite_quiet_cli_flags("/Users/dev" + "twg status") is None
+    assert rewrite_quiet_cli_flags("/home/alice" + "twg status") is None
+    assert rewrite_quiet_cli_flags("/home/alice/.local/bin/twg status") == "twg status"
+    assert rewrite_quiet_cli_flags("~/.local/bin/twg jira --help") == "twg jira --help"
+    assert rewrite_quiet_cli_flags("TWG_AGENT_DEFAULTS=1 /Users/dev/.local/bin/twg jira status") == "twg jira status"
+
+
+def test_unquoted_text_handles_escaped_quotes_in_outline_and_cli_rewrites() -> None:
+    from hooks.shell_parser import is_outline_pull
+
+    assert is_outline_pull('cg-outline "a\\" && cat b.py"') is True
+    assert is_outline_pull('cg-outline \\"a && cat b.py" \\"') is False
+    assert rewrite_quiet_cli_flags('pytest \\"a && echo hi" \\"') is None
+    assert rewrite_quiet_cli_flags('grep -n "\\" -r \\"" src/main.py') is None
+    assert rewrite_quiet_cli_flags('grep -rn "foo\\"bar" src/') is not None

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from hooks.file_io import normalize_cmd_basename
 from hooks.harness_adapter import NormalizedToolCall
 from hooks.local_repo_guard import is_bigquery_sql_tool_call, strip_sql_comments
 from hooks.state_store import MUTATED_REPOS_SCHEMA, STATE_FILENAME, locked_state
@@ -44,7 +45,7 @@ _APPLY_PATCH_MOVE_RE = re.compile(r"^\*\*\*\s+Move to:\s+(.+?)\s*$", re.MULTILIN
 _ENV_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
 _CLI_LONG_FLAG_RE = re.compile(r"^--[A-Za-z0-9][\w-]*(?:=.*)?$", re.DOTALL)
 _SED_INPLACE_RE = re.compile(r"^(?:--in-place(?:=.*)?|-[Enrsuz0-9]*i.*)$")
-_SED_SUBST_WRITE_RE = re.compile(r"s([^\w\s]).*?\1.*?\1[gipmI0-9]*[wWeE]", re.DOTALL)
+_SED_SUBST_WRITE_RE = re.compile(r"s([^\w\s])(?:\\.|(?!\1)[^\\])*\1(?:\\.|(?!\1)[^\\])*\1[gipmI0-9]*[wWeE]", re.DOTALL)
 _EMBEDDED_SLASH_PATH_RE = re.compile(r"[~A-Za-z0-9_./-]+/[A-Za-z0-9_./-]*")
 _INLINE_INTERP_RE = re.compile(r"(?:^|[\s;|&(])(?:[\w./-]+/)?(?:python3?(?:\.\d+)?|node|ruby|perl|sh|bash|zsh|dash|ksh)\b(?:[^\n]*?\s-[a-zA-Z]*[ce]\b|[^\n]*?<<-?\s*['\"\\]?[A-Za-z_]\w*)", re.DOTALL)
 _INLINE_SHELL_EXEC_RE = re.compile(r"(?:^|[\s;|&(])(?:[\w./-]+/)?(?:sh|bash|zsh|dash|ksh)\b(?:[^\n]*?\s-[a-zA-Z]*c\b|[^\n]*?<<-?\s*['\"\\]?[A-Za-z_]\w*)", re.DOTALL)
@@ -56,7 +57,7 @@ _SCRIPT_QUOTED_LIT_RE = re.compile(r"""['"]([^'"\n]{3,240})['"]""")
 _SHELL_VAR_REF_RE = re.compile(r"\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)")
 _LEADING_UNSET_VAR_RE = re.compile(r"^\$(?:\{[A-Za-z_]\w*\}|[A-Za-z_]\w*)(?:/|$)")
 _HEREDOC_EXEC_HEADER_RE = re.compile(r"(?:^|[;|&(`])\s*(?:[A-Za-z_]\w*=\S*\s+|(?:env|sudo|command|nohup|exec|builtin)\s+)*(?:[\w./-]+/)?(?:sh|bash|zsh|dash|ksh|python3?(?:\.\d+)?|node|ruby|perl|php|bq|eval|source)\b")
-_BQ_PY_SDK_MARKERS = ("bigquery.client", "from google.cloud import bigquery", "import google.cloud.bigquery", "read_gbq", "pandas_gbq", "to_gbq", "bigframes")
+_BQ_PY_SDK_MARKERS = ("bigquery.client", "from google.cloud import bigquery", "google.cloud.bigquery", "read_gbq", "pandas_gbq", "to_gbq", "bigframes")
 _BQ_SUBCOMMANDS = frozenset("query head mk update cp extract load insert rm".split())
 _TRUTHY_FORBIDDEN_ENV = frozenset("HUSKY_SKIP_HOOKS PRE_COMMIT_ALLOW_NO_CONFIG ALLOW_ASSERTION_REDUCTION ALLOW_TEST_DELETION ALLOW_CUSTOM_VERIFY_CMD SKIP_AGENT_GUARD".split())
 _GIT_VALUE_FLAGS = frozenset("-m --message -F --file -C -c --reuse-message --reedit-message --fixup --squash --author --date --cleanup --trailer --pathspec-from-file --strategy -X --strategy-option --onto".split())
@@ -67,7 +68,7 @@ _READONLY_GIT_SUBCMDS = frozenset("status diff log show rev-parse ls-files ls-tr
 _FIND_WRITE_FLAGS = frozenset("-delete -exec -execdir -ok -okdir -fprint -fprint0 -fls -fprintf".split())
 _NON_REPO_TOP_DIRS = frozenset("docs scripts repos .git .agents .claude .codex .cursor .gemini .worktrees".split())
 _MUTATING_FILE_BINS = frozenset("tee cp mv rm unlink chmod chown install ln touch truncate".split())
-_SHELL_PREFIX_WRAPPERS = frozenset("{ } ! sudo command nohup time builtin exec".split())
+_SHELL_PREFIX_WRAPPERS = frozenset("{ } ! sudo command nohup time timeout nice env builtin exec".split())
 _MUTATING_TOOL_NAMES = frozenset("edit multiedit multi_edit write notebookedit strreplace multistrreplace editfile writefile deletefile delete delete_file create_file edit_file write_file replace_file_content multi_replace_file_content write_to_file apply_patch".split())
 _SHELL_TOK_RE = re.compile(r"(?P<ws>[ \t\r]+)|(?P<sep>\n|;|&&|\|\||[()]|\|(?!\|)|(?<![><|])&(?!>))|(?P<redir>(?<![^\s;|&><()])(?:1>&2|2>&1|[12]>>|[12]>)|<<-|>>|>\||&>|>&|<<|<>|>|<)|'(?P<sq>[^']*)'?|\"(?P<dq>(?:\\.|[^\"\\])*)\"?|\\(?P<esc>.)|(?P<raw>[^\s'\"\\;|&><()]+)", re.DOTALL)
 
@@ -243,15 +244,24 @@ def _parse_shell_segments(command: str, include_subshells: bool = True) -> tuple
         env_pairs, is_export, idx = [], False, 0
         while idx < len(words):
             w = words[idx]
-            if w in _SHELL_PREFIX_WRAPPERS:
-                idx += 1
-            elif w in ("env", "export"):
-                is_export, idx = (w == "export"), idx + 1
-                while idx < len(words) and ((m_e := _ENV_ASSIGN_RE.match(words[idx])) is not None or (w == "env" and words[idx].startswith("-"))):
+            w_base = w if "=" in w else normalize_cmd_basename(w)
+            if w_base in ("env", "export"):
+                is_export, idx = (w_base == "export"), idx + 1
+                while idx < len(words) and ((m_e := _ENV_ASSIGN_RE.match(words[idx])) is not None or (w_base == "env" and words[idx].startswith("-"))):
                     if m_e is not None:
                         env_pairs.append((m_e.group(1), m_e.group(2)))
                     idx += 1
                 idx = len(words) if is_export else idx
+            elif w_base in _SHELL_PREFIX_WRAPPERS:
+                idx += 1
+                if w_base == "timeout":
+                    while idx < len(words) and words[idx].startswith("-"):
+                        idx += 2 if words[idx] in ("-k", "-s", "--kill-after", "--signal") and idx + 1 < len(words) else 1
+                    if idx < len(words) and re.fullmatch(r"\d+(?:\.\d+)?[smhd]?", words[idx]):
+                        idx += 1
+                elif w_base == "nice":
+                    while idx < len(words) and words[idx].startswith("-"):
+                        idx += 2 if words[idx] in ("-n", "--adjustment") and idx + 1 < len(words) else 1
             elif (m_l := _ENV_ASSIGN_RE.match(w)) is not None:
                 env_pairs.append((m_l.group(1), m_l.group(2)))
                 idx += 1
@@ -378,7 +388,7 @@ def check_shell_bypass_vectors(command: str) -> str | None:
     """Return block reason if `command` contains git hook bypasses, forbidden env vars, mass staging, or circuit-breaker resets."""
     stripped_cmd = _strip_heredoc_bodies(command, keep_exec_bodies=True) if command and command.strip() else ""
     for seg in (_parse_shell_segments(stripped_cmd)[0] if stripped_cmd else ()):
-        cmd_bin = "export" if seg.is_export else (os.path.basename(seg.words[0]) if seg.words else "")
+        cmd_bin = "export" if seg.is_export else (normalize_cmd_basename(seg.words[0]) if seg.words else "")
         for key, val in seg.env_pairs:
             v_low = val.strip().lower()
             if (key == "HUSKY" and v_low == "0") or (key in _TRUTHY_FORBIDDEN_ENV and v_low not in ("", "0", "false", "no")) or (key == "SKIP" and v_low and cmd_bin in ("git", "pre-commit", "export", "")):
@@ -398,7 +408,7 @@ def check_shell_bypass_vectors(command: str) -> str | None:
                     return "CONTEXT-GUARD GOVERNANCE BLOCK: `--capture-baseline` is reserved for SessionStart hooks (`stop_guard_baseline_tamper`)."
                 if cmd_bin in ("python", "python3") and tok == "-c" and pos + 1 < len(seg.words) and "--capture-baseline" in seg.words[pos + 1]:
                     return "CONTEXT-GUARD GOVERNANCE BLOCK: `--capture-baseline` is reserved for SessionStart hooks (`stop_guard_baseline_tamper`)."
-                if cmd_bin in ("sh", "bash", "zsh", "dash", "ksh") and tok.startswith("-") and "c" in tok[1:] and pos + 1 < len(seg.words) and (sub_hit := check_shell_bypass_vectors(seg.words[pos + 1])) is not None:
+                if cmd_bin in ("sh", "bash", "zsh", "dash", "ksh") and tok.startswith("-") and not tok.startswith("--") and "c" in tok[1:] and pos + 1 < len(seg.words) and (sub_hit := check_shell_bypass_vectors(seg.words[pos + 1])) is not None:
                     return sub_hit
     return None
 
@@ -406,26 +416,16 @@ def _advance_cwd(cur_cwd: str | None, cd_target: str | None) -> str | None:
     exp = os.path.expanduser(cd_target) if cd_target else ""
     return cur_cwd if not exp else (exp if os.path.isabs(exp) else (str(Path(cur_cwd) / exp) if cur_cwd else exp))
 
-def check_shell_protected_writes(command: str, cwd: str | None = None, workspace_root: Path | None = None) -> str | None:
+def check_shell_protected_writes(command: str, cwd: str | None = None, workspace_root: Path | None = None, _depth: int = 0) -> str | None:
     """Return block reason if `command` mutates a protected governance path via redirection, CLI tools, or inline scripts."""
+    if _depth > 8:
+        return "CONTEXT-GUARD GOVERNANCE BLOCK: Nested shell depth limit exceeded."
     if not command or not command.strip():
         return None
     stripped_cmd = _strip_heredoc_bodies(command, keep_exec_bodies=True)
-    has_inline_write = (
-        any(ind in stripped_cmd for ind in _SCRIPT_WRITE_INDICATORS)
-        or _SCRIPT_OPEN_WRITE_RE.search(stripped_cmd) is not None
-        or (_INLINE_SHELL_EXEC_RE.search(stripped_cmd) is not None and _SCRIPT_SHELL_REDIR_RE.search(stripped_cmd) is not None)
-    )
-    if _INLINE_INTERP_RE.search(stripped_cmd) and has_inline_write:
-        inline_cands = [m.group(1) for m in _SCRIPT_QUOTED_LIT_RE.finditer(stripped_cmd)] + [
-            m.group(0) for m in _EMBEDDED_SLASH_PATH_RE.finditer(stripped_cmd)
-        ]
-        if any(sub in stripped_cmd for sub in _SCRIPT_PROTECTED_SUBSTRINGS) or any(
-            is_protected_governance_path(cand, cwd=cwd, workspace_root=workspace_root) is not None for cand in inline_cands
-        ):
-            return "CONTEXT-GUARD GOVERNANCE BLOCK: Inline script/heredoc write targeting a protected governance path is forbidden."
-    eff_cwd = cwd
+    eff_cwd: str | None = cwd
     shell_vars: dict[str, str] = {}
+    heredoc_tail = stripped_cmd.split("\n", 1)[1] if "\n" in stripped_cmd else ""
     for seg in _parse_shell_segments(stripped_cmd)[0]:
         eff_vars = {**shell_vars, **{k: _expand_shell_vars(v, shell_vars) for k, v in seg.env_pairs}}
         if not seg.words and seg.env_pairs:
@@ -441,10 +441,27 @@ def check_shell_protected_writes(command: str, cwd: str | None = None, workspace
                 return f"CONTEXT-GUARD GOVERNANCE BLOCK: Shell redirection targeting protected path `{target}` (`{cat}`) is forbidden."
         if not seg.words:
             continue
-        cmd_bin, args = os.path.basename(seg.words[0]), seg.words[1:]
+        cmd_bin, args = normalize_cmd_basename(seg.words[0]), seg.words[1:]
+        seg_head = " ".join((cmd_bin, *args, *(f"{op} {tgt}" for op, tgt in seg.redirects)))
+        if _INLINE_INTERP_RE.search(seg_head):
+            has_hd = any(op in ("<<", "<<-") for op, _ in seg.redirects)
+            seg_text = f"{seg_head}\n{heredoc_tail}" if (has_hd and heredoc_tail) else seg_head
+            has_inline_write = (
+                any(ind in seg_text for ind in _SCRIPT_WRITE_INDICATORS)
+                or _SCRIPT_OPEN_WRITE_RE.search(seg_text) is not None
+                or (_INLINE_SHELL_EXEC_RE.search(seg_text) is not None and _SCRIPT_SHELL_REDIR_RE.search(seg_text) is not None)
+            )
+            if has_inline_write:
+                inline_cands = [m.group(1) for m in _SCRIPT_QUOTED_LIT_RE.finditer(seg_text)] + [
+                    m.group(0) for m in _EMBEDDED_SLASH_PATH_RE.finditer(seg_text)
+                ]
+                if any(sub in seg_text for sub in _SCRIPT_PROTECTED_SUBSTRINGS) or any(
+                    _check_shell_write_target(cand, eff_cwd, workspace_root, eff_vars) is not None for cand in inline_cands
+                ):
+                    return "CONTEXT-GUARD GOVERNANCE BLOCK: Inline script/heredoc write targeting a protected governance path is forbidden."
         if cmd_bin in ("sh", "bash", "zsh", "dash", "ksh"):
             for pos, a in enumerate(args):
-                if a.startswith("-") and "c" in a[1:] and pos + 1 < len(args) and (sub := check_shell_protected_writes(args[pos + 1], cwd=eff_cwd, workspace_root=workspace_root)) is not None:
+                if a.startswith("-") and not a.startswith("--") and "c" in a[1:] and pos + 1 < len(args) and (sub := check_shell_protected_writes(args[pos + 1], cwd=eff_cwd, workspace_root=workspace_root, _depth=_depth + 1)) is not None:
                     return sub
         operands, check_cwd = [], eff_cwd
         if cmd_bin in ("cp", "install"):
@@ -464,10 +481,18 @@ def check_shell_protected_writes(command: str, cwd: str | None = None, workspace
                 return f"CONTEXT-GUARD GOVERNANCE BLOCK: `{cmd_bin}` targeting protected governance path `{op_path}` (`{cat}`) is forbidden."
     return None
 
-def check_shell_bigquery_raw(command: str, cfg: dict[str, Any]) -> str | None:
+def check_shell_bigquery_raw(command: str, cfg: dict[str, Any], _depth: int = 0) -> str | None:
     """Block `bq` CLI and Python BigQuery SDK queries against restricted raw datasets."""
+    if _depth > 8:
+        return "CONTEXT-GUARD BIGQUERY AI-VIEWS BLOCK: Nested shell depth limit exceeded."
     segments = _parse_shell_segments(command)[0] if command and command.strip() else []
-    bq_segs = [seg for seg in segments if seg.words and os.path.basename(seg.words[0]) == "bq" and any(t in _BQ_SUBCOMMANDS for t in seg.words[1:])]
+    for seg in segments:
+        if seg.words and normalize_cmd_basename(seg.words[0]) in ("sh", "bash", "zsh", "dash", "ksh"):
+            for pos, tok in enumerate(seg.words[1:], start=1):
+                if tok.startswith("-") and not tok.startswith("--") and "c" in tok[1:] and pos + 1 < len(seg.words):
+                    if (sub_hit := check_shell_bigquery_raw(seg.words[pos + 1], cfg, _depth=_depth + 1)) is not None:
+                        return sub_hit
+    bq_segs = [seg for seg in segments if seg.words and normalize_cmd_basename(seg.words[0]) == "bq" and any(t in _BQ_SUBCOMMANDS for t in seg.words[1:])]
     if not bq_segs and not (command and any(marker in command.lower() for marker in _BQ_PY_SDK_MARKERS)):
         return None
     if isinstance(cfg.get("config_error"), str) and cfg["config_error"]:
@@ -566,7 +591,7 @@ def _is_readonly_sed_args(args: tuple[str, ...]) -> bool:
     for scr in scripts:
         if _SED_SUBST_WRITE_RE.search(scr):
             return False
-        stripped = re.sub(r"/(\\.|[^/])*/", "//", re.sub(r"s([^\w\s]).*?\1.*?\1[a-zA-Z0-9]*", "", scr, flags=re.DOTALL))
+        stripped = re.sub(r"/(\\.|[^/\\])*/", "//", re.sub(r"s([^\w\s])(?:\\.|(?!\1)[^\\])*\1(?:\\.|(?!\1)[^\\])*\1[gipmI0-9]*", "", scr, flags=re.DOTALL))
         if re.search(r"[wWeE]", stripped):
             return False
     return True
@@ -583,7 +608,7 @@ def is_readonly_shell_command(command: str) -> bool:
             continue
         if not seg.words:
             return False
-        cmd_bin, args = os.path.basename(seg.words[0]), seg.words[1:]
+        cmd_bin, args = normalize_cmd_basename(seg.words[0]), seg.words[1:]
         uniq_ok = cmd_bin == "uniq" and sum(1 for a in args if a != "--" and (not a.startswith("-") or a == "-")) <= 1
         if not ((_is_readonly_git_segment(args) if cmd_bin == "git" else False) or uniq_ok or (cmd_bin in _READONLY_SIMPLE_BINS and not (cmd_bin == "rg" and any(a == "--pre" or a.startswith("--pre=") for a in args))) or (cmd_bin == "sort" and not any(a in ("-o", "--output") or a.startswith(("-o", "--output=")) for a in args)) or (cmd_bin in ("sed", "gsed") and _is_readonly_sed_args(args)) or (cmd_bin == "find" and not any(a in _FIND_WRITE_FLAGS or a.startswith(("-fprint", "-fls")) for a in args))):
             return False

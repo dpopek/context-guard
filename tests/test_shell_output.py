@@ -77,6 +77,11 @@ from hooks.shell_output import BUCKETS, SIM_MARKER, SPILL_PREVIEW_TOKENS, classi
         ("uv run --frozen pytest", "test"),
         ("uv pip install x", "other"),
         ("uv sync", "other"),
+        (r"C:\Python313\python.exe -m pytest -q", "test"),
+        (r"C:\Git\bin\GIT.EXE diff --stat", "git_diff"),
+        ("PYTEST.CMD tests/", "test"),
+        (r"C:\tools\RG.BAT foo src", "search"),
+        (r"C:\Windows\System32\bash.exe -lc 'git log -n 5'", "git_log"),
     ],
 )
 def test_classify_family(command: str, family: str) -> None:

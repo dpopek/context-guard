@@ -6,6 +6,8 @@ import re
 import shlex
 from dataclasses import dataclass
 
+from hooks.file_io import normalize_cmd_basename
+
 SIM_THRESHOLD_CHARS = 8000
 SIM_HEAD_LINES = 60
 SIM_TAIL_LINES = 40
@@ -75,6 +77,33 @@ class Measurement:
 
 
 def _tokens(segment: str) -> list[str]:
+    if "\\" in segment:
+        out: list[str] = []
+        i, q, n = 0, "", len(segment)
+        while i < n:
+            ch = segment[i]
+            if q:
+                if q == '"' and ch == "\\" and i + 1 < n:
+                    nxt = segment[i + 1]
+                    out.append("\\\\" + nxt if nxt not in '"\\$`\n' else ch + nxt)
+                    i += 2
+                    continue
+                if ch == q:
+                    q = ""
+                out.append(ch)
+            elif ch in ('"', "'"):
+                q = ch
+                out.append(ch)
+            elif ch == "\\" and i + 1 < n and segment[i + 1] not in " \t\n'\"|&;()$`<>":
+                out.append("\\\\")
+            elif ch == "\\" and i + 1 < n:
+                out.append(ch + segment[i + 1])
+                i += 2
+                continue
+            else:
+                out.append(ch)
+            i += 1
+        segment = "".join(out)
     try:
         return shlex.split(segment)
     except ValueError:
@@ -245,7 +274,7 @@ def _classify_tokens(tokens: list[str]) -> str:
     for i, token in enumerate(tokens):
         if _ASSIGNMENT_RE.match(token) or token.startswith("-"):
             continue
-        name = token.rsplit("/", 1)[-1]
+        name = normalize_cmd_basename(token)
         if name in _WRAPPERS:
             in_wrapper = True
             continue
