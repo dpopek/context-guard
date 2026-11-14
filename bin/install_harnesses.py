@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -13,14 +12,19 @@ import sys
 import tempfile
 import time
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Callable, Sequence
+from urllib.parse import quote
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 if str(_PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(_PACKAGE_ROOT))
 
 from bin import update_check  # noqa: E402
+from bin.codex_toml import (  # noqa: E402
+    compute_codex_trusted_hash as compute_codex_trusted_hash,
+    sync_codex_config_toml as sync_codex_config_toml,
+)
 from bin.harness_status import (  # noqa: E402
     CLAUDE_MATCHER,
     CODEX_MATCHER,
@@ -34,7 +38,17 @@ from bin.instruction_block import DEFAULT_SHIM_BIN_DIR, install_outline_pull, sh
 from hooks.config import cached_raw_config_status  # noqa: E402
 from hooks.state_store import resolve_plugin_root, warn  # noqa: E402
 
-DEFAULT_PLUGIN_ROOT = resolve_plugin_root()
+_INITIAL_PLUGIN_ROOT = resolve_plugin_root()
+DEFAULT_PLUGIN_ROOT = _INITIAL_PLUGIN_ROOT
+
+
+def _active_plugin_root(plugin_root: Path | None = None) -> Path:
+    if plugin_root is not None:
+        return Path(plugin_root)
+    if DEFAULT_PLUGIN_ROOT != _INITIAL_PLUGIN_ROOT:
+        return Path(DEFAULT_PLUGIN_ROOT)
+    return resolve_plugin_root()
+
 
 DEFAULT_CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
 DEFAULT_CURSOR_EXTENSIONS = Path.home() / ".cursor" / "extensions"
@@ -47,11 +61,7 @@ CLAUDE_POST_MATCHER = "Bash"
 CODEX_POST_MATCHER = "^(Bash|shell|exec_command|exec)$"
 CURSOR_POST_MATCHER = "Shell|run_terminal_cmd"
 
-_CAMEL_TO_SNAKE_RE = re.compile(r"(?<!^)(?=[A-Z])")
-
-
-def _event_to_snake(event_name: str) -> str:
-    return _CAMEL_TO_SNAKE_RE.sub("_", event_name).lower()
+_SAFE_HOOK_PATH_RE = re.compile(r"[A-Za-z0-9_./:-]+")
 
 
 def resolve_python_command(
@@ -73,34 +83,12 @@ def resolve_python_command(
 
 
 def format_hook_script_path(path: Path) -> str:
-    """Format a hook script path with forward slashes and double quotes when spaces are present."""
+    """Format a hook script path with forward slashes, double-quoting when special characters appear."""
     posix_str = str(path).replace("\\", "/")
-    return f'"{posix_str}"' if " " in posix_str else posix_str
-
-
-def compute_codex_trusted_hash(
-    event_name: str,
-    matcher: str | None,
-    command: str,
-    timeout: int = 600,
-    is_async: bool = False,
-) -> str:
-    """Return `sha256:<hex>` matching `codex-rs/config/src/fingerprint.rs` canonical JSON identity."""
-    obj: dict[str, Any] = {
-        "event_name": event_name,
-        "hooks": [
-            {
-                "async": bool(is_async),
-                "command": command,
-                "timeout": int(timeout),
-                "type": "command",
-            }
-        ],
-    }
-    if matcher is not None:
-        obj["matcher"] = matcher
-    payload = json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return "sha256:" + hashlib.sha256(payload).hexdigest()
+    if _SAFE_HOOK_PATH_RE.fullmatch(posix_str):
+        return posix_str
+    escaped = posix_str.replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 _CG_HOOK_SCRIPTS = (
@@ -153,20 +141,22 @@ def _without_cg_handlers(groups: list[Any]) -> list[Any]:
 
 
 def _atomic_write_text(path: Path, content: str, create_backup: bool = True) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        old_text = path.read_text(encoding="utf-8")
+    real_path = Path(os.path.realpath(str(path)))
+    real_path.parent.mkdir(parents=True, exist_ok=True)
+    if real_path.exists():
+        old_text = real_path.read_text(encoding="utf-8")
         if old_text == content:
             return
         if create_backup:
             bak_path = path.with_suffix(path.suffix + ".bak")
             if not bak_path.exists():
-                shutil.copy2(path, bak_path)
-    fd, tmp_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+                bak_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(real_path, bak_path)
+    fd, tmp_path = tempfile.mkstemp(prefix=f".{real_path.name}.", suffix=".tmp", dir=str(real_path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(content)
-        os.replace(tmp_path, str(path))
+        os.replace(tmp_path, str(real_path))
     except OSError:
         try:
             os.unlink(tmp_path)
@@ -334,78 +324,21 @@ def _update_cursor_hooks_json(
     return "updated"
 
 
-def sync_codex_config_toml(
-    codex_hooks_path: Path,
-    codex_config_path: Path,
-    hooks_data: dict[str, Any],
-    ensure_compact_limit: bool,
-    dry_run: bool = False,
-) -> str:
-    if not codex_config_path.exists():
-        return "skipped (not found)"
-    raw_toml = codex_config_path.read_text(encoding="utf-8")
-
-    # Strip existing [hooks.state."<codex_hooks_path>:..."] blocks (both raw and TOML backslash-escaped)
-    raw_hooks_str = str(codex_hooks_path)
-    toml_hooks_str = raw_hooks_str.replace("\\", "\\\\")
-    candidates = {re.escape(raw_hooks_str), re.escape(toml_hooks_str)}
-    cleaned = raw_toml
-    for pat in candidates:
-        block_re = re.compile(
-            rf'(?m)^\n?\[hooks\.state\."{pat}:[^"]+"\]\n(?:(?!\[)[^\n]*(?:\n|$))*'
-        )
-        cleaned = block_re.sub("", cleaned)
-    cleaned = cleaned.strip()
-    cleaned = (cleaned + "\n") if cleaned else ""
-
-    if ensure_compact_limit and "model_auto_compact_token_limit" not in cleaned:
-        first_section_match = re.search(r"^\[", cleaned, flags=re.MULTILINE)
-        limit_line = "model_auto_compact_token_limit = 250000\n"
-        if first_section_match is not None:
-            idx = first_section_match.start()
-            prefix = cleaned[:idx]
-            if prefix and not prefix.endswith("\n"):
-                prefix += "\n"
-            cleaned = prefix + limit_line + ("\n" if idx == 0 else "") + cleaned[idx:]
-        else:
-            cleaned = cleaned + limit_line
-
-    # Generate fresh [hooks.state."<toml_hooks_str>:<snake_evt>:<g_idx>:<h_idx>"] blocks
-    hooks_root = hooks_data.get("hooks") if isinstance(hooks_data, dict) else {}
-    blocks: list[str] = []
-    if isinstance(hooks_root, dict):
-        for event_key, groups in hooks_root.items():
-            if not isinstance(groups, list):
-                continue
-            snake_evt = _event_to_snake(str(event_key))
-            for g_idx, grp in enumerate(groups):
-                if not isinstance(grp, dict):
-                    continue
-                matcher = grp.get("matcher") if isinstance(grp.get("matcher"), str) else None
-                h_list = grp.get("hooks")
-                if not isinstance(h_list, list):
-                    continue
-                for h_idx, h_obj in enumerate(h_list):
-                    if not isinstance(h_obj, dict):
-                        continue
-                    cmd = str(h_obj.get("command") or "")
-                    if not cmd:
-                        continue
-                    timeout = int(h_obj.get("timeout") or 600)
-                    is_async = bool(h_obj.get("async") or False)
-                    thash = compute_codex_trusted_hash(
-                        snake_evt, matcher, cmd, timeout=timeout, is_async=is_async
-                    )
-                    state_key = f"{toml_hooks_str}:{snake_evt}:{g_idx}:{h_idx}"
-                    blocks.append(f'[hooks.state."{state_key}"]\ntrusted_hash = "{thash}"\n')
-
-    final_toml = cleaned.rstrip() + "\n"
-    if blocks:
-        final_toml += "\n" + "\n".join(blocks)
-
-    if not dry_run:
-        _atomic_write_text(codex_config_path, final_toml)
-    return "updated"
+def build_vscode_file_uri_location(target_dir: Path | PurePath) -> dict[str, Any]:
+    """Build a VS Code `extensions.json` location entry using RFC 8089 `file:///` URIs."""
+    resolved = target_dir.resolve() if isinstance(target_dir, Path) else target_dir
+    if isinstance(resolved, Path):
+        external = resolved.as_uri()
+    else:
+        posix = resolved.as_posix()
+        external = "file:" + quote(posix, safe="/:") if posix.startswith("//") else "file:///" + quote(posix.lstrip("/"), safe="/:")
+    return {
+        "$mid": 1,
+        "fsPath": str(resolved),
+        "external": external,
+        "path": "/" + resolved.as_posix().lstrip("/"),
+        "scheme": "file",
+    }
 
 
 def install_ide_extension(
@@ -495,13 +428,7 @@ def install_ide_extension(
                     {
                         "identifier": {"id": EXTENSION_ID},
                         "version": version,
-                        "location": {
-                            "$mid": 1,
-                            "fsPath": str(target_dir),
-                            "external": f"file://{target_dir}",
-                            "path": str(target_dir),
-                            "scheme": "file",
-                        },
+                        "location": build_vscode_file_uri_location(target_dir),
                         "relativeLocation": target_dir.name,
                         "metadata": {
                             "isApplicationScoped": False,
@@ -573,8 +500,7 @@ def install_all(
     workspace_root: Path | None = None,
 ) -> dict[str, str]:
     """Idempotently install Context-Guard hooks & status bars across Claude Code, Cursor, Antigravity, and Codex."""
-    if plugin_root is None:
-        plugin_root = DEFAULT_PLUGIN_ROOT
+    plugin_root = _active_plugin_root(plugin_root)
     if cursor_extensions_dir is None and claude_settings_path == DEFAULT_CLAUDE_SETTINGS:
         cursor_extensions_dir = DEFAULT_CURSOR_EXTENSIONS
     if antigravity_extensions_dir is None and claude_settings_path == DEFAULT_CLAUDE_SETTINGS:
@@ -651,6 +577,7 @@ def install_all(
         hooks_data=codex_data,
         ensure_compact_limit=True,
         dry_run=dry_run,
+        atomic_writer=_atomic_write_text,
     )
     _skip = "skipped (not requested)"
     cursor_ext_status = install_ide_extension(plugin_root, cursor_extensions_dir, dry_run=dry_run) if cursor_extensions_dir is not None else _skip
@@ -711,6 +638,7 @@ def uninstall_all(
         hooks_data=codex_data,
         ensure_compact_limit=False,
         dry_run=dry_run,
+        atomic_writer=_atomic_write_text,
     )
     _skip = "skipped (not requested)"
     cursor_ext_status = _uninstall_ide_extension(cursor_extensions_dir, dry_run=dry_run) if cursor_extensions_dir is not None else _skip
@@ -768,13 +696,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.install:
         res = install_all(dry_run=args.dry_run)
         if not args.dry_run:
-            update_check.record_install(DEFAULT_PLUGIN_ROOT, datetime.now(timezone.utc))
+            update_check.record_install(_active_plugin_root(), datetime.now(timezone.utc))
         print(json.dumps(res, indent=2))
         return 0
     if args.uninstall:
         res = uninstall_all(dry_run=args.dry_run)
         if not args.dry_run:
-            update_check.remove_install_record(DEFAULT_PLUGIN_ROOT)
+            update_check.remove_install_record(_active_plugin_root())
         print(json.dumps(res, indent=2))
         return 0
     return 0
