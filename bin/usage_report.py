@@ -25,6 +25,7 @@ from bin.preamble_attribution import (  # noqa: E402
     CODEX_CLI_HARNESS,
     CODEX_DESKTOP_HARNESS,
     COMPONENTS,
+    extract_skill_frontmatter_summary,
     find_candidates,
     measure_antigravity_preamble,
     median,
@@ -190,11 +191,7 @@ def find_duplicate_skills(home: Path | None = None) -> list[tuple[str, list[Path
 
 def _frontmatter_listing(text: str) -> str:
     """The `name:` and `description:` lines of a SKILL.md frontmatter, which is what the skills listing shows."""
-    if not text.startswith("---"):
-        return ""
-    end = text.find("\n---", 3)
-    block = text[3:end] if end > 0 else ""
-    return "\n".join(line for line in block.strip("\n").splitlines() if line.startswith(("name:", "description:")))
+    return extract_skill_frontmatter_summary(text)
 
 
 def measure_preamble_components(home: Path, project_dir: Path) -> PreambleBreakdown:
@@ -296,6 +293,9 @@ def savings_share(
         if isinstance(raw_stats_days, dict)
         else {}
     )
+    total_events = sum(
+        _row_int(row, "events") for harnesses in usage_by_day.values() for row in harnesses.values()
+    )
     if stats_by_day and usage_by_day:
         common_start_day = max(min(stats_by_day.keys()), min(usage_by_day.keys()))
         common_end_day = min(max(stats_by_day.keys()), max(usage_by_day.keys()))
@@ -306,6 +306,8 @@ def savings_share(
                 "saved": 0,
                 "real_input": 0,
                 "share_pct": 0.0,
+                "window_events": 0,
+                "total_events": total_events,
             }
         saved_bytes_sum = sum(
             int(stats_by_day[d].get("saved_bytes", 0) or 0)
@@ -314,12 +316,14 @@ def savings_share(
         )
         saved = max(0, saved_bytes_sum) // 4
         real_input = 0
+        window_events = 0
         for day, harnesses in usage_by_day.items():
             if common_start_day <= day <= common_end_day:
                 for row in harnesses.values():
                     real_input += (
                         _row_int(row, "input") + _row_int(row, "cache_read") + _row_int(row, "cache_write")
                     )
+                    window_events += _row_int(row, "events")
         denominator = real_input + saved
         share = round(saved / denominator * 100.0, 2) if denominator else 0.0
         return {
@@ -328,18 +332,33 @@ def savings_share(
             "saved": saved,
             "real_input": real_input,
             "share_pct": share,
+            "window_events": window_events,
+            "total_events": total_events,
         }
 
     since = str(state.get("started_at") or "")
+    since_day = _ledger_day(since[:10])
+    since_prefix = since_day.isoformat() if since_day else ""
     saved = max(0, saved_tokens_now - _row_int(state, "saved_tokens_at_start"))
     real_input = 0
+    window_events = 0
     for day, harnesses in (state.get("by_day") or {}).items():
         if day >= since[:10] and isinstance(harnesses, dict):
             for row in harnesses.values():
                 real_input += _row_int(row, "input") + _row_int(row, "cache_read") + _row_int(row, "cache_write")
+                window_events += _row_int(row, "events")
+    until = max((d for d in usage_by_day if d >= since_prefix), default="") if since_day else ""
     denominator = real_input + saved
     share = round(saved / denominator * 100.0, 2) if denominator else 0.0
-    return {"since": since, "saved": saved, "real_input": real_input, "share_pct": share}
+    return {
+        "since": since,
+        "until": until,
+        "saved": saved,
+        "real_input": real_input,
+        "share_pct": share,
+        "window_events": window_events,
+        "total_events": total_events,
+    }
 
 
 def _cache_hit(row: dict[str, Any]) -> str:
@@ -547,6 +566,10 @@ def sunset_verdict(share: dict[str, Any], overhead: dict[str, int]) -> dict[str,
     """Evaluate net savings after denial overhead and classify whether the 30-day sunset threshold is cleared."""
     saved = max(0, int(share.get("saved") or 0))
     denial_tok = max(0, int(overhead.get("tokens") or 0)) if overhead else 0
+    window_events = max(0, int(share.get("window_events") or 0))
+    total_events = max(0, int(share.get("total_events") or 0))
+    if 0 < window_events < total_events:
+        denial_tok = int(denial_tok * window_events / total_events)
     net_saved = saved - denial_tok
     real_input = max(0, int(share.get("real_input") or 0))
     denom = real_input + max(0, net_saved)

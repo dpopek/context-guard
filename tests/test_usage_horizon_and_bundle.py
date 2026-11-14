@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import struct
 from pathlib import Path
 
@@ -11,10 +12,13 @@ import pytest
 from bin.cg_status import render_doctor_report, run_doctor
 from bin.install_harnesses import install_ide_extension
 from bin.token_usage import (
+    USAGE_SCHEMA_VERSION,
     empty_usage_state,
     fold_jsonl_file,
+    ingest_transcripts,
     parse_antigravity_record,
     parse_utc_day,
+    restore_usage_state,
 )
 from bin.usage_report import (
     active_claude_plugin_skill_files,
@@ -64,6 +68,8 @@ def test_cross_day_daily_sum_invariant_and_common_window(
         "saved": 12000,
         "real_input": 48000,
         "share_pct": 20.0,
+        "window_events": 0,
+        "total_events": 0,
     }
 
 
@@ -204,4 +210,207 @@ def test_logo_wcag_contrast_icon_png_and_context_audit_skill(tmp_path: Path) -> 
     skill_md = root / "skills" / "context-audit" / "SKILL.md"
     assert skill_md.is_file()
     assert "name: context-audit" in skill_md.read_text(encoding="utf-8")
+
+
+def test_restore_usage_state_sanitizes_corrupt_inner_rows_from_path(tmp_path: Path) -> None:
+    ledger = tmp_path / "token_usage.json"
+    ledger.write_text(
+        json.dumps(
+            {
+                "schema_version": USAGE_SCHEMA_VERSION,
+                "totals": {
+                    "claude|opus": 999,
+                    "codex|o3": {"input": 10, "events": 1, "output": "bad", "cache_read": True, "cache_write": -4},
+                },
+                "preamble": {"claude": "bad", "codex": [100, True, -5, 200]},
+                "preamble_parts": ["bad", {"measured": 100, "components": {}}],
+                "codex_preamble_parts": [123, {"measured": 50, "cohort": "codex (cli)", "components": {}}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    restored = restore_usage_state(ledger)
+    assert "claude|opus" not in restored["totals"]
+    assert restored["totals"]["codex|o3"] == {"input": 10, "events": 1, "output": 0, "cache_read": 0, "cache_write": 0}
+    assert restored["preamble"] == {"codex": [100, 0, 200]}
+    assert restored["preamble_parts"] == [{"measured": 100, "components": {}}]
+    assert restored["codex_preamble_parts"] == [{"measured": 50, "cohort": "codex (cli)", "components": {}}]
+
+    bad_path = tmp_path / "corrupt.json"
+    bad_path.write_text("{corrupt json", encoding="utf-8")
+    quarantined = restore_usage_state(bad_path)
+    assert quarantined["totals"] == {}
+    assert len(list(tmp_path.glob("corrupt.json.corrupt-*"))) == 1
+
+
+def test_antigravity_rewind_and_step_index_none_sidechain_reconciliation(tmp_path: Path) -> None:
+    ag_tx = tmp_path / "ag" / "b1" / ".system_generated" / "logs" / "transcript.jsonl"
+    ag_tx.parent.mkdir(parents=True)
+    r1 = json.dumps({"type": "USER_INPUT", "step_index": 0, "content": "<USER_REQUEST>hi</USER_REQUEST>"})
+    p1 = json.dumps({
+        "type": "PLANNER_RESPONSE",
+        "step_index": 1,
+        "created_at": "2026-11-14T10:00:00Z",
+        "model": "gemini-2.5-pro",
+        "input_tokens": 1000,
+        "output_tokens": 100,
+    })
+    p2 = json.dumps({
+        "type": "PLANNER_RESPONSE",
+        "step_index": 2,
+        "created_at": "2026-11-14T10:01:00Z",
+        "model": "gemini-2.5-pro",
+        "input_tokens": 1500,
+        "output_tokens": 200,
+    })
+    ag_tx.write_text(f"{r1}\n{p1}\n", encoding="utf-8")
+    st = empty_usage_state()
+    fold_jsonl_file(st, "antigravity", ag_tx, 1_000_000)
+    with ag_tx.open("a", encoding="utf-8") as fh:
+        fh.write(f"{p2}\n")
+    fold_jsonl_file(st, "antigravity", ag_tx, 1_000_000)
+    assert st["totals"]["antigravity|gemini-2.5-pro"]["input"] == 2500
+    assert st["totals"]["antigravity|gemini-2.5-pro"]["events"] == 2
+
+    # Truncate step 2 (rewind on same inode):
+    ag_tx.write_text(f"{r1}\n{p1}\n", encoding="utf-8")
+    fold_jsonl_file(st, "antigravity", ag_tx, 1_000_000)
+    assert st["totals"]["antigravity|gemini-2.5-pro"]["input"] == 1000
+    assert st["totals"]["antigravity|gemini-2.5-pro"]["events"] == 1
+    assert st["by_day"]["2026-11-14"]["antigravity"]["input"] == 1000
+    assert st["preamble"]["antigravity"] == [1000]
+
+    # Truncate to incomplete line (no newline): must still drop prior row cleanly once!
+    ag_tx.write_text("{incomplete", encoding="utf-8")
+    fold_jsonl_file(st, "antigravity", ag_tx, 1_000_000)
+    assert st["totals"] == {}
+    assert st["by_day"] == {}
+    assert st["preamble"] == {}
+
+    # Omitted step_index (None) with <SYSTEM_MESSAGE> before <USER_REQUEST> marks sidechain;
+    # after <USER_REQUEST>, <SYSTEM_MESSAGE> stays on main thread.
+    sub_tx = tmp_path / "ag" / "sub" / ".system_generated" / "logs" / "transcript.jsonl"
+    sub_tx.parent.mkdir(parents=True)
+    sub_tx.write_text(
+        "\n".join([
+            json.dumps({"type": "USER_INPUT", "content": "<SYSTEM_MESSAGE>subagent</SYSTEM_MESSAGE>"}),
+            json.dumps({"type": "PLANNER_RESPONSE", "created_at": "2026-11-14T10:02:00Z", "model": "flash", "input_tokens": 900, "output_tokens": 10}),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    main_tx = tmp_path / "ag" / "main2" / ".system_generated" / "logs" / "transcript.jsonl"
+    main_tx.parent.mkdir(parents=True)
+    main_tx.write_text(
+        "\n".join([
+            json.dumps({"type": "USER_INPUT", "content": "<USER_REQUEST>solve</USER_REQUEST>"}),
+            json.dumps({"type": "SYSTEM_MESSAGE", "content": "<SYSTEM_MESSAGE>notify</SYSTEM_MESSAGE>"}),
+            json.dumps({"type": "PLANNER_RESPONSE", "created_at": "2026-11-14T10:03:00Z", "model": "gemini-2.5-pro", "input_tokens": 500, "output_tokens": 20}),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    st2 = empty_usage_state()
+    fold_jsonl_file(st2, "antigravity", sub_tx, 1_000_000)
+    fold_jsonl_file(st2, "antigravity", main_tx, 1_000_000)
+    assert st2["preamble"] == {"antigravity": [500]}
+
+
+def test_forked_claude_and_codex_rewind_reconciles_all_per_file_contributions(tmp_path: Path) -> None:
+    def _claude_rec(mid: str, inp: int, tool: tuple[str, dict[str, str]] | None = None) -> dict:
+        msg: dict = {
+            "id": mid,
+            "model": "claude-opus-5-5",
+            "usage": {"input_tokens": inp, "output_tokens": 5, "cache_read_input_tokens": 0, "cache_write": 0},
+        }
+        if tool:
+            msg["content"] = [{"type": "tool_use", "id": f"t_{mid}", "name": tool[0], "input": tool[1]}]
+        return {"type": "assistant", "isSidechain": False, "timestamp": "2026-11-14T10:00:00Z", "message": msg}
+
+    roots = {name: tmp_path / name for name in ("antigravity", "claude", "codex", "cursor")}
+    parent = roots["claude"] / "p" / "parent.jsonl"
+    fork = roots["claude"] / "p" / "fork.jsonl"
+    solo = roots["claude"] / "p" / "solo.jsonl"
+    parent.parent.mkdir(parents=True)
+    hook_att = {"type": "attachment", "attachment": {"type": "hook_additional_context", "content": ["h" * 400]}}
+
+    parent.write_text(
+        json.dumps(hook_att) + "\n" + json.dumps(_claude_rec("m1", 100, ("Skill", {"skill": "superpowers:tdd"}))) + "\n",
+        encoding="utf-8",
+    )
+    fork.write_text(
+        json.dumps(_claude_rec("m1", 100, ("Skill", {"skill": "superpowers:tdd"})))
+        + "\n"
+        + json.dumps(_claude_rec("m2", 200, ("mcp__alpha__ping", {})))
+        + "\n",
+        encoding="utf-8",
+    )
+    solo.write_text(
+        json.dumps(hook_att) + "\n" + json.dumps(_claude_rec("m3", 600, ("mcp__beta__run", {}))) + "\n",
+        encoding="utf-8",
+    )
+    os.utime(parent, (1000, 1000))
+    os.utime(fork, (2000, 2000))
+    os.utime(solo, (3000, 3000))
+
+    st = empty_usage_state()
+    ingest_transcripts(st, roots)
+    assert st["totals"]["claude|claude-opus-5-5"]["events"] == 3
+    assert st["totals"]["claude|claude-opus-5-5"]["input"] == 900
+    assert st["component_use"] == {"2026-11-14": {"superpowers": 1, "mcp:alpha": 1, "mcp:beta": 1}}
+    assert st["preamble"]["claude"] == [100, 600]
+    assert len(st["preamble_parts"]) == 2
+
+    # Atomic inode replacement of fork.jsonl: m1 stays owned by parent, m2 & mcp:alpha subtracted!
+    repl = fork.with_suffix(".tmp")
+    repl.write_text(
+        json.dumps(_claude_rec("m1", 100, ("Skill", {"skill": "superpowers:tdd"})))
+        + "\n"
+        + json.dumps(_claude_rec("m4", 50))
+        + "\n",
+        encoding="utf-8",
+    )
+    os.replace(repl, fork)
+    # Rewind solo.jsonl with smaller preamble and no beta call:
+    solo.write_text(json.dumps(_claude_rec("m5", 250)) + "\n", encoding="utf-8")
+    os.utime(parent, (1000, 1000))
+    os.utime(fork, (2000, 2000))
+    os.utime(solo, (3000, 3000))
+
+    ingest_transcripts(st, roots)
+    assert st["seen_ids"][str(parent)] == ["m1"]
+    assert st["seen_ids"][str(fork)] == ["m4"]
+    assert st["totals"]["claude|claude-opus-5-5"]["events"] == 3
+    assert st["totals"]["claude|claude-opus-5-5"]["input"] == 400  # 100 + 50 + 250
+    assert st["component_use"] == {"2026-11-14": {"superpowers": 1}}
+    assert st["preamble"]["claude"] == [100, 250]
+    assert len(st["preamble_parts"]) == 1
+
+    # Codex rewind reconciles codex_preamble_parts + total_only row:
+    codex_file = roots["codex"] / "2026" / "11" / "14" / "rollout-1.jsonl"
+    codex_file.parent.mkdir(parents=True)
+    codex_file.write_text(
+        "\n".join([
+            json.dumps({"timestamp": "2026-11-14T10:00:00Z", "type": "session_meta", "payload": {"originator": "codex_cli_rs", "source": "cli"}}),
+            json.dumps({"type": "turn_context", "payload": {"model": "gpt-5.4"}}),
+            json.dumps({"type": "response_item", "payload": {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "You are Codex.\n" + "x" * 200}]}}),
+            json.dumps({"timestamp": "2026-11-14T10:00:01Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"total_tokens": 5000}}}}),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    ingest_transcripts(st, roots)
+    assert st["totals"]["codex|gpt-5.4"]["total_only"] == 1
+    assert len(st["codex_preamble_parts"]) == 1
+    codex_file.write_text(
+        "\n".join([
+            json.dumps({"timestamp": "2026-11-14T10:00:00Z", "type": "session_meta", "payload": {"originator": "codex_cli_rs", "source": "cli"}}),
+            json.dumps({"type": "turn_context", "payload": {"model": "gpt-5.4"}}),
+            json.dumps({"type": "response_item", "payload": {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "You are Codex.\n" + "y" * 20}]}}),
+            json.dumps({"timestamp": "2026-11-14T10:00:01Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 1200, "cached_input_tokens": 0, "output_tokens": 10}}}}),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    ingest_transcripts(st, roots)
+    assert st["totals"]["codex|gpt-5.4"]["total_only"] == 0
+    assert st["totals"]["codex|gpt-5.4"]["events"] == 1
+    assert st["preamble"]["codex"] == [1200]
+    assert [e["measured"] for e in st["codex_preamble_parts"]] == [1200]
 

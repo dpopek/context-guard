@@ -432,12 +432,7 @@ def outline_task_output(source: str) -> list[str]:
         stripped = line.strip()
         if not stripped:
             continue
-        if (
-            banner_re.match(stripped)
-            or tb_re.match(stripped)
-            or exc_re.match(stripped)
-            or fail_re.search(stripped)
-        ):
+        if any((banner_re.match(stripped), tb_re.match(stripped), exc_re.match(stripped), fail_re.search(stripped))):
             out.append(f"{stripped}: L{lineno}")
     return out
 
@@ -493,6 +488,55 @@ def outline_toml(source: str) -> list[str]:
     return out
 
 
+_HEREDOC_TAG_RE = re.compile(r"['\"]([A-Za-z_]\w*)['\"]")
+
+
+def _strip_shell_non_heredoc(line: str) -> str:
+    """Strip quotes, `<<<` here-strings, comments, and `(( ... ))` arithmetic, keeping `<<` delimiters."""
+    out: list[str] = []
+    i, n = 0, len(line)
+    while i < n:
+        ch = line[i]
+        if ch == "\\" and i + 1 < n:
+            i += 2
+        elif ch == "#" and (i == 0 or line[i - 1].isspace()):
+            break
+        elif line[i : i + 2] == "((":
+            depth, j = 2, i + 2
+            while j < n and depth > 0:
+                if line[j] == "\\" and j + 1 < n:
+                    j += 2
+                else:
+                    depth += 1 if line[j] == "(" else (-1 if line[j] == ")" else 0)
+                    j += 1
+            out.append(" ")
+            i = j
+        elif line[i : i + 3] == "<<<":
+            out.append("   ")
+            i += 3
+        elif line[i : i + 2] == "<<":
+            j = i + 2 + (1 if i + 2 < n and line[i + 2] == "-" else 0)
+            while j < n and line[j].isspace():
+                j += 1
+            end_q = line.find(line[j], j + 1) if j < n and line[j] in ("'", '"') else -1
+            if end_q != -1 and _HEREDOC_TAG_RE.fullmatch(line[j : end_q + 1]):
+                out.append(line[i : end_q + 1])
+                i = end_q + 1
+            else:
+                out.append("<<")
+                i += 2
+        elif ch in ("'", '"'):
+            j = i + 1
+            while j < n and line[j] != ch:
+                j += 2 if ch == '"' and line[j] == "\\" and j + 1 < n else 1
+            out.append(" ")
+            i = (j + 1) if j < n else n
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
 def outline_shell(source: str) -> list[str]:
     """Extract shell function spans from `.sh`/`.bash`/`.zsh`, ignoring heredoc bodies."""
     lines = source.splitlines()
@@ -510,7 +554,7 @@ def outline_shell(source: str) -> list[str]:
             continue
         stripped = line.lstrip()
         if not stripped.startswith("#"):
-            m_hd = heredoc_re.search(line)
+            m_hd = heredoc_re.search(_strip_shell_non_heredoc(line))
             if m_hd:
                 heredoc_eof = m_hd.group(1)
                 continue

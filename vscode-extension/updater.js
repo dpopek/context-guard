@@ -158,7 +158,7 @@ function updateStepEnv(baseEnv) {
 }
 
 function runUpdateStep([command, args]) {
-  const options = { timeout: UPDATE_STEP_TIMEOUT_MS, env: updateStepEnv(process.env) };
+  const options = { timeout: UPDATE_STEP_TIMEOUT_MS, env: updateStepEnv(process.env), windowsHide: true };
   const attempts =
     command === "python3"
       ? pythonCandidates().map(([pyBin, prefixArgs]) => [pyBin, [...prefixArgs, ...args]])
@@ -188,17 +188,31 @@ function runUpdateStep([command, args]) {
 }
 
 function spawnUpdateCheckIfStale(update, pluginRoot, lockPath) {
+  if (!pluginRoot) return;
+  const scriptPath = path.join(pluginRoot, "bin", "update_check.py");
+  if (!fs.existsSync(scriptPath)) return;
   const nowMs = Date.now();
   if (!isUpdateStale(update, nowMs) || isUpdateAttemptRecent(lockPath, nowMs)) return;
-  const scriptPath = path.join(pluginRoot, "bin", "update_check.py");
   const cands = pythonCandidates();
   const trySpawn = (idx) => {
     if (idx >= cands.length) return;
     const [pyBin, prefixArgs] = cands[idx];
-    const child = childProcess.spawn(pyBin, [...prefixArgs, scriptPath], { detached: true, stdio: "ignore" });
+    const child = childProcess.spawn(pyBin, [...prefixArgs, scriptPath], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    let settled = false;
     child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
       if (idx + 1 < cands.length) trySpawn(idx + 1);
       else console.warn(`context-guard: update check not started: ${err}`);
+    });
+    child.on("exit", (code) => {
+      if (settled) return;
+      settled = true;
+      if (code === 9009 && idx + 1 < cands.length) trySpawn(idx + 1);
     });
     child.unref();
   };
@@ -211,7 +225,7 @@ function hasContextGuardHook(configPath) {
     const parsed = JSON.parse(fs.readFileSync(configPath, "utf8"));
     if (!parsed || typeof parsed !== "object" || !parsed.hooks || typeof parsed.hooks !== "object") return false;
     const serialized = JSON.stringify(parsed.hooks);
-    return serialized.includes("pre_tool_use.py");
+    return serialized.includes("/hooks/pre_tool_use.py") || serialized.includes("\\\\hooks\\\\pre_tool_use.py");
   } catch (_err) {
     return false;
   }

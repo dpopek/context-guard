@@ -225,3 +225,35 @@ def test_tree_sitter_ts_abstract_class_is_listed() -> None:
     res = try_outline_tree_sitter("export abstract class BSONValue {\n    abstract get kind(): string\n}\n", ".ts")
     assert res is not None
     assert "class BSONValue: L1-L3" in res
+
+
+def test_outline_shell_ignores_arithmetic_shift_herestrings_and_quotes() -> None:
+    from hooks.markup_outliners import outline_shell
+
+    src = (
+        "#!/usr/bin/env bash\n"
+        "calc_mask() {\n"
+        "  (( mask = 1 << bits ))\n"
+        "  val=$(( shifted << 2 ))\n"
+        "  echo \"cat << FAKE_EOF\"\n"
+        "  printf '%s' '<< SINGLE_FAKE'\n"
+        "  cat <<< \"here string\"\n"
+        "}\n"
+        "real_after() {\n"
+        "  cat << 'EOF'\n"
+        "inside_heredoc() {\n"
+        "  echo skipped\n"
+        "}\n"
+        "EOF\n"
+        "  echo done\n"
+        "}\n"
+        "final_fn() {\n"
+        "  return 0\n"
+        "}\n"
+    )
+    symbols = outline_shell(src)
+    joined = "\n".join(symbols)
+    assert "function calc_mask(): L2-L8" in joined
+    assert "function real_after(): L9-L16" in joined
+    assert "function final_fn(): L17-L19" in joined
+    assert "inside_heredoc" not in joined

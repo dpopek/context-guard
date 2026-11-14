@@ -17,6 +17,7 @@ from bin.preamble_attribution import (
     attribute_record,
     cap_parts_to_measured,
     codex_session_traits,
+    extract_skill_frontmatter_summary,
     finalize_codex_preamble,
     find_candidates,
     is_claude_desktop_parts,
@@ -642,5 +643,35 @@ def test_codex_preamble_parts_never_exceed_measured_tokens(tmp_path: Path) -> No
     total_attributed = sum(v for sec in entry["components"].values() for v in sec.values())
     assert total_attributed <= entry["measured"] == 1000
     assert summarize_parts(split_codex_parts(state["codex_preamble_parts"])[CODEX_DESKTOP_HARNESS])["clamped"] is False
+
+
+def test_extract_skill_frontmatter_summary_and_workspace_agents_skills(tmp_path: Path) -> None:
+    block_md = (
+        "---\n"
+        "name: demo-multi\n"
+        "description: |\n"
+        "  line one\n"
+        "\tline two\n"
+        "metadata:\n"
+        "  author: dev\n"
+        "---\n"
+        "body\n"
+    )
+    assert extract_skill_frontmatter_summary(block_md) == "name: demo-multi\ndescription: |\n  line one\n\tline two"
+
+    folded_md = "---\nname: fold\ndescription: >\n  wrapped one\n  wrapped two\n---\n"
+    assert extract_skill_frontmatter_summary(folded_md) == "name: fold\ndescription: >\n  wrapped one\n  wrapped two"
+
+    home = tmp_path / "home"
+    ws = tmp_path / "ws"
+    (home / ".gemini").mkdir(parents=True)
+    ws_skill = ws / ".agents" / "skills" / "local-skill" / "SKILL.md"
+    ws_skill.parent.mkdir(parents=True)
+    ws_skill.write_text(block_md, encoding="utf-8")
+
+    without_ws = dict(measure_antigravity_preamble(home, None))
+    with_ws = dict(measure_antigravity_preamble(home, ws))
+    assert without_ws["skills listing"] == 0
+    assert with_ws["skills listing"] == tokens(extract_skill_frontmatter_summary(block_md))
 
 

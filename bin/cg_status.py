@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import select
 import shlex
+import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,7 +27,7 @@ from hooks.telemetry import DEFAULT_TELEMETRY_PATH, load_telemetry_stats  # noqa
 from hooks.outcomes import DEFAULT_OUTCOMES_PATH, load_outcomes  # noqa: E402
 from hooks.state_store import resolve_plugin_root, warn  # noqa: E402
 from bin import token_usage, usage_report  # noqa: E402
-from bin.harness_status import check_status  # noqa: E402
+from bin.harness_status import check_status, verify_harness_hooks  # noqa: E402
 from bin.update_check import UPDATE_LOCK, is_update_stale  # noqa: E402
 
 ROOT = resolve_plugin_root()
@@ -459,24 +462,86 @@ def usage_json(stats: dict[str, Any], usage_path: Path | None, outcomes_path: Pa
 _usage_json = usage_json
 
 
-def read_nonblocking_stdin_json() -> dict[str, Any]:
-    """Read JSON from stdin if piped and ready; return {} on empty or invalid input."""
+def _read_stream_bounded(stream: Any, max_bytes: int) -> str:
     try:
-        if sys.stdin is None or sys.stdin.isatty():
+        buf = getattr(stream, "buffer", None)
+        if buf is not None and hasattr(buf, "read1"):
+            chunk = buf.read1(max_bytes)
+            if isinstance(chunk, (bytes, bytearray)):
+                return bytes(chunk).decode("utf-8", errors="replace")
+            return str(chunk) if chunk is not None else ""
+        data = stream.read(max_bytes)
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data).decode("utf-8", errors="replace")
+        return str(data) if data is not None else ""
+    except (OSError, ValueError):
+        return ""
+
+
+def read_nonblocking_stdin_json(
+    timeout_s: float = 0.05,
+    max_bytes: int = 262_144,
+) -> dict[str, Any]:
+    """Read JSON from stdin if piped and ready; return {} on empty, timeout, or invalid input."""
+    stream = sys.stdin
+    if stream is None:
+        return {}
+    try:
+        if stream.isatty():
             return {}
-        ready, _, _ = select.select([sys.stdin], [], [], 0.05)
-        if not ready:
-            return {}
-        raw = sys.stdin.read()
-        if not raw or not raw.strip():
-            return {}
-        parsed = json.loads(raw)
-        return parsed if isinstance(parsed, dict) else {}
     except (OSError, ValueError):
         return {}
 
+    raw = ""
+    use_thread = sys.platform == "win32"
+    if not use_thread:
+        try:
+            ready, _, _ = select.select([stream], [], [], timeout_s)
+            if not ready:
+                return {}
+            raw = _read_stream_bounded(stream, max_bytes)
+        except (OSError, ValueError, io.UnsupportedOperation):
+            use_thread = True
+
+    if use_thread:
+        holder: list[str] = []
+
+        def _worker() -> None:
+            holder.append(_read_stream_bounded(stream, max_bytes))
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+        thread.join(timeout_s)
+        if thread.is_alive() or not holder:
+            return {}
+        raw = holder[0]
+
+    if not raw or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
 
 _read_nonblocking_stdin_json = read_nonblocking_stdin_json
+
+
+def _check_win32_python3() -> dict[str, Any]:
+    p3 = shutil.which("python3")
+    if not p3:
+        return {"available": False, "path": None, "is_stub": False, "detail": "python3 not found on PATH"}
+    is_windows_apps = "windowsapps" in p3.lower()
+    try:
+        size = Path(p3).stat().st_size
+    except OSError:
+        if is_windows_apps:
+            return {"available": False, "path": None, "is_stub": True, "detail": f"0-byte WindowsApps stub: {p3}"}
+        return {"available": True, "path": p3, "is_stub": False, "detail": p3}
+    if size == 0:
+        return {"available": False, "path": None, "is_stub": True, "detail": f"0-byte WindowsApps stub: {p3}"}
+    return {"available": True, "path": p3, "is_stub": False, "detail": p3}
 
 
 def run_doctor(
@@ -489,6 +554,13 @@ def run_doctor(
     root = plugin_root if plugin_root is not None else ROOT
     py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
     py_ok = (sys.version_info.major, sys.version_info.minor) >= (3, 9)
+    py_info: dict[str, Any] = {"executable": sys.executable, "version": py_ver, "ok": py_ok}
+    if sys.platform == "win32":
+        p3_check = _check_win32_python3()
+        py_info["python3_available"] = p3_check["available"]
+        py_info["python3_path"] = p3_check["path"]
+        py_info["python3_stub"] = p3_check["is_stub"]
+        py_info["python3_detail"] = p3_check["detail"]
     telemetry_dir = root / "telemetry"
     telem_ok = False
     flock_ok = False
@@ -522,6 +594,11 @@ def run_doctor(
         cursor_hooks_path=cursor_hooks_path,
         codex_hooks_path=codex_hooks_path,
     )
+    harness_details = verify_harness_hooks(
+        claude_settings_path=claude_settings_path,
+        cursor_hooks_path=cursor_hooks_path,
+        codex_hooks_path=codex_hooks_path,
+    )
     harnesses = {"antigravity": ag_ok, **ext_harnesses}
 
     is_repo = (root / ".git").exists()
@@ -537,7 +614,7 @@ def run_doctor(
             )
             if proc.returncode == 0:
                 git_clean = proc.stdout.strip() == ""
-        except OSError:
+        except (OSError, subprocess.SubprocessError):
             git_clean = None
 
     dups = usage_report.find_duplicate_skills()
@@ -553,10 +630,11 @@ def run_doctor(
         "ok": overall_ok,
         "version": plugin_version(),
         "platform": sys.platform,
-        "python": {"executable": sys.executable, "version": py_ver, "ok": py_ok},
+        "python": py_info,
         "flock": {"backend": flock_backend, "ok": flock_ok, "detail": flock_detail},
         "telemetry_dir": {"path": str(telemetry_dir), "writable": telem_ok, "ok": telem_ok},
         "harnesses": harnesses,
+        "harness_details": harness_details,
         "git": {"is_repo": is_repo, "clean": git_clean, "ok": True},
         "skill_hygiene": skill_hygiene,
     }
@@ -568,6 +646,7 @@ def render_doctor_report(report: dict[str, Any]) -> str:
     fl = report.get("flock", {})
     td = report.get("telemetry_dir", {})
     hr = report.get("harnesses", {})
+    hd = report.get("harness_details", {})
     gt = report.get("git", {})
     sh = report.get("skill_hygiene", {})
     lines = [
@@ -576,15 +655,27 @@ def render_doctor_report(report: dict[str, Any]) -> str:
         "| Check | Status | Details |",
         "| :--- | :---: | :--- |",
         f"| Python runtime (`>= 3.9`) | `{'OK' if py.get('ok') else 'FAIL'}` | `{py.get('version')}` (`{py.get('executable')}`) |",
+    ]
+    if "python3_available" in py:
+        p3_ok = bool(py.get("python3_available"))
+        lines.append(
+            f"| Windows `python3` | `{'OK' if p3_ok else 'WARN'}` | `{py.get('python3_detail')}` |"
+        )
+    lines.extend([
         f"| File locking (`flock`) | `{'OK' if fl.get('ok') else 'FAIL'}` | `{fl.get('backend')}` — {fl.get('detail')} |",
         f"| Telemetry directory | `{'OK' if td.get('ok') else 'FAIL'}` | `{td.get('path')}` (`writable={td.get('writable')}`) |",
         f"| Harness: `antigravity` | `{'OK' if hr.get('antigravity') else 'FAIL'}` | `hooks.json` & `plugin.json` |",
-    ]
+    ])
     for name in ("claude", "cursor", "codex"):
         installed = bool(hr.get(name))
-        lines.append(
-            f"| Harness: `{name}` | `{'OK' if installed else 'WARN'}` | `{'registered' if installed else 'not registered'}` |"
-        )
+        detail_obj = hd.get(name) if isinstance(hd, dict) else None
+        if installed and isinstance(detail_obj, dict) and detail_obj.get("target_exists") is False:
+            status_lbl = "WARN"
+            detail_str = f"registered, missing target ({detail_obj.get('target') or 'pre_tool_use.py'})"
+        else:
+            status_lbl = "OK" if installed else "WARN"
+            detail_str = "registered" if installed else "not registered"
+        lines.append(f"| Harness: `{name}` | `{status_lbl}` | `{detail_str}` |")
     git_detail = f"is_repo={gt.get('is_repo')}, clean={gt.get('clean')}"
     lines.append(f"| Git workspace | `OK` | `{git_detail}` |")
     dup_count = int(sh.get("duplicate_count", 0) or 0) if isinstance(sh, dict) else 0

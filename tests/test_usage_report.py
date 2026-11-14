@@ -137,9 +137,12 @@ BREAKDOWN = PreambleBreakdown(components=(("user CLAUDE.md + imports", 1000), ("
 def test_savings_share_counts_only_days_since_start() -> None:
     assert savings_share(ledger(), 2000) == {
         "since": "2026-11-01T08:00:00+00:00",
+        "until": "2026-11-01",
         "saved": 1000,
         "real_input": 1000,
         "share_pct": 50.0,
+        "window_events": 3,
+        "total_events": 4,
     }
 
 
@@ -441,4 +444,44 @@ def test_denial_overhead_and_sunset_verdict_ignore_legacy_v1_outcomes_schema() -
     }
     summary_v3 = usage_summary(state, 50_000, BREAKDOWN, outcomes_state=v3_out)
     assert summary_v3["denial_overhead"] == {"denials": 1, "tokens": 10_000}
+
+
+def test_measure_preamble_components_captures_multiline_yaml_skill_description(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "work" / "proj"
+    skill_text = "---\nname: multi\ndescription: |\n  line one\n  line two\nother:\n  ignored: true\n---\n"
+    write(home / ".claude" / "skills" / "multi" / "SKILL.md", skill_text)
+    components = dict(measure_preamble_components(home, project).components)
+    expected = "name: multi\ndescription: |\n  line one\n  line two"
+    assert components["skills listing"] == len(expected.encode("utf-8")) // 4
+
+
+def test_sunset_verdict_empty_stats_without_started_at_and_denial_proration() -> None:
+    # 40-day historical usage_by_day with empty stats.by_day and missing started_at -> window_days == 0
+    hist_days = {f"2026-10-{d:02d}": {"claude": {"input": 1000, "events": 1}} for d in range(1, 31)}
+    hist_days.update({f"2026-11-{d:02d}": {"claude": {"input": 1000, "events": 1}} for d in range(1, 11)})
+    share_no_start = savings_share({"by_day": hist_days}, saved_tokens_now=5000, stats_state={"by_day": {}})
+    assert share_no_start["until"] == ""
+    verdict_no_start = sunset_verdict(share_no_start, {"denials": 2, "tokens": 1000})
+    assert verdict_no_start["window_days"] == 0
+    assert verdict_no_start["status"] == "collecting_30d_window"
+
+    # Overlapping window (30 events) out of 90 total events -> denial_tok prorated by 30/90
+    usage_by_day = {
+        "2026-09-01": {"claude": {"input": 10_000, "events": 60}},
+        "2026-11-10": {"claude": {"input": 50_000, "events": 15}},
+        "2026-11-11": {"claude": {"input": 50_000, "events": 15}},
+    }
+    stats_state = {
+        "by_day": {
+            "2026-11-10": {"saved_bytes": 40_000},
+            "2026-11-11": {"saved_bytes": 40_000},
+        }
+    }
+    share_overlap = savings_share({"by_day": usage_by_day}, saved_tokens_now=20_000, stats_state=stats_state)
+    assert share_overlap["window_events"] == 30
+    assert share_overlap["total_events"] == 90
+    verdict_prorated = sunset_verdict(share_overlap, {"denials": 3, "tokens": 9000})
+    assert verdict_prorated["net_saved"] == 20_000 - 3000
+    assert verdict_prorated["window_days"] == 2
 

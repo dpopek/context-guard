@@ -174,3 +174,242 @@ def test_workspace_session_start_and_stop_hooks_installed_idempotently_keeping_s
     assert sum("claude_stop_guard.py --cursor-hook" in c for c in _commands(cursor, "stop")) == 1
 
 
+def test_codex_toml_lexical_scanner_preserves_comments_strings_arrays_and_indented_tables(
+    tmp_path: Path,
+) -> None:
+    from bin.codex_toml import sync_codex_config_toml
+
+    codex_hooks = tmp_path / "hooks.json"
+    codex_config = tmp_path / "config.toml"
+    state_header = f'[hooks.state."{codex_hooks}:pre_tool_use:0:0"]'
+    initial = (
+        '# Top comment with """ and [fake_table]\n'
+        '# model_auto_compact_token_limit = 999\n'
+        'model = "gpt-5"\n'
+        'escaped = "a\\\\\\"b [not_a_table]"\n'
+        "win_lit = 'C:\\\\temp\\\\ [not_a_table]'\n"
+        'multiline_str = """\n'
+        "[inside_multiline_str]\n"
+        "model_auto_compact_token_limit = 1\n"
+        '"""\n'
+        "literal_multi = '''\n"
+        "[inside_literal_multi]\n"
+        "'''\n"
+        "nested_arr = [\n"
+        '  "[inside_array]",\n'
+        "  [1, 2],\n"
+        "]\n"
+        "\n"
+        "# Section comment for demo\n"
+        "# Second line of demo comment\n"
+        "[mcp_servers.demo]\n"
+        'args = ["--flag"]\n'
+        "\n"
+        f"{state_header}\n"
+        'trusted_hash = "sha256:old"\n'
+        "\n"
+        "# User comment before indented table\n"
+        "  [indented_user_table]\n"
+        'key = "keep_me"\n'
+    )
+    codex_config.write_text(initial, encoding="utf-8")
+    hooks_data = {
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "^(Bash)$",
+                    "hooks": [{"type": "command", "command": "python3 /opt/cg/hooks/pre_tool_use.py"}],
+                }
+            ]
+        }
+    }
+
+    assert (
+        sync_codex_config_toml(
+            codex_hooks_path=codex_hooks,
+            codex_config_path=codex_config,
+            hooks_data=hooks_data,
+            ensure_compact_limit=True,
+            dry_run=False,
+        )
+        == "updated"
+    )
+    rendered = codex_config.read_text(encoding="utf-8")
+    limit_line = "model_auto_compact_token_limit = 250000 # context-guard:managed"
+    assert limit_line in rendered
+    assert rendered.index(limit_line) < rendered.index("# Section comment for demo")
+    assert rendered.index("nested_arr = [") < rendered.index(limit_line)
+    assert "# User comment before indented table" in rendered
+    assert "  [indented_user_table]" in rendered
+    assert 'key = "keep_me"' in rendered
+    assert 'trusted_hash = "sha256:old"' not in rendered
+
+    # Idempotency check
+    sync_codex_config_toml(
+        codex_hooks_path=codex_hooks,
+        codex_config_path=codex_config,
+        hooks_data=hooks_data,
+        ensure_compact_limit=True,
+        dry_run=False,
+    )
+    assert codex_config.read_text(encoding="utf-8") == rendered
+
+    # Uninstall removes managed limit line and hooks.state blocks cleanly
+    sync_codex_config_toml(
+        codex_hooks_path=codex_hooks,
+        codex_config_path=codex_config,
+        hooks_data={"hooks": {}},
+        ensure_compact_limit=False,
+        dry_run=False,
+    )
+    after_uninstall = codex_config.read_text(encoding="utf-8")
+    assert "# context-guard:managed" not in after_uninstall
+    assert "hooks.state" not in after_uninstall
+    assert "# User comment before indented table" in after_uninstall
+    assert "  [indented_user_table]" in after_uninstall
+    assert "[inside_multiline_str]" in after_uninstall
+
+
+def test_codex_toml_preserves_existing_user_compact_limit(tmp_path: Path) -> None:
+    from bin.codex_toml import sync_codex_config_toml
+
+    codex_hooks = tmp_path / "hooks.json"
+    codex_config = tmp_path / "config.toml"
+    codex_config.write_text(
+        "model_auto_compact_token_limit = 180000\n\n[mcp_servers.demo]\ncommand = 'x'\n",
+        encoding="utf-8",
+    )
+    sync_codex_config_toml(
+        codex_hooks_path=codex_hooks,
+        codex_config_path=codex_config,
+        hooks_data={"hooks": {}},
+        ensure_compact_limit=True,
+        dry_run=False,
+    )
+    text = codex_config.read_text(encoding="utf-8")
+    assert "model_auto_compact_token_limit = 180000" in text
+    assert "# context-guard:managed" not in text
+
+    sync_codex_config_toml(
+        codex_hooks_path=codex_hooks,
+        codex_config_path=codex_config,
+        hooks_data={"hooks": {}},
+        ensure_compact_limit=False,
+        dry_run=False,
+    )
+    assert "model_auto_compact_token_limit = 180000" in codex_config.read_text(encoding="utf-8")
+
+
+def test_installer_preserves_symlinks_and_skips_dangling_symlinks(tmp_path: Path) -> None:
+    import os
+
+    if os.name == "nt":
+        return
+
+    dots = tmp_path / "dotfiles"
+    dots.mkdir()
+    real_claude = dots / "claude.json"
+    real_cursor = dots / "cursor.json"
+    real_codex = dots / "codex.json"
+    real_toml = dots / "config.toml"
+    real_claude.write_text('{"hooks": {}}\n', encoding="utf-8")
+    real_cursor.write_text('{"version": 1, "hooks": {}}\n', encoding="utf-8")
+    real_codex.write_text('{"hooks": {}}\n', encoding="utf-8")
+    real_toml.write_text('model = "gpt-5"\n', encoding="utf-8")
+
+    home_cfgs = tmp_path / "home_cfgs"
+    home_cfgs.mkdir()
+    claude_link = home_cfgs / "settings.json"
+    cursor_link = home_cfgs / "cursor_hooks.json"
+    codex_link = home_cfgs / "codex_hooks.json"
+    toml_link = home_cfgs / "config.toml"
+    claude_link.symlink_to(real_claude)
+    cursor_link.symlink_to(real_cursor)
+    codex_link.symlink_to(real_codex)
+    toml_link.symlink_to(real_toml)
+
+    plugin_root = Path(__file__).resolve().parent.parent
+    res = install_all(plugin_root, claude_link, cursor_link, codex_link, toml_link)
+    assert res["claude"] == "updated"
+    assert res["cursor"] == "updated"
+    assert res["codex_hooks"] == "updated"
+    assert res["codex_config"] == "updated"
+    for link in (claude_link, cursor_link, codex_link, toml_link):
+        assert link.is_symlink()
+    assert (home_cfgs / "settings.json.bak").is_file()
+    assert "pre_tool_use.py" in real_claude.read_text(encoding="utf-8")
+
+    uninstall_all(claude_link, cursor_link, codex_link, toml_link)
+    for link in (claude_link, cursor_link, codex_link, toml_link):
+        assert link.is_symlink()
+    assert "context-guard" not in real_claude.read_text(encoding="utf-8")
+
+    dangling_claude = home_cfgs / "dangling_claude.json"
+    dangling_cursor = home_cfgs / "dangling_cursor.json"
+    dangling_codex = home_cfgs / "dangling_codex.json"
+    dangling_toml = home_cfgs / "dangling_config.toml"
+    for dlink in (dangling_claude, dangling_cursor, dangling_codex, dangling_toml):
+        dlink.symlink_to(dots / f"missing_{dlink.name}")
+
+    d_res = install_all(plugin_root, dangling_claude, dangling_cursor, dangling_codex, dangling_toml)
+    assert d_res["claude"] == "skipped (not found)"
+    assert d_res["cursor"] == "skipped (not found)"
+    assert d_res["codex_hooks"] == "skipped (not found)"
+    assert d_res["codex_config"] == "skipped (not found)"
+
+
+def test_build_vscode_file_uri_location_hook_quoting_and_lazy_plugin_root(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from pathlib import PureWindowsPath
+    from bin import install_harnesses
+
+    win_loc = install_harnesses.build_vscode_file_uri_location(
+        PureWindowsPath(r"C:\Users\Alice Smith\.cursor\extensions\advox.context-guard-statusbar-3.99.0")
+    )
+    assert win_loc == {
+        "$mid": 1,
+        "fsPath": r"C:\Users\Alice Smith\.cursor\extensions\advox.context-guard-statusbar-3.99.0",
+        "external": "file:///C:/Users/Alice%20Smith/.cursor/extensions/advox.context-guard-statusbar-3.99.0",
+        "path": "/C:/Users/Alice Smith/.cursor/extensions/advox.context-guard-statusbar-3.99.0",
+        "scheme": "file",
+    }
+
+    space_dir = tmp_path / "dir with spaces" / "ext"
+    space_dir.mkdir(parents=True)
+    posix_loc = install_harnesses.build_vscode_file_uri_location(space_dir)
+    assert posix_loc["external"].startswith("file:///")
+    assert "%20" in posix_loc["external"]
+    assert posix_loc["path"].startswith("/")
+    assert posix_loc["fsPath"] == str(space_dir.resolve())
+
+    assert (
+        install_harnesses.format_hook_script_path(Path("/opt/my(proj)&1/hooks/pre_tool_use.py"))
+        == '"/opt/my(proj)&1/hooks/pre_tool_use.py"'
+    )
+    assert (
+        install_harnesses.format_hook_script_path(Path('/opt/my"proj/hooks/pre_tool_use.py'))
+        == '"/opt/my\\"proj/hooks/pre_tool_use.py"'
+    )
+    assert (
+        install_harnesses.format_hook_script_path(Path("C:/Users/Alice/hooks/pre_tool_use.py"))
+        == "C:/Users/Alice/hooks/pre_tool_use.py"
+    )
+
+    assert hasattr(install_harnesses, "DEFAULT_PLUGIN_ROOT")
+    lazy_root = tmp_path / "lazy-cg-root"
+    (lazy_root / "hooks").mkdir(parents=True)
+    (lazy_root / "bin").mkdir(parents=True)
+    claude_cfg = tmp_path / "claude.json"
+    claude_cfg.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("CONTEXT_GUARD_HOME", str(lazy_root))
+    install_harnesses.install_all(
+        claude_settings_path=claude_cfg,
+        cursor_hooks_path=tmp_path / "missing_cursor.json",
+        codex_hooks_path=tmp_path / "missing_codex.json",
+        codex_config_path=tmp_path / "missing_config.toml",
+    )
+    assert str(lazy_root.resolve()).replace("\\", "/") in claude_cfg.read_text(encoding="utf-8")
+
+
+

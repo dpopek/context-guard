@@ -514,3 +514,99 @@ def test_notebook_read_cell_id_does_not_false_block_distinct_cells_and_maps_note
     assert "file_path" not in updated
     assert "offset" not in updated
     assert "limit" not in updated
+
+
+def test_antigravity_normalize_extracts_cwd_and_resolves_relative_paths_only_in_canonical(
+    tmp_path: Path,
+) -> None:
+    payload_edit = {
+        "conversationId": "c-ag-cwd",
+        "stepIdx": 3,
+        "cwd": str(tmp_path),
+        "toolCall": {
+            "name": "replace_file_content",
+            "args": {"TargetFile": "pkg/mod.py", "StartLine": 1, "EndLine": 10},
+        },
+    }
+    norm_edit = normalize_pre_tool_payload(payload_edit)
+    expected_edit = str(tmp_path / "pkg/mod.py")
+    assert norm_edit.cwd == str(tmp_path)
+    assert norm_edit.canonical_args["TargetFile"] == expected_edit
+    assert norm_edit.mutated_paths == (expected_edit,)
+    assert norm_edit.original_tool_input["TargetFile"] == "pkg/mod.py"
+
+    payload_write = {
+        "conversationId": "c-ag-cwd",
+        "stepIdx": 4,
+        "cwd": str(tmp_path),
+        "toolCall": {"name": "write_to_file", "args": {"AbsolutePath": "sub/out.py"}},
+    }
+    norm_write = normalize_pre_tool_payload(payload_write)
+    assert norm_write.canonical_args["AbsolutePath"] == str(tmp_path / "sub/out.py")
+    assert norm_write.mutated_paths == (str(tmp_path / "sub/out.py"),)
+    assert norm_write.original_tool_input["AbsolutePath"] == "sub/out.py"
+
+    payload_read = {
+        "conversationId": "c-ag-cwd",
+        "stepIdx": 5,
+        "cwd": str(tmp_path),
+        "toolCall": {"name": "read_file", "args": {"Path": "rel.py"}},
+    }
+    norm_read = normalize_pre_tool_payload(payload_read)
+    assert norm_read.canonical_args["Path"] == str(tmp_path / "rel.py")
+    assert norm_read.original_tool_input["Path"] == "rel.py"
+
+    norm_blank = normalize_pre_tool_payload(
+        {
+            "conversationId": "c-ag-cwd",
+            "stepIdx": 6,
+            "cwd": "   ",
+            "toolCall": {"name": "read_file", "args": {"Path": "rel.py"}},
+        }
+    )
+    assert norm_blank.cwd is None
+    assert norm_blank.canonical_args["Path"] == "rel.py"
+
+
+def test_format_pre_tool_output_detects_path_key_and_respects_original_line_bounds() -> None:
+    norm_path_key = normalize_pre_tool_payload(
+        {"tool_name": "read_file", "tool_input": {"path": "/tmp/a.py"}, "session_id": "s1"}
+    )
+    fmt_path = format_pre_tool_output(
+        {"decision": "allow", "overwrite": {"Path": "/tmp/b.py", "StartLine": 10, "EndLine": 30}},
+        norm_path_key,
+    )
+    upd_path = fmt_path["hookSpecificOutput"]["updatedInput"]
+    assert upd_path == {"path": "/tmp/b.py", "offset": 10, "limit": 21}
+    assert "file_path" not in upd_path
+
+    norm_orig_bounds = normalize_pre_tool_payload(
+        {
+            "tool_name": "read_file",
+            "tool_input": {"file_path": "/tmp/a.py", "StartLine": 1, "EndLine": 50},
+            "session_id": "s2",
+        }
+    )
+    fmt_bounds = format_pre_tool_output(
+        {"decision": "allow", "overwrite": {"Path": "/tmp/a.py", "StartLine": 25, "EndLine": 50}},
+        norm_orig_bounds,
+    )
+    upd_bounds = fmt_bounds["hookSpecificOutput"]["updatedInput"]
+    assert upd_bounds["file_path"] == "/tmp/a.py"
+    assert upd_bounds["StartLine"] == 25
+    assert upd_bounds["EndLine"] == 50
+    assert "offset" not in upd_bounds
+    assert "limit" not in upd_bounds
+
+    norm_end_only = normalize_pre_tool_payload(
+        {"tool_name": "view_file", "tool_input": {"path": "/tmp/a.py", "EndLine": 40}, "session_id": "s3"}
+    )
+    fmt_end = format_pre_tool_output(
+        {"decision": "allow", "overwrite": {"StartLine": 15, "EndLine": 40}},
+        norm_end_only,
+    )
+    upd_end = fmt_end["hookSpecificOutput"]["updatedInput"]
+    assert upd_end["StartLine"] == 15
+    assert upd_end["EndLine"] == 40
+    assert "offset" not in upd_end
+    assert "limit" not in upd_end

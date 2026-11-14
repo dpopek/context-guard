@@ -700,3 +700,88 @@ console.log("WIN_EXT_OK");
     assert proc.returncode == 0, proc.stderr
     assert "WIN_EXT_OK" in proc.stdout
 
+
+def test_updater_guards_windows_hide_9009_settled_and_hook_path(
+    tmp_path: Path,
+) -> None:
+    manifest = json.loads((EXT_DIR / "package.json").read_text(encoding="utf-8"))
+    plugin_ver = json.loads((ROOT / "plugin.json").read_text(encoding="utf-8"))["version"]
+    assert manifest["version"] == plugin_ver
+    assert manifest["publisher"] == "advox"
+
+    plugin_dir = tmp_path / "cg-upd"
+    (plugin_dir / "bin").mkdir(parents=True)
+    home_dir = tmp_path / "home"
+    (home_dir / ".claude").mkdir(parents=True)
+    (home_dir / ".cursor").mkdir(parents=True)
+    (home_dir / ".codex").mkdir(parents=True)
+    (home_dir / ".claude" / "settings.json").write_text(
+        json.dumps({"hooks": {"PreToolUse": [{"hooks": [{"command": "python C:\\cg\\hooks\\pre_tool_use.py"}]}]}}),
+        encoding="utf-8",
+    )
+    (home_dir / ".cursor" / "hooks.json").write_text(
+        json.dumps({"hooks": {"PreToolUse": [{"hooks": [{"command": "python3 /opt/other/my_pre_tool_use.py"}]}]}}),
+        encoding="utf-8",
+    )
+    (home_dir / ".codex" / "hooks.json").write_text(
+        json.dumps({"hooks": {"PreToolUse": [{"hooks": [{"command": "python3 /opt/cg/hooks/pre_tool_use.py"}]}]}}),
+        encoding="utf-8",
+    )
+
+    script = rf"""
+const assert = require("assert");
+const childProcess = require("child_process");
+const fs = require("fs");
+const path = require("path");
+const updater = require({json.dumps(str(EXT_DIR / "updater.js"))});
+
+const spawnCalls = [];
+const execOpts = [];
+childProcess.spawn = (bin, args, opts) => {{
+  spawnCalls.push({{ bin, args, opts }});
+  const handlers = {{}};
+  return {{
+    on(ev, fn) {{ handlers[ev] = fn; }},
+    unref() {{
+      if (spawnCalls.length === 1) {{
+        handlers.error(Object.assign(new Error("missing"), {{ code: "ENOENT" }}));
+        handlers.exit(9009);
+      }}
+    }},
+  }};
+}};
+childProcess.execFile = (_bin, _args, opts, cb) => {{ execOpts.push(opts); cb(null, "", ""); }};
+
+const doc = updater.probeDoctor({json.dumps(str(plugin_dir))}, {json.dumps(str(home_dir))});
+assert.deepStrictEqual(doc.harnesses, {{ antigravity: false, claude: true, cursor: false, codex: true }});
+
+updater.spawnUpdateCheckIfStale(null, "", path.join({json.dumps(str(plugin_dir))}, "update.lock"));
+updater.spawnUpdateCheckIfStale(null, {json.dumps(str(plugin_dir))}, path.join({json.dumps(str(plugin_dir))}, "update.lock"));
+assert.strictEqual(spawnCalls.length, 0);
+
+fs.writeFileSync({json.dumps(str(plugin_dir / "bin" / "update_check.py"))}, "# stub\n");
+updater.spawnUpdateCheckIfStale(null, {json.dumps(str(plugin_dir))}, path.join({json.dumps(str(plugin_dir))}, "update.lock"));
+assert.strictEqual(spawnCalls.length, 2);
+assert.strictEqual(spawnCalls[0].opts.windowsHide, true);
+
+spawnCalls.length = 0;
+childProcess.spawn = (bin, args, opts) => {{
+  spawnCalls.push({{ bin, args, opts }});
+  const handlers = {{}};
+  return {{
+    on(ev, fn) {{ handlers[ev] = fn; }},
+    unref() {{ if (spawnCalls.length === 1) handlers.exit(9009); }},
+  }};
+}};
+updater.spawnUpdateCheckIfStale(null, {json.dumps(str(plugin_dir))}, path.join({json.dumps(str(plugin_dir))}, "update.lock"));
+assert.strictEqual(spawnCalls.length, 2);
+
+updater.runUpdateStep(["git", ["--version"]]).then(() => {{
+  assert.strictEqual(execOpts[0].windowsHide, true);
+  console.log("UPDATER_OK");
+}});
+"""
+    proc = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stderr
+    assert "UPDATER_OK" in proc.stdout
+

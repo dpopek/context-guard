@@ -16,6 +16,9 @@ const {
   isValidSemver,
   escapeHtml,
   escapeMarkdownCodeSpan,
+  escapeMarkdownText,
+  finiteNonNeg,
+  parseIsoDayUtcMs,
   normalizeStats,
   formatCompactTokens,
   formatContextWindows,
@@ -64,6 +67,23 @@ let lastSeenSavedTokens = null;
 let activeReportPanel = null;
 const activeWebviewViews = new Set();
 const pendingNoticeKeys = new Set();
+const jsonCache = new Map();
+const DOCTOR_CACHE_TTL_MS = 30000;
+let doctorCache = null;
+
+function invalidateDoctorCache() {
+  doctorCache = null;
+}
+
+function getCachedDoctor() {
+  const now = Date.now();
+  if (doctorCache && doctorCache.root === PLUGIN_ROOT && now - doctorCache.atMs < DOCTOR_CACHE_TTL_MS) {
+    return doctorCache.value;
+  }
+  const value = probeDoctor(PLUGIN_ROOT);
+  doctorCache = { root: PLUGIN_ROOT, atMs: now, value };
+  return value;
+}
 
 function refreshPluginPaths() {
   PLUGIN_ROOT = resolvePluginRoot();
@@ -72,14 +92,29 @@ function refreshPluginPaths() {
   UPDATE_LOCK_PATH = path.join(PLUGIN_ROOT, "telemetry", "update.lock");
   USAGE_PATH = path.join(PLUGIN_ROOT, "telemetry", "token_usage.json");
   OUTCOMES_PATH = path.join(PLUGIN_ROOT, "telemetry", "outcomes.json");
+  jsonCache.clear();
+  invalidateDoctorCache();
 }
 
 function loadJsonFailOpen(filePath, warnLabel = "") {
   try {
-    if (!fs.existsSync(filePath)) return null;
-    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+    const st = fs.statSync(filePath);
+    const cached = jsonCache.get(filePath);
+    if (
+      cached &&
+      cached.ino === st.ino &&
+      cached.mtimeMs === st.mtimeMs &&
+      cached.ctimeMs === st.ctimeMs &&
+      cached.size === st.size
+    ) {
+      return cached.data;
+    }
+    const data = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    jsonCache.set(filePath, { ino: st.ino, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs, size: st.size, data });
+    return data;
   } catch (err) {
-    if (warnLabel) {
+    jsonCache.delete(filePath);
+    if (err && err.code !== "ENOENT" && warnLabel) {
       console.warn(`context-guard: ${warnLabel} unreadable (${filePath}): ${err}`);
     }
     return null;
@@ -92,7 +127,7 @@ const loadTokenUsage = () => loadJsonFailOpen(USAGE_PATH);
 const loadOutcomes = () => loadJsonFailOpen(OUTCOMES_PATH);
 
 function computeInsights(stats) {
-  return summarizeV4Insights(stats, loadTokenUsage(), loadOutcomes(), probeDoctor(PLUGIN_ROOT));
+  return summarizeV4Insights(stats, loadTokenUsage(), loadOutcomes(), getCachedDoctor());
 }
 
 function buildTooltipMarkdown(stats, updateLine = "", insights = undefined) {
@@ -136,6 +171,7 @@ async function runUpdate() {
     return false;
   } finally {
     updateInFlight = false;
+    invalidateDoctorCache();
   }
   updateStatusBar();
   const choice = await vscode.window.showInformationMessage(
@@ -188,7 +224,7 @@ function triggerBackgroundUsageRefresh() {
       return;
     }
     const [pyBin, prefixArgs] = cands[idx];
-    childProcess.execFile(pyBin, [...prefixArgs, scriptPath, "--usage"], { timeout: 15000 }, (err) => {
+    childProcess.execFile(pyBin, [...prefixArgs, scriptPath, "--usage"], { timeout: 15000, windowsHide: true }, (err) => {
       if (err && idx + 1 < cands.length && (err.code === "ENOENT" || err.code === 9009)) {
         tryExec(idx + 1);
         return;
@@ -204,12 +240,22 @@ function triggerBackgroundUsageRefresh() {
   tryExec(0);
 }
 
+function triggerUsageRefreshIfStale(maxAgeMs = 600000) {
+  try {
+    const st = fs.statSync(USAGE_PATH);
+    if (Number.isFinite(st.mtimeMs) && Date.now() - st.mtimeMs < maxAgeMs) return;
+  } catch (_err) {
+    // Missing or unreadable token_usage.json triggers background refresh.
+  }
+  triggerBackgroundUsageRefresh();
+}
+
 function updateStatusBar(options = {}) {
   const stats = loadStats();
   const update = loadUpdate();
   const badge = updateBadge(update);
   const insights = computeInsights(stats);
-  const currentSaved = stats ? Math.max(0, Number(stats.saved_tokens) || 0) : 0;
+  const currentSaved = stats ? finiteNonNeg(stats.saved_tokens) : 0;
   if (statusBarItem) {
     const isPulseHit =
       Boolean(options.fromWatch) &&
@@ -271,12 +317,14 @@ function createSidebarProvider() {
       webviewView.webview.options = { enableScripts: false };
       activeWebviewViews.add(webviewView);
       webviewView.webview.html = renderSidebarHtml(loadStats());
+      triggerUsageRefreshIfStale();
       webviewView.onDidDispose(() => {
         activeWebviewViews.delete(webviewView);
       });
       webviewView.onDidChangeVisibility(() => {
         if (webviewView.visible) {
           webviewView.webview.html = renderSidebarHtml(loadStats());
+          triggerUsageRefreshIfStale();
         }
       });
     },
@@ -303,6 +351,8 @@ function _cleanupExtensionState() {
   }
   activeWebviewViews.clear();
   pendingNoticeKeys.clear();
+  jsonCache.clear();
+  invalidateDoctorCache();
   activeReportPanel = null;
   statusBarItem = null;
   lastSeenSavedTokens = null;
@@ -329,6 +379,7 @@ function activate(context) {
   }
 
   const cmdDisposable = vscode.commands.registerCommand("contextGuard.showReport", () => {
+    triggerUsageRefreshIfStale();
     if (activeReportPanel) {
       activeReportPanel.webview.html = renderWebviewHtml(loadStats());
       if (typeof activeReportPanel.reveal === "function") {
@@ -351,16 +402,16 @@ function activate(context) {
     panel.webview.html = renderWebviewHtml(loadStats());
   });
   const refreshDisposable = vscode.commands.registerCommand("contextGuard.refresh", () => {
+    invalidateDoctorCache();
     updateStatusBar();
     triggerBackgroundUsageRefresh();
   });
-  const updateDisposable = vscode.commands.registerCommand("contextGuard.update", () => {
-    runUpdate();
-  });
+  const updateDisposable = vscode.commands.registerCommand("contextGuard.update", () => runUpdate());
   context.subscriptions.push(cmdDisposable, refreshDisposable, updateDisposable);
 
   const initial = updateStatusBar();
   spawnUpdateCheckIfStale(initial.update, PLUGIN_ROOT, UPDATE_LOCK_PATH);
+  triggerUsageRefreshIfStale();
 
   watchListener = () => {
     updateStatusBar({ fromWatch: true });
@@ -399,6 +450,9 @@ module.exports = {
   COST_BASIS_NOTE,
   escapeHtml,
   escapeMarkdownCodeSpan,
+  escapeMarkdownText,
+  finiteNonNeg,
+  parseIsoDayUtcMs,
   isValidSemver,
   normalizeStats,
   HARNESS_ORDER,

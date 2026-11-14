@@ -99,6 +99,10 @@ def empty_usage_state() -> dict[str, Any]:
     }
 
 
+def _clean_counter_row(row: dict[str, Any]) -> dict[str, int]:
+    return {str(k): nonneg_int(v) for k, v in row.items()}
+
+
 def restore_usage_state(path: Path) -> dict[str, Any]:
     """The ledger at `path` with missing or mistyped sections reset; a file that is not a JSON object is quarantined."""
     try:
@@ -133,13 +137,25 @@ def restore_usage_state(path: Path) -> dict[str, Any]:
     state["antigravity_last_model"] = (
         norm_ag_last if norm_ag_last not in (UNKNOWN_MODEL, "auto") else UNKNOWN_MODEL
     )
-    # A non-dict row would crash the next refresh before the ledger is rewritten, so the crash would repeat.
-    state["component_use"] = {day: row for day, row in state["component_use"].items() if isinstance(row, dict)}
+    # A non-dict row or mistyped inner entry would crash the next refresh before rewrite, repeating on every run.
+    state["totals"] = {
+        str(k): _clean_counter_row(row) for k, row in state["totals"].items() if isinstance(row, dict)
+    }
+    state["component_use"] = {
+        str(day): _clean_counter_row(row) for day, row in state["component_use"].items() if isinstance(row, dict)
+    }
     state["by_day"] = {
-        day: {harness: totals for harness, totals in row.items() if isinstance(totals, dict)}
+        str(day): {str(harness): _clean_counter_row(totals) for harness, totals in row.items() if isinstance(totals, dict)}
         for day, row in state["by_day"].items()
         if isinstance(row, dict)
     }
+    state["preamble"] = {
+        str(harness): [nonneg_int(x) for x in vals if not isinstance(x, bool)]
+        for harness, vals in state["preamble"].items()
+        if isinstance(vals, list)
+    }
+    state["preamble_parts"] = [row for row in state["preamble_parts"] if isinstance(row, dict)]
+    state["codex_preamble_parts"] = [row for row in state["codex_preamble_parts"] if isinstance(row, dict)]
     return state
 
 
@@ -170,11 +186,18 @@ def _fold_into(row: dict[str, Any], event: UsageEvent) -> None:
     row["total_only"] = nonneg_int(row.get("total_only")) + int(event.total_only)
 
 
-def add_event(state: dict[str, Any], event: UsageEvent) -> None:
-    """Add one call to the per harness|model totals and, when it has a day, to that day's per-harness row."""
-    _fold_into(state["totals"].setdefault(f"{event.harness}|{event.model}", {}), event)
+def add_event(state: dict[str, Any], event: UsageEvent, cursor: dict[str, Any] | None = None) -> None:
+    """Add one call to totals and per-day harness rows, recording per-file deltas on `cursor` when provided."""
+    model_key = f"{event.harness}|{event.model}"
+    _fold_into(state["totals"].setdefault(model_key, {}), event)
     if event.day:
         _fold_into(state["by_day"].setdefault(event.day, {}).setdefault(event.harness, {}), event)
+    if cursor is not None:
+        ftot = cursor.setdefault("folded_totals", {})
+        _fold_into(ftot.setdefault(model_key, {}), event)
+        if event.day:
+            fdays = cursor.setdefault("folded_days", {})
+            _fold_into(fdays.setdefault(event.day, {}).setdefault(event.harness, {}), event)
 
 
 def add_preamble(state: dict[str, Any], harness: str, event: UsageEvent) -> int:
@@ -193,11 +216,13 @@ def add_preamble_parts(state: dict[str, Any], measured: int, components: dict[st
     del history[:-PREAMBLE_HISTORY]
 
 
-def add_codex_preamble_parts(state: dict[str, Any], measured: int, cohort: str, components: dict[str, Any]) -> None:
+def add_codex_preamble_parts(state: dict[str, Any], measured: int, cohort: str, components: dict[str, Any]) -> dict[str, Any]:
     """Append one Codex main-thread session's preamble breakdown, keeping the last PREAMBLE_HISTORY."""
+    capped = cap_parts_to_measured(measured, components)
     history = state.setdefault("codex_preamble_parts", [])
-    history.append({"measured": measured, "cohort": cohort, "components": cap_parts_to_measured(measured, components)})
+    history.append({"measured": measured, "cohort": cohort, "components": capped})
     del history[:-PREAMBLE_HISTORY]
+    return capped
 
 
 def _note_claude_record(
@@ -229,9 +254,12 @@ def _note_claude_record(
     message_id = str(message.get("id") or "") if isinstance(message, dict) else ""
     if message_id and known[message_id] > 0 and message_id not in seen:
         return
-    row = state["component_use"].setdefault(parse_utc_day(record.get("timestamp")) or fallback_day, {})
+    comp_day = parse_utc_day(record.get("timestamp")) or fallback_day
+    row = state["component_use"].setdefault(comp_day, {})
+    fcomp = cursor.setdefault("folded_comp_use", {}).setdefault(comp_day, {})
     for key in keys:
         row[key] = nonneg_int(row.get(key)) + 1
+        fcomp[key] = nonneg_int(fcomp.get(key)) + 1
 
 
 def _event_from(
@@ -271,8 +299,13 @@ def _event_from(
         if rec_type in ("USER_INPUT", "SYSTEM_MESSAGE"):
             content = str(record.get("content") or "")
             if rec_type == "USER_INPUT" and "<USER_REQUEST>" in content:
+                cursor["has_user_request"] = True
                 cursor["is_sidechain"] = False
-            elif record.get("step_index") == 0 and "<SYSTEM_MESSAGE>" in content:
+            elif (
+                record.get("step_index") in (0, None)
+                and not cursor.get("has_user_request")
+                and "<SYSTEM_MESSAGE>" in content
+            ):
                 cursor["is_sidechain"] = True
             if rec_type == "USER_INPUT":
                 sel_model = antigravity_model_from_record(record)
@@ -307,6 +340,77 @@ def known_message_ids(state: dict[str, Any]) -> Counter[str]:
     return known
 
 
+def _subtract_counts(target: dict[str, Any], delta: dict[str, Any], *, prune_zero_keys: bool = False) -> bool:
+    """Subtract `delta` counters from `target`, clamping at 0; returns True when the row has no remaining activity."""
+    for field, raw_val in delta.items():
+        dec = nonneg_int(raw_val)
+        if dec:
+            target[field] = max(0, nonneg_int(target.get(field)) - dec)
+    if prune_zero_keys:
+        for key in [k for k, v in target.items() if nonneg_int(v) == 0]:
+            del target[key]
+        return not target
+    return nonneg_int(target.get("events")) == 0
+
+
+def _pop_last_equal(items: Any, target: Any) -> None:
+    if not isinstance(items, list):
+        return
+    for idx in range(len(items) - 1, -1, -1):
+        if items[idx] == target:
+            del items[idx]
+            return
+
+
+def _reconcile_rewind(state: dict[str, Any], key: str, cursor: dict[str, Any], known: Counter[str]) -> None:
+    """Roll back per-file contributions recorded on `cursor` before re-reading a truncated or replaced file."""
+    folded_totals = cursor.get("folded_totals")
+    if isinstance(folded_totals, dict):
+        for model_key, delta in folded_totals.items():
+            row = state["totals"].get(model_key)
+            if isinstance(delta, dict) and isinstance(row, dict) and _subtract_counts(row, delta):
+                del state["totals"][model_key]
+    folded_days = cursor.get("folded_days")
+    if isinstance(folded_days, dict):
+        for day, harnesses in folded_days.items():
+            day_row = state["by_day"].get(day)
+            if not isinstance(harnesses, dict) or not isinstance(day_row, dict):
+                continue
+            for h_name, delta in harnesses.items():
+                h_row = day_row.get(h_name)
+                if isinstance(delta, dict) and isinstance(h_row, dict) and _subtract_counts(h_row, delta):
+                    del day_row[h_name]
+            if not day_row:
+                del state["by_day"][day]
+    folded_comp = cursor.get("folded_comp_use")
+    if isinstance(folded_comp, dict):
+        for day, delta in folded_comp.items():
+            day_row = state["component_use"].get(day)
+            if (
+                isinstance(delta, dict)
+                and isinstance(day_row, dict)
+                and _subtract_counts(day_row, delta, prune_zero_keys=True)
+            ):
+                del state["component_use"][day]
+    pre = cursor.get("folded_preamble")
+    if isinstance(pre, dict):
+        p_harness = pre.get("harness")
+        if isinstance(p_harness, str) and "measured" in pre:
+            hist = state["preamble"].get(p_harness)
+            _pop_last_equal(hist, nonneg_int(pre.get("measured")))
+            if isinstance(hist, list) and not hist:
+                state["preamble"].pop(p_harness, None)
+        if "parts" in pre:
+            _pop_last_equal(state.get("preamble_parts"), pre["parts"])
+        if "codex_parts" in pre:
+            _pop_last_equal(state.get("codex_preamble_parts"), pre["codex_parts"])
+    old_ids = _id_list(state["seen_ids"].pop(key, None))
+    known.subtract(old_ids)
+    for mid in old_ids:
+        if known[mid] <= 0:
+            known.pop(mid, None)
+
+
 def fold_jsonl_file(
     state: dict[str, Any], harness: str, path: Path, budget: int, known: Counter[str] | None = None
 ) -> int:
@@ -327,8 +431,9 @@ def fold_jsonl_file(
     key = str(path)
     cursor = state["cursors"].get(key)
     if not isinstance(cursor, dict) or cursor.get("inode") != stat.st_ino or stat.st_size < nonneg_int(cursor.get("offset")):
+        _reconcile_rewind(state, key, cursor if isinstance(cursor, dict) else {}, known)
         cursor = {"inode": stat.st_ino, "offset": 0, "model": None, "preamble_done": False}
-        known.subtract(_id_list(state["seen_ids"].pop(key, None)))
+        state["cursors"][key] = cursor
     offset = nonneg_int(cursor.get("offset"))
     if stat.st_size <= offset or budget <= 0:
         state["cursors"][key] = cursor
@@ -382,16 +487,21 @@ def fold_jsonl_file(
             event = replace(event, model=fixed_model)
         if not event.day:
             event = replace(event, day=fallback_day)
-        add_event(state, event)
+        add_event(state, event, cursor)
         if first_main:
             measured = add_preamble(state, harness, event)
             cursor["preamble_done"] = True
+            pre_meta: dict[str, Any] = {"harness": harness, "measured": measured}
             parts = cursor.pop("pending_parts", None)
             if parts:
                 add_preamble_parts(state, measured, parts)
+                pre_meta["parts"] = {"measured": measured, "components": parts}
             codex_parts = finalize_codex_preamble(cursor.pop("codex_pending_parts", None))
             if harness == "codex" and codex_parts:
-                add_codex_preamble_parts(state, measured, str(cursor.get("codex_cohort") or CODEX_CLI_HARNESS), codex_parts)
+                cohort = str(cursor.get("codex_cohort") or CODEX_CLI_HARNESS)
+                capped = add_codex_preamble_parts(state, measured, cohort, codex_parts)
+                pre_meta["codex_parts"] = {"measured": measured, "cohort": cohort, "components": capped}
+            cursor["folded_preamble"] = pre_meta
     cursor["offset"] = offset + len(body)
     state["cursors"][key] = cursor
     if seen:

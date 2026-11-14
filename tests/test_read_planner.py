@@ -208,3 +208,55 @@ def test_trim_bounds_and_interval_normalization_edge_cases() -> None:
     normed = normalize_recorded_ranges([[1, -1, 3], [0, 10, 1]], target_lines=200)
     assert normed == [[1, 200, 3]]
     assert covering_read_step(normed, 50, 150, target_lines=200) == 3
+
+
+def test_antigravity_unbounded_read_ignores_cached_lines_above_harness_cap(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "big_1200.py"
+    target.write_text("".join(f"x = {i}\n" for i in range(1, 1201)), encoding="utf-8")
+    state_dir = str(tmp_path / "state_cap")
+
+    res_tail = ptu.evaluate_hook(
+        {
+            "conversationId": "c-cap",
+            "stepIdx": 1,
+            "toolCall": {
+                "name": "read_file",
+                "args": {"Path": str(target), "StartLine": 900, "EndLine": 1200},
+            },
+        },
+        state_dir=state_dir,
+    )
+    assert res_tail == {"decision": "allow"}
+
+    res_unbounded = ptu.evaluate_hook(
+        {
+            "conversationId": "c-cap",
+            "stepIdx": 2,
+            "toolCall": {"name": "read_file", "args": {"Path": str(target)}},
+        },
+        state_dir=state_dir,
+    )
+    assert res_unbounded == {"decision": "allow"}
+    assert load_telemetry_stats().get("ranges_trimmed", 0) == 0
+
+
+def test_telemetry_and_outcomes_resolve_default_paths_lazily(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hooks.telemetry as tele
+
+    tele_path = tmp_path / "lazy_telemetry.json"
+    out_path = tmp_path / "lazy_outcomes.jsonl"
+    monkeypatch.setattr(tele, "DEFAULT_TELEMETRY_PATH", tele_path)
+    monkeypatch.setattr(outcomes, "DEFAULT_OUTCOMES_PATH", out_path)
+
+    outcomes.record_direct_outcome("claude", "gpt-5", "range_trim")
+    assert out_path.is_file()
+    loaded_outcomes = outcomes.load_outcomes()
+    assert loaded_outcomes["by_key"]["claude|gpt-5|range_trim"]["total"] == 1
+
+    tele_path.write_text(json.dumps({"saved_bytes": 777}), encoding="utf-8")
+    assert tele.load_telemetry_stats().get("saved_bytes") == 777

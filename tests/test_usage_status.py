@@ -94,12 +94,24 @@ def test_cg_status_doctor_reports_healthy_environment_and_harnesses(
     (plugin_root / "hooks").mkdir(parents=True)
     (plugin_root / "telemetry").mkdir(parents=True)
     (plugin_root / "hooks" / "hooks.json").write_text("{}", encoding="utf-8")
+    (plugin_root / "hooks" / "pre_tool_use.py").write_text("# stub\n", encoding="utf-8")
     (plugin_root / "plugin.json").write_text('{"version": "0.0.0-test"}', encoding="utf-8")
     claude_cfg = tmp_path / "settings.json"
     cursor_cfg = tmp_path / "cursor_hooks.json"
     codex_cfg = tmp_path / "codex_hooks.json"
-    for cfg in (claude_cfg, cursor_cfg, codex_cfg):
-        cfg.write_text('{"command": "/path/to/hooks/pre_tool_use.py"}', encoding="utf-8")
+    pre_hook = plugin_root / "hooks" / "pre_tool_use.py"
+    claude_cfg.write_text(
+        json.dumps({"hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": f"python3 {pre_hook}"}]}]}}),
+        encoding="utf-8",
+    )
+    cursor_cfg.write_text(
+        json.dumps({"version": 1, "hooks": {"preToolUse": [{"command": f"python3 {pre_hook}"}]}}),
+        encoding="utf-8",
+    )
+    codex_cfg.write_text(
+        json.dumps({"hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": f"python3 {pre_hook}"}]}]}}),
+        encoding="utf-8",
+    )
 
     report = cg_status.run_doctor(
         plugin_root=plugin_root,
@@ -363,4 +375,171 @@ def test_refresh_usage_migrates_legacy_antigravity_and_codex_preserving_claude(t
     assert state["codex_preamble_parts"][0]["cohort"] == "codex (desktop)"
 
 
+def test_harness_status_validates_json_and_verifies_targets_on_disk(tmp_path: Path) -> None:
+    import os
+    from bin import harness_status
 
+    real_hook = tmp_path / "dir with spaces" / "hooks" / "pre_tool_use.py"
+    real_hook.parent.mkdir(parents=True)
+    real_hook.write_text("# stub\n", encoding="utf-8")
+
+    claude_cfg = tmp_path / "claude.json"
+    cursor_cfg = tmp_path / "cursor.json"
+    codex_cfg = tmp_path / "codex.json"
+
+    claude_cfg.write_text(
+        json.dumps({"hooks": {"PreToolUse": [{"hooks": [{"command": f'python3 "{real_hook}" --harness claude'}]}]}}),
+        encoding="utf-8",
+    )
+    cursor_cfg.write_text(
+        json.dumps({"version": 1, "hooks": {"preToolUse": [{"command": r"python C:\missing\hooks\pre_tool_use.py"}]}}),
+        encoding="utf-8",
+    )
+    codex_cfg.write_text('{"command": "/not/inside/hooks/pre_tool_use.py"}', encoding="utf-8")
+
+    status = harness_status.check_status(claude_cfg, cursor_cfg, codex_cfg)
+    assert status == {"claude": True, "cursor": True, "codex": False}
+
+    codex_cfg.write_text(json.dumps({"hooks": {"note": "/hooks/pre_tool_use.py"}}), encoding="utf-8")
+    assert harness_status.check_status(claude_cfg, cursor_cfg, codex_cfg)["codex"] is False
+
+    details = harness_status.verify_harness_hooks(claude_cfg, cursor_cfg, codex_cfg)
+    assert details["claude"]["registered"] is True
+    assert details["claude"]["target_exists"] is True
+    assert details["claude"]["ok"] is True
+    assert details["cursor"]["registered"] is True
+    assert details["cursor"]["target_exists"] is False
+    assert details["cursor"]["ok"] is False
+    assert details["codex"]["registered"] is False
+    assert details["codex"]["target_exists"] is False
+    assert details["codex"]["ok"] is False
+
+    if os.name != "nt":
+        dangling = tmp_path / "dangling_hooks.json"
+        dangling.symlink_to(tmp_path / "does_not_exist.json")
+        assert harness_status.check_status(dangling, cursor_cfg, codex_cfg)["claude"] is False
+        assert harness_status.verify_harness_hooks(dangling, cursor_cfg, codex_cfg)["claude"]["registered"] is False
+
+
+def test_read_nonblocking_stdin_json_hybrid_zero_thread_leak_and_fallbacks(
+    monkeypatch,
+) -> None:
+    import io
+    import os
+    import select
+    import sys
+    import threading
+
+    spawned: list[threading.Thread] = []
+    real_thread = threading.Thread
+
+    def _spy_thread(*args, **kwargs):
+        t = real_thread(*args, **kwargs)
+        spawned.append(t)
+        return t
+
+    monkeypatch.setattr(threading, "Thread", _spy_thread)
+
+    if sys.platform != "win32":
+        r_fd, w_fd = os.pipe()
+        try:
+            with os.fdopen(r_fd, "r", encoding="utf-8") as r_stream:
+                monkeypatch.setattr(sys, "stdin", r_stream)
+                # Empty open pipe: times out in select without spawning any thread
+                assert cg_status.read_nonblocking_stdin_json(timeout_s=0.01) == {}
+                assert spawned == []
+
+                # Write JSON without closing write fd: reads immediately without hanging or spawning threads
+                os.write(w_fd, b'{"model": {"display_name": "Opus"}}')
+                assert cg_status.read_nonblocking_stdin_json(timeout_s=0.05) == {
+                    "model": {"display_name": "Opus"}
+                }
+                assert spawned == []
+        finally:
+            os.close(w_fd)
+
+    # StringIO raises UnsupportedOperation in select -> falls back to daemon thread
+    monkeypatch.setattr(sys, "stdin", io.StringIO('{"session_id": "s1"}'))
+    assert cg_status.read_nonblocking_stdin_json(timeout_s=0.05) == {"session_id": "s1"}
+    assert len(spawned) == 1
+    assert spawned[0].daemon is True
+
+    # Simulated win32 path uses daemon thread fallback without calling select.select
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(
+        select,
+        "select",
+        lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("select must not be called on win32")),
+    )
+    monkeypatch.setattr(sys, "stdin", io.StringIO('{"ok": true}'))
+    assert cg_status.read_nonblocking_stdin_json(timeout_s=0.05) == {"ok": True}
+    assert len(spawned) == 2
+
+    # Invalid / non-dict JSON returns {}
+    monkeypatch.setattr(sys, "stdin", io.StringIO("[1, 2, 3]"))
+    assert cg_status.read_nonblocking_stdin_json(timeout_s=0.05) == {}
+
+
+def test_run_doctor_subprocess_timeout_harness_details_and_win32_python3_stub(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import shutil
+    import subprocess
+    import sys
+
+    plugin_root = tmp_path / "cg_plugin"
+    (plugin_root / "hooks").mkdir(parents=True)
+    (plugin_root / "telemetry").mkdir(parents=True)
+    (plugin_root / ".git").mkdir()
+    (plugin_root / "hooks.json").write_text("{}", encoding="utf-8")
+    (plugin_root / "plugin.json").write_text('{"version": "3.99.0"}', encoding="utf-8")
+
+    claude_cfg = tmp_path / "claude.json"
+    cursor_cfg = tmp_path / "cursor.json"
+    codex_cfg = tmp_path / "codex.json"
+    claude_cfg.write_text(
+        json.dumps({"hooks": {"PreToolUse": [{"hooks": [{"command": "python3 /missing/hooks/pre_tool_use.py"}]}]}}),
+        encoding="utf-8",
+    )
+    cursor_cfg.write_text('{"version": 1, "hooks": {}}', encoding="utf-8")
+    codex_cfg.write_text('{"hooks": {}}', encoding="utf-8")
+
+    def _timeout_run(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd=["git", "status"], timeout=3)
+
+    monkeypatch.setattr(subprocess, "run", _timeout_run)
+
+    stub_dir = tmp_path / "Microsoft" / "WindowsApps"
+    stub_dir.mkdir(parents=True)
+    stub_py3 = stub_dir / "python3.exe"
+    stub_py3.write_bytes(b"")
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(shutil, "which", lambda cmd: str(stub_py3) if cmd == "python3" else None)
+
+    report = cg_status.run_doctor(
+        plugin_root=plugin_root,
+        claude_settings_path=claude_cfg,
+        cursor_hooks_path=cursor_cfg,
+        codex_hooks_path=codex_cfg,
+    )
+    assert report["git"]["clean"] is None
+    assert report["harness_details"]["claude"]["registered"] is True
+    assert report["harness_details"]["claude"]["target_exists"] is False
+    assert report["python"]["python3_available"] is False
+    assert report["python"]["python3_stub"] is True
+    rendered = cg_status.render_doctor_report(report)
+    assert "missing target" in rendered
+
+    real_py3 = tmp_path / "Python312" / "python3.exe"
+    real_py3.parent.mkdir(parents=True)
+    real_py3.write_bytes(b"MZ")
+    monkeypatch.setattr(shutil, "which", lambda cmd: str(real_py3) if cmd == "python3" else None)
+    report_ok = cg_status.run_doctor(
+        plugin_root=plugin_root,
+        claude_settings_path=claude_cfg,
+        cursor_hooks_path=cursor_cfg,
+        codex_hooks_path=codex_cfg,
+    )
+    assert report_ok["python"]["python3_available"] is True
+    assert report_ok["python"]["python3_stub"] is False

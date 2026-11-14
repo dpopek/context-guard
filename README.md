@@ -89,6 +89,7 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 | `hooks/model_identity.py` | Telemetry | Resolves canonical model slugs (Antigravity transcript/sibling fallback, Claude, Codex) and harness `model_labels` overrides. |
 | `bin/cg_status.py` | CLI & UI | Status CLI (`--short`, `--claude-hud`, `--markdown`, `--json`, `--outcomes`, `--usage`, `--doctor`). |
 | `bin/install_harnesses.py` | CLI & UI | Multi-harness hook & IDE extension installer (`--install`, `--uninstall`, `--status`, `--dry-run`). |
+| `bin/codex_toml.py` | CLI & UI | Lexical TOML scanner for non-destructive `~/.codex/config.toml` sync. |
 | `bin/harness_status.py` | CLI & UI | Cycle-free status verifier across Claude Code, Cursor, and OpenAI Codex configs. |
 | `bin/outline.py` | CLI & UI | CLI wrapper around `hooks/outline.py` (`cg-outline`). |
 | `bin/instruction_block.py` | CLI & UI | `cg-outline` shim and instruction-file rule block. |

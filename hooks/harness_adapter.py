@@ -140,19 +140,26 @@ def normalize_pre_tool_payload(
         orig_args = dict(raw_args) if isinstance(raw_args, dict) else {}
         step_idx = _safe_finite_int(payload.get("stepIdx"), default=0)
         session_id = str(payload.get("conversationId") or "default")
+        cwd_raw = payload.get("cwd")
+        cwd = cwd_raw.strip() if isinstance(cwd_raw, str) and cwd_raw.strip() else None
         artifact_dir_raw = payload.get("artifactDirectoryPath")
         artifact_dir = artifact_dir_raw.strip() if isinstance(artifact_dir_raw, str) and artifact_dir_raw.strip() else None
+        ag_args = dict(orig_args)
+        for path_field in ("Path", "TargetFile", "AbsolutePath"):
+            val = ag_args.get(path_field)
+            if isinstance(val, str) and val.strip():
+                ag_args[path_field] = _resolve_with_cwd(val, cwd)
         mutated: tuple[str, ...] = ()
         ag_canonical = raw_tool
         if raw_tool in ("edit_file", "write_file", "replace_file_content", "multi_replace_file_content", "write_to_file"):
-            p = orig_args.get("Path") or orig_args.get("TargetFile") or orig_args.get("AbsolutePath")
+            p = ag_args.get("Path") or ag_args.get("TargetFile") or ag_args.get("AbsolutePath")
             if isinstance(p, str) and p.strip():
                 mutated = (p.strip(),)
             ag_canonical = "edit_file" if raw_tool in ("edit_file", "replace_file_content", "multi_replace_file_content") else "write_file"
         return NormalizedToolCall(
-            harness="antigravity", canonical_tool=ag_canonical, canonical_args=dict(orig_args),
+            harness="antigravity", canonical_tool=ag_canonical, canonical_args=ag_args,
             original_tool_name=raw_tool, original_tool_input=orig_args, session_id=session_id,
-            step_idx=step_idx, cwd=None, artifact_dir=artifact_dir, mutated_paths=mutated,
+            step_idx=step_idx, cwd=cwd, artifact_dir=artifact_dir, mutated_paths=mutated,
         )
 
     raw_tool = str(payload.get("tool_name") or "")
@@ -237,17 +244,22 @@ def format_pre_tool_output(decision: dict[str, Any], norm: NormalizedToolCall) -
         if norm.canonical_tool in ("read_file", "view_file") and norm.original_tool_name == "NotebookRead":
             if "Path" in overwrite:
                 updated["notebook_path"] = overwrite["Path"]
-        elif norm.canonical_tool in ("read_file", "view_file") and (
-            norm.original_tool_name == "Read" or "file_path" in updated
-        ):
+        elif norm.canonical_tool in ("read_file", "view_file"):
             if "Path" in overwrite:
-                updated["file_path"] = overwrite["Path"]
+                path_key = "path" if ("path" in updated and "file_path" not in updated) else "file_path"
+                updated[path_key] = overwrite["Path"]
             if "StartLine" in overwrite or "EndLine" in overwrite:
                 new_start = int(overwrite.get("StartLine", norm.canonical_args.get("StartLine", 1)))
                 new_end = int(overwrite.get("EndLine", norm.canonical_args.get("EndLine", -1)))
-                updated["offset"] = new_start
-                if new_end != -1 and new_end >= new_start:
-                    updated["limit"] = new_end - new_start + 1
+                if "StartLine" in norm.original_tool_input or "EndLine" in norm.original_tool_input:
+                    if "StartLine" in overwrite:
+                        updated["StartLine"] = new_start
+                    if "EndLine" in overwrite:
+                        updated["EndLine"] = new_end
+                else:
+                    updated["offset"] = new_start
+                    if new_end != -1 and new_end >= new_start:
+                        updated["limit"] = new_end - new_start + 1
         elif norm.canonical_tool == "run_command" and "CommandLine" in overwrite:
             cmd_key = next(
                 (k for k in ("command", "cmd", "CommandLine") if updated.get(k)),

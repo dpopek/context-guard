@@ -529,3 +529,125 @@ def test_detect_antigravity_model_handles_oversized_sidechain_and_transcript_ful
     os.utime(comp_sib, (1000, 1000))
     os.utime(comp_cur, (2000, 2000))
     assert mi.detect_antigravity_model(state_dir=comp_cur_dir) == "claude-sonnet-4-6"
+
+
+def test_detect_antigravity_model_to_auto_stops_older_settings_but_keeps_planner_tags(
+    tmp_path: Path,
+) -> None:
+    conv_only_auto = tmp_path / "iso_only" / "ag_auto_only"
+    (conv_only_auto / ".system_generated" / "logs").mkdir(parents=True)
+    log_only = conv_only_auto / ".system_generated" / "logs" / "transcript.jsonl"
+    log_only.write_text(
+        json.dumps(
+            {
+                "step_index": 0,
+                "type": "USER_INPUT",
+                "content": "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from Auto to Gemini 3 Flash.\n</USER_SETTINGS_CHANGE>",
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "step_index": 1,
+                "type": "USER_INPUT",
+                "content": "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from Gemini 3 Flash to Auto.\n</USER_SETTINGS_CHANGE>",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert mi.detect_antigravity_model(state_dir=conv_only_auto) == "unknown"
+
+    conv_planner = tmp_path / "iso_planner" / "ag_auto_planner"
+    (conv_planner / ".system_generated" / "logs").mkdir(parents=True)
+    log_planner = conv_planner / ".system_generated" / "logs" / "transcript.jsonl"
+    log_planner.write_text(
+        json.dumps(
+            {
+                "step_index": 0,
+                "type": "USER_INPUT",
+                "content": "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from Auto to Gemini 3 Flash.\n</USER_SETTINGS_CHANGE>",
+            }
+        )
+        + "\n"
+        + json.dumps({"step_index": 1, "type": "PLANNER_RESPONSE", "model": "claude-sonnet-4-6"})
+        + "\n"
+        + json.dumps(
+            {
+                "step_index": 2,
+                "type": "USER_INPUT",
+                "content": "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from Gemini 3 Flash to Auto.\n</USER_SETTINGS_CHANGE>",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert mi.detect_antigravity_model(state_dir=conv_planner) == "claude-sonnet-4-6"
+
+    conv_big = tmp_path / "iso_big" / "ag_auto_cross_boundary"
+    (conv_big / ".system_generated" / "logs").mkdir(parents=True)
+    log_big = conv_big / ".system_generated" / "logs" / "transcript.jsonl"
+    pad_lines = [
+        json.dumps({"step_index": i + 1, "type": "USER_INPUT", "content": "p" * 1000})
+        for i in range(80)
+    ]
+    log_big.write_text(
+        json.dumps(
+            {
+                "step_index": 0,
+                "type": "USER_INPUT",
+                "content": "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from Auto to Gemini 3 Flash.\n</USER_SETTINGS_CHANGE>",
+            }
+        )
+        + "\n"
+        + "\n".join(pad_lines)
+        + "\n"
+        + json.dumps(
+            {
+                "step_index": 81,
+                "type": "USER_INPUT",
+                "content": "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from Gemini 3 Flash to Auto.\n</USER_SETTINGS_CHANGE>",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert mi.detect_antigravity_model(state_dir=conv_big) == "unknown"
+
+
+def test_detect_codex_model_prefers_tail_turn_context_over_head() -> None:
+    day_dir = mi.CODEX_SESSIONS_DIR / "2026" / "11" / "14"
+    day_dir.mkdir(parents=True, exist_ok=True)
+
+    small = day_dir / "rollout-2026-11-14T10-00-00-switchsmall.jsonl"
+    small.write_text(
+        json.dumps({"type": "turn_context", "payload": {"model": "gpt-5-codex"}})
+        + "\n"
+        + json.dumps({"type": "turn_context", "payload": {"model": "gpt-6.1-sol"}})
+        + "\n",
+        encoding="utf-8",
+    )
+    assert mi.detect_codex_model("switchsmall") == "gpt-6.1-sol"
+
+    large = day_dir / "rollout-2026-11-14T10-00-00-switchlarge.jsonl"
+    pad = "\n".join(json.dumps({"type": "event_msg", "payload": {"text": "x" * 1000}}) for _ in range(80))
+    large.write_text(
+        json.dumps({"type": "turn_context", "payload": {"model": "gpt-5-codex"}})
+        + "\n"
+        + pad
+        + "\n"
+        + json.dumps({"type": "turn_context", "payload": {"model": "gpt-6.2-max"}})
+        + "\n",
+        encoding="utf-8",
+    )
+    assert mi.detect_codex_model("switchlarge") == "gpt-6.2-max"
+
+    head_only = day_dir / "rollout-2026-11-14T10-00-00-headfallback.jsonl"
+    head_only.write_text(
+        json.dumps({"type": "turn_context", "payload": {"model": "gpt-5-codex"}})
+        + "\n"
+        + pad
+        + "\n",
+        encoding="utf-8",
+    )
+    assert mi.detect_codex_model("headfallback") == "gpt-5-codex"

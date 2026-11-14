@@ -9,6 +9,8 @@ const {
   isLayerVisible,
   escapeHtml,
   escapeMarkdownCodeSpan,
+  escapeMarkdownText,
+  finiteNonNeg,
   normalizeStats,
   formatCompactTokens,
   formatContextWindows,
@@ -20,7 +22,8 @@ const {
 const TOOLTIP_COMMANDS = ["contextGuard.refresh", "contextGuard.showReport", "contextGuard.update"];
 
 function formatSignedCompactTokens(value) {
-  const num = Number(value) || 0;
+  const raw = typeof value === "boolean" ? 0 : Number(value);
+  const num = Number.isFinite(raw) ? raw : 0;
   const formatted = formatCompactTokens(Math.abs(num));
   return num >= 0 ? `+${formatted}` : `-${formatted}`;
 }
@@ -32,7 +35,7 @@ function insightsView(insights) {
   const verdict = src.sunsetVerdict && typeof src.sunsetVerdict === "object" ? src.sunsetVerdict : null;
   const verdictStatus = verdict && verdict.status ? String(verdict.status) : "n/a";
   const verdictDetail =
-    verdict && verdict.windowDays != null && verdict.targetDays != null
+    verdict && Number.isFinite(verdict.windowDays) && Number.isFinite(verdict.targetDays)
       ? `${verdict.windowDays}/${verdict.targetDays}d (${formatSignedCompactTokens(verdict.netSaved)} tok)`
       : "";
   const preLast = src.preambleLast && typeof src.preambleLast === "object" ? src.preambleLast : null;
@@ -48,7 +51,7 @@ function buildTooltipMarkdown(MarkdownStringCls, version, stats, updateLine = ""
   if (updateLine) {
     md.appendMarkdown(`${updateLine}\n\n`);
   }
-  const safeVer = escapeMarkdownCodeSpan(version || "0.0.0");
+  const safeVer = escapeMarkdownText(version || "0.0.0");
   if (!stats) {
     md.appendMarkdown(
       `**$(shield) Context-Guard v${safeVer}**\n\nNo telemetry events recorded yet. Token savings will appear automatically as you work.\n\n[$(graph) Open Dashboard](command:contextGuard.showReport)`
@@ -64,7 +67,7 @@ function buildTooltipMarkdown(MarkdownStringCls, version, stats, updateLine = ""
   const ctxWindows = formatContextWindows(savedTok);
   const ev = norm.events;
   const lastEv = norm.lastEvent;
-  const installedAt = escapeMarkdownCodeSpan(
+  const installedAt = escapeMarkdownText(
     norm.installedAt ? String(norm.installedAt).slice(0, 16).replace("T", " ") : "unknown"
   );
 
@@ -77,7 +80,7 @@ function buildTooltipMarkdown(MarkdownStringCls, version, stats, updateLine = ""
     const preText = iv.preLast
       ? `\`${formatCompactTokens(iv.preLast.last)}\` (Recent (10): \`${formatCompactTokens(iv.preLast.recentMedian)}\`, \`${escapeMarkdownCodeSpan(iv.preLast.harness)}\`)`
       : "`n/a`";
-    const verdictSuffix = iv.verdictDetail ? ` *(${escapeMarkdownCodeSpan(iv.verdictDetail)})*` : "";
+    const verdictSuffix = iv.verdictDetail ? ` *(${escapeMarkdownText(iv.verdictDetail)})*` : "";
     md.appendMarkdown(
       `**Cache Hit:** \`${escapeMarkdownCodeSpan(iv.cacheHit)}\` &nbsp;&bull;&nbsp; **Preamble (Last):** ${preText} &nbsp;&bull;&nbsp; **Doctor:** \`${escapeMarkdownCodeSpan(iv.docLabel)}\` &nbsp;&bull;&nbsp; **30d Verdict:** \`${escapeMarkdownCodeSpan(iv.verdictStatus)}\`${verdictSuffix}\n\n`
     );
@@ -281,7 +284,7 @@ function renderWebviewHtml(version, stats, insights = null) {
       const preRows = preEntries
         .map(([h, row]) => {
           const r = row && typeof row === "object" ? row : {};
-          return `<tr><td><code>${escapeHtml(h)}</code></td><td>${(Number(r.sessions) || 0).toLocaleString()}</td><td>${formatCompactTokens(r.median)}</td><td>${formatCompactTokens(r.recentMedian)}</td><td>${formatCompactTokens(r.last)}</td></tr>`;
+          return `<tr><td><code>${escapeHtml(h)}</code></td><td>${Math.round(finiteNonNeg(r.sessions)).toLocaleString()}</td><td>${formatCompactTokens(r.median)}</td><td>${formatCompactTokens(r.recentMedian)}</td><td>${formatCompactTokens(r.last)}</td></tr>`;
         })
         .join("\n      ");
       preambleSection = `
@@ -340,6 +343,7 @@ ${WEBVIEW_CSP_META}
 
 module.exports = {
   TOOLTIP_COMMANDS,
+  escapeMarkdownText,
   buildTooltipMarkdown,
   renderSidebarHtml,
   renderWebviewHtml,
