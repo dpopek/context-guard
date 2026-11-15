@@ -321,7 +321,7 @@ def test_codex_pre_tool_use_intercepts_and_blocks_apply_patch_with_exit_2_and_de
     pack_src = (
         "from policies.api import POLICY_API_VERSION, PolicyDecision, PolicyPackManifest\n"
         "def evaluate(ctx):\n"
-        "    if ctx.canonical_tool == 'edit_file' and any('.githooks/' in p for p in (*ctx.mutated_paths, str(ctx.canonical_args.get('Path', '')))):\n"
+        "    if ctx.canonical_tool == 'edit_file' and any('.githooks/' in p.replace('\\\\', '/') for p in (*ctx.mutated_paths, str(ctx.canonical_args.get('Path', '')))):\n"
         "        return PolicyDecision(decision='deny', reason='BLOCKED_GITHOOKS_PATCH')\n"
         "    return PolicyDecision(decision='allow')\n"
         "PACK_MANIFEST = PolicyPackManifest(pack_id='codex-sec', api_version=POLICY_API_VERSION, kind='security', covered_domains=('codex_patch',), evaluate=evaluate)\n"

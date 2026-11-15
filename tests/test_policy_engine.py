@@ -448,3 +448,62 @@ def test_pass2_four_cases_and_double_evaluate_idempotency(
     r_c4 = pre_tool_use.evaluate_hook({"session_id": "s4", "tool_name": "Read", "tool_input": {"file_path": str(big), "offset": 1, "limit": 200}}, state_dir=str(tmp_path / "sd4"), cli_harness="claude")
     assert r_c4 == {}
 
+
+def test_open_verified_regular_bytes_passes_o_binary_and_verifies_crlf_pack(
+    isolated_user_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from policies import loader as policies_loader
+
+    policies_dir = isolated_user_env / ".config" / "context-guard" / "policies"
+    pack_dir = policies_dir / "crlf-sec"
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        os.chmod(policies_dir, 0o700)
+        os.chmod(pack_dir, 0o700)
+
+    raw_crlf = (
+        b"from policies.api import POLICY_API_VERSION, PolicyPackManifest\r\n"
+        b"PACK_MANIFEST = PolicyPackManifest(\r\n"
+        b"    pack_id='crlf-sec',\r\n"
+        b"    api_version=POLICY_API_VERSION,\r\n"
+        b"    kind='security',\r\n"
+        b"    covered_domains=('crlf',),\r\n"
+        b"    evaluate=lambda ctx: None,\r\n"
+        b")\r\n"
+    )
+    pack_file = pack_dir / "pack.py"
+    pack_file.write_bytes(raw_crlf)
+    if os.name != "nt":
+        os.chmod(pack_file, 0o600)
+
+    fhash = _sha256(raw_crlf)
+    tsha = _tree_sha({"pack.py": fhash})
+    entry = {
+        "id": "crlf-sec",
+        "path": str(pack_file),
+        "enabled": True,
+        "kind": "security",
+        "scopes": ["file_mutation"],
+        "file_hashes": {"pack.py": fhash},
+        "tree_sha256": tsha,
+    }
+    cfg_path = isolated_user_env / ".config" / "context-guard" / "config.json"
+
+    had_o_binary = hasattr(os, "O_BINARY")
+    target_bit = getattr(os, "O_BINARY", 1 << 28)
+    if not had_o_binary:
+        monkeypatch.setattr(policies_loader.os, "O_BINARY", target_bit, raising=False)
+    real_open = os.open
+    recorded_flags: list[int] = []
+
+    def _wrapped_open(path: str, flags: int, mode: int = 0o777) -> int:
+        recorded_flags.append(flags)
+        delegate_flags = flags if had_o_binary else (flags & ~target_bit)
+        return real_open(path, delegate_flags, mode)
+
+    monkeypatch.setattr(policies_loader.os, "open", _wrapped_open)
+    policy_engine.clear_pack_cache()
+    manifest = policy_engine.load_verified_policy_pack(entry, config_path=cfg_path)
+    assert manifest.pack_id == "crlf-sec"
+    assert any((f & target_bit) == target_bit for f in recorded_flags)
+

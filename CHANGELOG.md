@@ -22,6 +22,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 - **Outcomes & cost reporting (`bin/outcomes_report.py`):** Conservative `v3 -> v4` migration and non-counterfactual `1/k` cost share.
 - **Safe IDE updater (`vscode-extension/updater.js`):** Added dirty-tree precheck and rollback via `git reset --keep`.
 
+### Fixed
+- **Windows binary pack loader (`policies/loader.py`):** Pass `O_BINARY` to `os.open` so CRLF packs keep exact SHA-256.
+
 ### Removed
 - **Bundled workspace guards:** Moved workspace-specific guard logic into external Policy API v1 packs for a universal OSS core.
 

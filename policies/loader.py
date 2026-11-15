@@ -65,7 +65,8 @@ def _assert_safe_dir(dir_path: Path, *, expected_uid: int | None) -> None:
 
 def _open_verified_regular_bytes(path: Path, *, expected_uid: int | None) -> bytes:
     try:
-        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        fd = os.open(str(path), flags)
     except OSError as exc:
         raise PolicyPackLoadError(f"cannot open {path.name}: {type(exc).__name__}") from exc
     try:
