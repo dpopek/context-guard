@@ -444,22 +444,57 @@ def test_shadow_mode_byte_parity_with_off_and_shadow_ledger_invalidation(
     assert sh_path is not None and sh_path.is_file()
     if os.name != "nt":
         assert (os.stat(sh_path).st_mode & 0o777) == 0o600
-    src_ph = pseudonymize_shadow_path(os.path.realpath(str(tmp_path / "big_src.py")))
+    src = tmp_path / "big_src.py"
+    src_lines = src.read_text(encoding="utf-8").splitlines()
+    src_ph = pseudonymize_shadow_path(os.path.realpath(str(src)))
     ledger = load_shadow_ledger(sh_path)
-    par_reads = ledger["sessions"]["s-par"]["paths"][src_ph]["reads"]
-    assert any(r[3] == 2 for r in par_reads)
+    assert src_ph in ledger["sessions"]["s-par"]["paths"]
+    assert ledger["sessions"]["s-par"]["paths"][src_ph]["reads"] == []
 
-    # Tier verification: antigravity=1, codex=0 (min_tier=1 filters codex reads list while path entry is tracked)
-    evaluate_hook({"conversationId": "s-ag", "stepIdx": 1, "toolCall": {"name": "read_file", "args": {"Path": str(tmp_path / "big_src.py"), "StartLine": 1, "EndLine": 80}}}, state_dir=str(sd_sh))
-    evaluate_hook({"conversationId": "s-ag", "stepIdx": 2, "toolCall": {"name": "read_file", "args": {"Path": str(tmp_path / "big_src.py"), "StartLine": 1, "EndLine": 160}}}, state_dir=str(sd_sh))
-    evaluate_hook({"session_id": "s-cx", "tool_name": "read_file", "tool_input": {"file_path": str(tmp_path / "big_src.py"), "offset": 1, "limit": 80}}, state_dir=str(sd_sh), cli_harness="codex")
-    evaluate_hook({"session_id": "s-cx", "tool_name": "read_file", "tool_input": {"file_path": str(tmp_path / "big_src.py"), "offset": 1, "limit": 160}}, state_dir=str(sd_sh), cli_harness="codex")
+    # PreToolUse alone leaves reads == [] across claude, antigravity, and codex while registering path entries
+    evaluate_hook({"conversationId": "s-ag", "stepIdx": 1, "toolCall": {"id": "ag-1", "name": "read_file", "args": {"Path": str(src), "StartLine": 1, "EndLine": 80}}}, state_dir=str(sd_sh))
+    evaluate_hook({"conversationId": "s-ag", "stepIdx": 2, "toolCall": {"id": "ag-2", "name": "read_file", "args": {"Path": str(src), "StartLine": 1, "EndLine": 160}}}, state_dir=str(sd_sh))
+    evaluate_hook({"session_id": "s-cx", "tool_use_id": "cx-1", "tool_name": "read_file", "tool_input": {"file_path": str(src), "offset": 1, "limit": 80}}, state_dir=str(sd_sh), cli_harness="codex")
+    evaluate_hook({"session_id": "s-cx", "tool_use_id": "cx-2", "tool_name": "read_file", "tool_input": {"file_path": str(src), "offset": 1, "limit": 160}}, state_dir=str(sd_sh), cli_harness="codex")
+    pre_sessions = load_shadow_ledger(sh_path)["sessions"]
+    assert src_ph in pre_sessions["s-ag"]["paths"] and pre_sessions["s-ag"]["paths"][src_ph]["reads"] == []
+    assert src_ph in pre_sessions["s-cx"]["paths"] and pre_sessions["s-cx"]["paths"][src_ph]["reads"] == []
+
+    # PostToolBatch (Claude) / PostToolUse (Antigravity under bounded min_tier=1) confirm shadow tiers; Codex remains tier 0
+    handle_post_tool_use(
+        "claude",
+        {"session_id": "s-par", "tool_calls": [{"tool_name": "Read", "tool_use_id": "c-1", "tool_input": {"file_path": str(src), "offset": 1, "limit": 80}, "tool_response": "\n".join(src_lines[:80])}]},
+        event_name="PostToolBatch",
+    )
+    handle_post_tool_use(
+        "antigravity",
+        {"conversationId": "s-ag", "stepIdx": 1, "toolCall": {"id": "ag-1", "name": "read_file", "args": {"Path": str(src), "StartLine": 1, "EndLine": 80}}},
+        state_dir=str(sd_sh),
+    )
+    handle_post_tool_use(
+        "codex",
+        {"session_id": "s-cx", "tool_use_id": "cx-1", "tool_name": "read_file", "tool_input": {"file_path": str(src), "offset": 1, "limit": 80}, "tool_response": "\n".join(src_lines[:80])},
+        state_dir=str(sd_sh),
+    )
     sessions = load_shadow_ledger(sh_path)["sessions"]
+    assert any(r[3] == 2 for r in sessions["s-par"]["paths"][src_ph]["reads"])
     assert any(r[3] == 1 for r in sessions["s-ag"]["paths"][src_ph]["reads"])
     assert sessions["s-cx"]["paths"][src_ph]["reads"] == []
 
+    # Under strict policy (min_tier=2), Antigravity tier-1 confirmation is filtered out of shadow reads
+    cfg_path = isolated_user_env / ".config" / "context-guard" / "config.json"
+    cfg_path.write_text(
+        json.dumps({"read_confirm_policy": "strict", "optimizers": {"range_trim": "shadow", "auto_outline": "shadow", "cli_rewrites": "shadow"}}),
+        encoding="utf-8",
+    )
+    clear_config_cache()
+    ag_strict = {"conversationId": "s-ag-strict", "stepIdx": 1, "toolCall": {"id": "ag-s1", "name": "read_file", "args": {"Path": str(src), "StartLine": 1, "EndLine": 80}}}
+    evaluate_hook(ag_strict, state_dir=str(sd_sh))
+    handle_post_tool_use("antigravity", ag_strict, state_dir=str(sd_sh))
+    assert load_shadow_ledger(sh_path)["sessions"]["s-ag-strict"]["paths"][src_ph]["reads"] == []
+
     # File mutation in pre_tool_use invalidates shadow records for that path
-    evaluate_hook({"session_id": "s-par", "tool_name": "Edit", "tool_input": {"file_path": str(tmp_path / "big_src.py")}}, state_dir=str(sd_sh), cli_harness="claude")
+    evaluate_hook({"session_id": "s-par", "tool_name": "Edit", "tool_input": {"file_path": str(src)}}, state_dir=str(sd_sh), cli_harness="claude")
     after_mut = load_shadow_ledger(sh_path)["sessions"]
     assert src_ph not in after_mut["s-par"]["paths"]
 

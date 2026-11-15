@@ -66,7 +66,7 @@ def _extract_manifest_hints(pack_py_text: str) -> tuple[str | None, str | None]:
 
 
 class RollbackJournal:
-    """LIFO rollback journal for atomic file mutations and directory swaps."""
+    """LIFO rollback journal for atomic file mutations, directory swaps, and staged removals."""
 
     def __init__(self) -> None:
         self._ops: list[tuple[str, Path, Any, int]] = []
@@ -93,7 +93,7 @@ class RollbackJournal:
         src, dst = Path(src_dir).expanduser(), Path(dst_dir).expanduser()
         backup: Path | None = None
         if dst.exists() or dst.is_symlink():
-            backup = backup_path or (dst.parent / f".rollback-bak-{dst.name}-{os.getpid()}-{len(self._ops)}")
+            backup = Path(backup_path).expanduser() if backup_path is not None else (dst.parent / f".rollback-bak-{dst.name}-{os.getpid()}-{len(self._ops)}")
             _remove_path(backup)
             shutil.move(str(dst), str(backup))
         try:
@@ -105,16 +105,28 @@ class RollbackJournal:
             raise
         self._ops.append(("dir_swap", dst, backup, 0))
 
+    def stage_directory_removal(self, target_dir: Path, *, backup_path: Path | None = None) -> None:
+        """Move existing target_dir to a temporary backup until commit or rollback."""
+        dst = Path(target_dir).expanduser()
+        if not dst.exists() and not dst.is_symlink():
+            return
+        backup = Path(backup_path).expanduser() if backup_path is not None else (dst.parent / f".rollback-del-{dst.name}-{os.getpid()}-{len(self._ops)}")
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        _remove_path(backup)
+        shutil.move(str(dst), str(backup))
+        self._ops.append(("dir_remove", dst, backup, 0))
+
     def rollback(self) -> None:
-        """Revert recorded file edits and directory swaps in strict LIFO order."""
+        """Revert recorded file edits, directory swaps, and staged removals in strict LIFO order."""
         first_err: Exception | None = None
         for kind, target, payload, mode in reversed(self._ops):
             try:
                 if kind == "file":
                     target.unlink(missing_ok=True) if payload is None else _atomic_write_bytes(target, payload, mode=mode)
-                elif kind == "dir_swap":
+                elif kind in ("dir_swap", "dir_remove"):
                     _remove_path(target)
                     if payload is not None and (payload.exists() or payload.is_symlink()):
+                        target.parent.mkdir(parents=True, exist_ok=True)
                         shutil.move(str(payload), str(target))
             except Exception as exc:
                 first_err = first_err or exc
@@ -126,7 +138,7 @@ class RollbackJournal:
     def commit(self) -> None:
         """Delete temporary directory backups and clear the journal on success."""
         for kind, _t, payload, _m in self._ops:
-            if kind == "dir_swap" and payload is not None and (payload.exists() or payload.is_symlink()):
+            if kind in ("dir_swap", "dir_remove") and payload is not None and (payload.exists() or payload.is_symlink()):
                 _remove_path(payload)
         self._ops.clear()
         self._seen.clear()

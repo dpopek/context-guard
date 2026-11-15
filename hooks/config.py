@@ -31,6 +31,11 @@ LEGACY_SECURITY_CONFIG_KEYS: tuple[str, ...] = (
     "allowed_bq_views_dataset",
     "enforce_governance_policy",
 )
+LEGACY_SECURITY_DOMAIN_MAP: dict[str, frozenset[str]] = {
+    "restricted_bq_datasets": frozenset({"bigquery_guard", "bigquery", "bq"}),
+    "allowed_bq_views_dataset": frozenset({"bigquery_guard", "bigquery", "bq"}),
+    "enforce_governance_policy": frozenset({"governance_guard", "governance"}),
+}
 
 
 @dataclass(frozen=True)

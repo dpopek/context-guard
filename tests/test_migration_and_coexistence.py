@@ -554,3 +554,128 @@ def test_claude_2_1_295_registers_on_failure_block_older_falls_back_and_doctor_d
     doc_md = cg_status.render_doctor_report(doc)
     assert "Native security sync" in doc_md and "WARN" in doc_md
     assert "NATIVE_FAIL_CLOSED_DRIFT" in doc_md
+
+
+def test_rollback_journal_stage_directory_removal_rollback_and_commit(tmp_path: Path) -> None:
+    """stage_directory_removal moves dirs reversibly on rollback and deletes backups on commit."""
+    old_dir = tmp_path / "old-ext"
+    old_dir.mkdir()
+    (old_dir / "extension.js").write_text("/* old */\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="abort"):
+        with RollbackJournal() as journal:
+            journal.stage_directory_removal(tmp_path / "missing-ext")
+            journal.stage_directory_removal(old_dir)
+            assert not old_dir.exists()
+            assert len(list(tmp_path.glob(".rollback-del-*"))) == 1
+            old_dir.mkdir()
+            (old_dir / "extension.js").write_text("/* stale */\n", encoding="utf-8")
+            raise RuntimeError("abort")
+
+    assert (old_dir / "extension.js").read_text(encoding="utf-8") == "/* old */\n"
+    assert list(tmp_path.glob(".rollback-del-*")) == []
+
+    with RollbackJournal() as ok_journal:
+        ok_journal.stage_directory_removal(old_dir)
+        assert not old_dir.exists()
+        ok_journal.commit()
+    assert not old_dir.exists()
+    assert list(tmp_path.glob(".rollback-del-*")) == []
+
+
+def test_install_all_ide_old_version_removal_rolls_back_on_failure_and_commits_on_success(
+    isolated_user_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """IDE old-version removal is restored on install_all rollback and finalized on commit."""
+    from bin import install_harnesses
+
+    repo_root = Path(__file__).resolve().parent.parent
+    cur_ver = json.loads((repo_root / "vscode-extension" / "package.json").read_text(encoding="utf-8"))["version"]
+    claude_cfg = tmp_path / "claude" / "settings.json"
+    cursor_cfg = tmp_path / "cursor" / "hooks.json"
+    codex_cfg = tmp_path / "codex" / "hooks.json"
+    codex_toml = tmp_path / "codex" / "config.toml"
+    for p, txt in ((claude_cfg, "{}\n"), (cursor_cfg, "{}\n"), (codex_cfg, "{}\n"), (codex_toml, "")):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(txt, encoding="utf-8")
+
+    pack_src = tmp_path / "pack-src"
+    _make_pack(pack_src)
+
+    cursor_ext_dir = tmp_path / "cursor-exts"
+    ag_ext_dir = tmp_path / "ag-exts"
+    orig_ext_json: dict[Path, str] = {}
+    for ext_dir in (cursor_ext_dir, ag_ext_dir):
+        old_dir = ext_dir / "advox.context-guard-statusbar-4.3.0"
+        old_dir.mkdir(parents=True)
+        (old_dir / "extension.js").write_text("/* old 4.3.0 */\n", encoding="utf-8")
+        raw_json = json.dumps(
+            [
+                {"identifier": {"id": "acme.other-ext"}, "version": "1.0.0"},
+                {
+                    "identifier": {"id": "advox.context-guard-statusbar"},
+                    "version": "4.3.0",
+                    "relativeLocation": "advox.context-guard-statusbar-4.3.0",
+                },
+            ],
+            indent=2,
+        ) + "\n"
+        (ext_dir / "extensions.json").write_text(raw_json, encoding="utf-8")
+        orig_ext_json[ext_dir] = raw_json
+
+    def _assert_rolled_back() -> None:
+        for ext_dir in (cursor_ext_dir, ag_ext_dir):
+            assert (ext_dir / "advox.context-guard-statusbar-4.3.0" / "extension.js").read_text(encoding="utf-8") == "/* old 4.3.0 */\n"
+            assert (ext_dir / "extensions.json").read_text(encoding="utf-8") == orig_ext_json[ext_dir]
+            assert not (ext_dir / f"advox.context-guard-statusbar-{cur_ver}").exists()
+            assert list(ext_dir.glob(".rollback-*")) == []
+            assert list(ext_dir.glob(".staging-*")) == []
+
+    # 1. Non-monkeypatched failure via corrupt cursor_cfg triggers rollback after IDE extension updates
+    cursor_cfg.write_text("{corrupt-json", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="harness installation error"):
+        install_harnesses.install_all(
+            claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
+            codex_hooks_path=codex_cfg, codex_config_path=codex_toml,
+            cursor_extensions_dir=cursor_ext_dir, antigravity_extensions_dir=ag_ext_dir,
+            pack_source=pack_src,
+        )
+    _assert_rolled_back()
+
+    # 2. Exception raised after install_ide_extension completes also rolls back staged IDE removals
+    cursor_cfg.write_text("{}\n", encoding="utf-8")
+    with monkeypatch.context() as mp:
+        def _fail_after_ide(*_a: Any, **_kw: Any) -> dict[str, str]:
+            assert (cursor_ext_dir / f"advox.context-guard-statusbar-{cur_ver}").is_dir()
+            assert not (cursor_ext_dir / "advox.context-guard-statusbar-4.3.0").exists()
+            assert len(list(cursor_ext_dir.glob(".rollback-del-*"))) == 1
+            raise OSError("simulated late outline failure")
+
+        mp.setattr(install_harnesses, "install_outline_pull", _fail_after_ide)
+        with pytest.raises(OSError, match="simulated late outline failure"):
+            install_harnesses.install_all(
+                claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
+                codex_hooks_path=codex_cfg, codex_config_path=codex_toml,
+                cursor_extensions_dir=cursor_ext_dir, antigravity_extensions_dir=ag_ext_dir,
+                pack_source=pack_src,
+            )
+    _assert_rolled_back()
+
+    # 3. Subsequent successful install_all removes 4.3.0 and cleans all .rollback-* dirs on commit()
+    res = install_harnesses.install_all(
+        claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
+        codex_hooks_path=codex_cfg, codex_config_path=codex_toml,
+        cursor_extensions_dir=cursor_ext_dir, antigravity_extensions_dir=ag_ext_dir,
+        pack_source=pack_src,
+    )
+    assert res["cursor_extension"] == "updated" and res["antigravity_extension"] == "updated"
+    for ext_dir in (cursor_ext_dir, ag_ext_dir):
+        assert not (ext_dir / "advox.context-guard-statusbar-4.3.0").exists()
+        assert (ext_dir / f"advox.context-guard-statusbar-{cur_ver}" / "extension.js").is_file()
+        items = json.loads((ext_dir / "extensions.json").read_text(encoding="utf-8"))
+        assert {item["identifier"]["id"]: item["version"] for item in items} == {
+            "acme.other-ext": "1.0.0",
+            "advox.context-guard-statusbar": cur_ver,
+        }
+        assert list(ext_dir.glob(".rollback-*")) == []
+        assert list(ext_dir.glob(".staging-*")) == []

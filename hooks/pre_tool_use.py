@@ -31,7 +31,6 @@ from hooks.state_store import (advance_session_step, emit_json_and_sanitize_stdi
                                resolve_state_dir, run_telemetry_safely, state_file_in, warn)
 
 _ORIG_VERIFY_P2 = verify_security_policies_post_transform
-_SHADOW_TIERS: dict[str, int] = {"claude": 2, "cursor": 2, "antigravity": 1, "codex": 0}
 
 STATIC_POLICY_INTERNAL_DENY_REASON = (
     "CONTEXT-GUARD POLICY ENGINE INTERNAL ERROR (fail-closed): "
@@ -247,7 +246,7 @@ def evaluate_hook(
                 if trim_mode == "shadow" and kind != "outline" and byte_offset == 0 and isinstance((pend := planned.meta.get("pending")), dict):
                     s_end = int(pend["delivered_end"]) if int(pend.get("delivered_end") or -1) > 0 else end_line
                     record_shadow_read(norm.session_id, str(pend.get("canonical_target") or raw_path.strip()), int(pend.get("exec_start") or start_line),
-                                       s_end, eff_step, _SHADOW_TIERS.get(norm.harness, 0), str(pend.get("sha256") or ""), min_tier=min_tier, shadow_path=shadow_path)
+                                       s_end, eff_step, 0, str(pend.get("sha256") or ""), min_tier=min_tier, shadow_path=shadow_path)
                 if kind == "outline" or read_outcome.followup_resolution is not None:
                     mod = _memoize_session_model(state_dir_path, norm, transcript_path, eff_step)
                     if kind == "outline":

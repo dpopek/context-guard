@@ -507,3 +507,170 @@ def test_open_verified_regular_bytes_passes_o_binary_and_verifies_crlf_pack(
     assert manifest.pack_id == "crlf-sec"
     assert any((f & target_bit) == target_bit for f in recorded_flags)
 
+
+def _write_domain_pack(
+    policies_dir: Path,
+    pack_id: str,
+    *,
+    kind: str = "security",
+    domains: tuple[str, ...],
+) -> dict[str, Any]:
+    pack_src = (
+        "from policies.api import POLICY_API_VERSION, PolicyDecision, PolicyPackManifest\n"
+        "def evaluate(ctx):\n"
+        "    cmd = str(ctx.canonical_args.get('CommandLine', ''))\n"
+        "    path = str(ctx.canonical_args.get('Path', ''))\n"
+        "    if 'eval_block' in cmd or 'eval_block' in path:\n"
+        "        return PolicyDecision(decision='deny', reason='EVAL_BLOCKED')\n"
+        "    return None\n"
+        "PACK_MANIFEST = PolicyPackManifest(\n"
+        f"    pack_id={pack_id!r}, api_version=POLICY_API_VERSION, kind={kind!r},\n"
+        f"    covered_domains={domains!r}, evaluate=evaluate,\n"
+        ")\n"
+    )
+    _, entry = _write_synthetic_pack(policies_dir, pack_id, pack_src=pack_src)
+    return entry
+
+
+def test_legacy_security_keys_require_verified_covered_domains(
+    isolated_user_env: Path, tmp_path: Path
+) -> None:
+    import json
+    from hooks import pre_tool_use
+
+    assert set(hooks_config.LEGACY_SECURITY_CONFIG_KEYS).issubset(
+        set(hooks_config.LEGACY_SECURITY_DOMAIN_MAP.keys())
+    )
+
+    policies_dir = isolated_user_env / ".config" / "context-guard" / "policies"
+    cfg_path = isolated_user_env / ".config" / "context-guard" / "config.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    policy_engine.clear_pack_cache()
+
+    gov_entry = _write_domain_pack(policies_dir, "gov-only", domains=("governance_guard",))
+    base_cfg: dict[str, Any] = {
+        "read_confirm_policy": "strict",
+        "optimizers": {},
+        "integrations": {"atlassian_twg": "off"},
+        "regret_window_steps": 2,
+        "policy_packs": [gov_entry],
+        "model_labels": {},
+        "legacy_security_keys": ("restricted_bq_datasets",),
+        "config_path": str(cfg_path),
+        "config_error": None,
+    }
+
+    cmd_norm = _make_norm(tool="run_command", args={"CommandLine": "echo ok"})
+    write_norm = _make_norm(tool="write_file", args={"Path": "/tmp/ws/a.py"}, mutated=("/tmp/ws/a.py",))
+    mcp_norm = _make_norm(tool="call_mcp_tool", orig="mcp_bigquery_query", args={"ServerName": "bigquery"})
+    read_norm = _make_norm(tool="read_file", args={"Path": "/tmp/ws/a.py"})
+
+    for scoped_norm in (cmd_norm, write_norm, mcp_norm):
+        dec = policy_engine.apply_policy_packs(scoped_norm, base_cfg)
+        assert dec is not None and dec["decision"] == "deny"
+        assert "UNMIGRATED SECURITY CONFIG" in dec["reason"]
+        assert "restricted_bq_datasets" in dec["reason"]
+    assert policy_engine.apply_policy_packs(read_norm, base_cfg) is None
+
+    # End-to-end via evaluate_hook with config.json
+    sample = tmp_path / "sample.py"
+    sample.write_bytes(b"print('hi')\n")
+    cfg_path.write_text(
+        json.dumps({"restricted_bq_datasets": ["raw_sales"], "policy_packs": [gov_entry]}),
+        encoding="utf-8",
+    )
+    hooks_config.clear_config_cache()
+    sd = str(tmp_path / "sd_mig")
+    for tool_name, tool_input in (
+        ("Bash", {"command": "echo ok"}),
+        ("Write", {"file_path": str(sample), "content": "x = 1\n"}),
+        ("mcp_bigquery_query", {"query": "SELECT 1"}),
+    ):
+        hook_dec = pre_tool_use.evaluate_hook(
+            {"session_id": "s-mig", "tool_name": tool_name, "tool_input": tool_input},
+            state_dir=sd,
+            cli_harness="claude",
+        )
+        assert hook_dec["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert "UNMIGRATED SECURITY CONFIG" in hook_dec["hookSpecificOutput"]["permissionDecisionReason"]
+    hook_read = pre_tool_use.evaluate_hook(
+        {"session_id": "s-mig", "tool_name": "Read", "tool_input": {"file_path": str(sample)}},
+        state_dir=sd,
+        cli_harness="claude",
+    )
+    assert hook_read == {}
+
+    # Two legacy keys with partial coverage (only bigquery_guard) still fail closed on enforce_governance_policy
+    bq_entry = _write_domain_pack(policies_dir, "bq-only", domains=("bigquery_guard",))
+    partial_cfg = {
+        **base_cfg,
+        "policy_packs": [bq_entry],
+        "legacy_security_keys": ("restricted_bq_datasets", "enforce_governance_policy"),
+    }
+    for scoped_norm in (cmd_norm, write_norm, mcp_norm):
+        p_dec = policy_engine.apply_policy_packs(scoped_norm, partial_cfg)
+        assert p_dec is not None and p_dec["decision"] == "deny"
+        assert "UNMIGRATED SECURITY CONFIG" in p_dec["reason"]
+        assert "enforce_governance_policy" in p_dec["reason"]
+    assert policy_engine.apply_policy_packs(read_norm, partial_cfg) is None
+
+    # Full domain coverage skips migration block and delegates to manifest.evaluate
+    full_entry = _write_domain_pack(policies_dir, "full-sec", domains=("bigquery_guard", "governance_guard"))
+    full_cfg = {
+        **base_cfg,
+        "policy_packs": [full_entry],
+        "legacy_security_keys": ("restricted_bq_datasets", "allowed_bq_views_dataset", "enforce_governance_policy"),
+    }
+    for ok_norm in (cmd_norm, write_norm, mcp_norm, read_norm):
+        assert policy_engine.apply_policy_packs(ok_norm, full_cfg) is None
+    blocked_cmd = _make_norm(tool="run_command", args={"CommandLine": "eval_block"})
+    eval_dec = policy_engine.apply_policy_packs(blocked_cmd, full_cfg)
+    assert eval_dec == {"decision": "deny", "reason": "EVAL_BLOCKED"}
+
+
+def test_manifest_kind_mismatch_fails_closed_and_cannot_cover_legacy_domains(
+    isolated_user_env: Path,
+) -> None:
+    policies_dir = isolated_user_env / ".config" / "context-guard" / "policies"
+    cfg_path = isolated_user_env / ".config" / "context-guard" / "config.json"
+    policy_engine.clear_pack_cache()
+
+    spoofed_entry = _write_domain_pack(
+        policies_dir,
+        "spoofed-opt",
+        kind="optimization",
+        domains=("bigquery_guard", "governance_guard"),
+    )
+    # Entry claims kind='security' even though PACK_MANIFEST has kind='optimization'
+    mismatched_entry = {**spoofed_entry, "kind": "security"}
+    cfg_no_legacy: dict[str, Any] = {
+        "read_confirm_policy": "strict",
+        "optimizers": {},
+        "integrations": {"atlassian_twg": "off"},
+        "regret_window_steps": 2,
+        "policy_packs": [mismatched_entry],
+        "model_labels": {},
+        "legacy_security_keys": (),
+        "config_path": str(cfg_path),
+        "config_error": None,
+    }
+    hook_edit = _make_norm(
+        tool="edit_file",
+        args={"Path": "/tmp/ws/.githooks/pre-commit"},
+        mutated=("/tmp/ws/.githooks/pre-commit",),
+    )
+    dec_scoped = policy_engine.apply_policy_packs(hook_edit, cfg_no_legacy)
+    assert dec_scoped is not None and dec_scoped["decision"] == "deny"
+    assert "SECURITY PACK ERROR" in dec_scoped["reason"]
+
+    app_edit = _make_norm(tool="edit_file", args={"Path": "/tmp/ws/app.py"}, mutated=("/tmp/ws/app.py",))
+    assert policy_engine.apply_policy_packs(app_edit, cfg_no_legacy) is None
+
+    # With legacy_security_keys active, mismatched manifest cannot grant domain coverage
+    cfg_legacy = {**cfg_no_legacy, "legacy_security_keys": ("restricted_bq_datasets",)}
+    dec_legacy = policy_engine.apply_policy_packs(app_edit, cfg_legacy)
+    assert dec_legacy is not None and dec_legacy["decision"] == "deny"
+    assert "UNMIGRATED SECURITY CONFIG" in dec_legacy["reason"]
+    act_p2, p2_dec = policy_engine.reconcile_post_transform(app_edit, cfg_legacy, fallback_norm=app_edit)
+    assert act_p2 == "deny" and p2_dec is not None and "UNMIGRATED SECURITY CONFIG" in p2_dec["reason"]
+    assert policy_engine.apply_policy_packs(_make_norm(tool="read_file", args={"Path": "/tmp/ws/app.py"}), cfg_legacy) is None

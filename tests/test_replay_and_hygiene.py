@@ -44,8 +44,13 @@ def test_benchmark_measures_isolated_latency_and_savings(capsys: Any) -> None:
     bench = replay_benchmark.run_deterministic_benchmark(iterations=2)
     assert bench["ok"] is True
     assert bench["isolated"] is True
+    assert bench["measurement_scope"] == "synthetic_corpus"
     assert bench["cold_ms"] >= 0.0
     assert bench["warm_ms"] >= 0.0
+    assert bench["in_process_cold_ms"] == bench["cold_ms"]
+    assert bench["in_process_warm_ms"] == bench["warm_ms"]
+    assert bench["in_process_warm_ms_per_call"] == bench["warm_ms_per_call"]
+    assert bench["subprocess_hook_ms_per_call"] > 0.0
     assert bench["saved_bytes"] > 0
     assert bench["saved_tokens"] > 0
     assert bench["savings_pct"] > 0.0
@@ -54,7 +59,11 @@ def test_benchmark_measures_isolated_latency_and_savings(capsys: Any) -> None:
     out = capsys.readouterr().out
     assert rc == 0
     assert "Context-Guard Deterministic Benchmark" in out
+    assert "synthetic corpus (not live session A/B)" in out
+    assert "In-process engine" in out
+    assert "Subprocess E2E hook latency" in out
     assert "Bytes saved" in out
+    assert "Tokens saved" in out
 
 
 def test_public_json_scrubs_sensitive_paths_and_files(tmp_path: Path, capsys: Any) -> None:

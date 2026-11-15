@@ -1,4 +1,4 @@
-# Context-Guard (v4.4.0)
+# Context-Guard (v4.4.1)
 
 Zero-prompt policy host, verified Read Ledger v2 (`range_trim`), machine-artifact unwrapper, and multi-harness telemetry plugin for **Google Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex CLI/App** across **macOS, Linux, and Windows**.
 
@@ -37,7 +37,7 @@ Source code and Markdown reads never block; `cg-outline <path>` handles on-deman
 - Tracks streaming 64 KB `SHA-256` hashes (`10 MB` fallback), `[StartLine, EndLine]` spans, and `confirm_tier` (`0`/`1`/`2`) in `.context_guard_state.json` (`READ_LEDGER_SCHEMA = 2`).
 - **Product Asymmetry (`spec §7.5`):** Default `"read_confirm_policy": "strict"` trusts only `confirm_tier == 2` (Claude `PostToolBatch`, Cursor `tool_output`).
 - **Antigravity & Codex:** Default `"strict"` yields `0` `range_trim` savings there unless `"bounded"` is opted into.
-- **Shadow Mode:** `"shadow"` optimizer mode logs counterfactual savings to `0o600` `telemetry/shadow.json`, invalidated on edit, compaction, or rewind.
+- **Shadow Mode:** `"shadow"` mode logs counterfactual savings to `0o600` `telemetry/shadow.json` only after post-tool confirmation (`tier 0` on Codex), invalidated on edit, compaction, or rewind.
 
 ### 2. Verified Policy API v1 & Security Boundaries (`policies/api.py`, `policies/loader.py`)
 - Normalizes tool and MCP calls across Antigravity (`mcp_<server>_<tool>`), Claude/Codex (`mcp__<server>__<tool>`), Cursor (`MCP:<tool>`), and `call_mcp_tool`.
@@ -45,7 +45,9 @@ Source code and Markdown reads never block; `cg-outline <path>` handles on-deman
 - **Platform Fail-Closed:** Claude `>= 2.1.295` sets `"onFailure": "block"` (older falls back + warns); Cursor sets `"failClosed": true` (`NATIVE_FAIL_CLOSED_DRIFT`).
 - **Codex & Integrity Limits:** Antigravity exits `2`; Codex requires `[features].hooks = true` + trust (`openai/codex#27833`); `repo_map_path`/stdlib stay outside pack hashes.
 
-### 3. Lossless Quiet CLI Rewrites (`PreToolUse`)
+### 3. Guardrailed Quiet CLI Rewrites (`PreToolUse`)
+
+Trims noisy test and grep boilerplate without overriding explicit user flags:
 
 | CLI Command | Injected Flags (Antigravity `run_command`; auto-approved Claude/Cursor `Bash`/`Shell`: `bypassPermissions`/`dontAsk`/`auto`) | Guardrails |
 | :--- | :--- | :--- |
@@ -81,7 +83,7 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 | `hooks/session_end.py` | Hook Entry | `SessionEnd` hook clearing transient `pending_reads` state and emitting session-end policy events. |
 | `hooks/harness_adapter.py` | Normalization | Normalizes tool payloads (`Read`, `Bash`, `exec_command`, `apply_patch`), permission modes, and verdicts. |
 | `hooks/read_planner.py` | Core Engine | Silent `range_trim` overlap trimmer, slice caps, and machine-artifact outline planner. |
-| `hooks/shell_parser.py` | Core Engine | Lossless quiet CLI flag rewriter, voluntary `cg-outline` detector, and bounded shell-read analyzer. |
+| `hooks/shell_parser.py` | Core Engine | Guardrailed quiet CLI flag rewriter (never overrides explicit user flags), voluntary `cg-outline` detector, and bounded shell-read analyzer. |
 | `hooks/session_lifecycle.py` | State & Cache | Checkpoint compaction (`apply_compaction_boundary`) and rewind (`prune_state_on_rewind`) pruning. |
 | `hooks/state_store.py` | State & Cache | State dir resolution (`resolve_state_dir`), subagent isolation, and locked JSON persistence. |
 | `hooks/file_io.py` | State & Cache | Streaming 64 KB `SHA-256` hashing (`10 MB` stat fallback), line counter, and `tail -n` reader. |
@@ -96,7 +98,7 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 | `bin/cg_status.py` | CLI & UI | Status CLI (`--short`, `--claude-hud`, `--markdown`, `--json`, `--outcomes`, `--usage`, `--doctor`, `--replay`, `--benchmark`, `--public-json`). |
 | `bin/install_harnesses.py` | CLI & UI | Multi-harness hook & IDE extension installer (`--install`, `--uninstall`, `--status`, `--dry-run`, `--pack-source`). |
 | `bin/migration_guard.py` | CLI & UI | Staged pack transaction (`StagedPackTransaction`), rollback journal, and migration preflight checks (`--pack-source`). |
-| `bin/replay_benchmark.py` | CLI & UI | Deterministic trace `--replay`, `--benchmark` aggregator, `--public-json` exporter, and release hygiene/secret checks. |
+| `bin/replay_benchmark.py` | CLI & UI | Deterministic `--replay`, `--benchmark` (in-process engine vs subprocess E2E hook latency over synthetic corpus), `--public-json` exporter, and release hygiene/secret checks. |
 | `bin/codex_toml.py` | CLI & UI | Lexical TOML scanner for non-destructive `~/.codex/config.toml` sync. |
 | `bin/harness_status.py` | CLI & UI | Cycle-free status verifier and dynamic matcher merger across Claude Code, Cursor, and OpenAI Codex configs. |
 | `bin/outline.py` | CLI & UI | CLI wrapper around `hooks/outline.py` (`cg-outline`). |
@@ -121,11 +123,11 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 Context-Guard runs from wherever you clone it: the installer points every harness hook at that checkout. Pick any directory; `~/.gemini` is needed only if you use Antigravity.
 
 ```bash
-# 1. Clone anywhere (or unpack dist/context-guard-v4.4.0.zip there)
+# 1. Clone anywhere (or unpack dist/context-guard-v4.4.1.zip there)
 CG_DIR=~/tools/context-guard
 git clone https://github.com/dpopek/context-guard.git "$CG_DIR"
 
-# 2. Install hooks (Claude Code, Codex, Cursor, Antigravity) & advox.context-guard-statusbar-4.4.0 extension
+# 2. Install hooks (Claude Code, Codex, Cursor, Antigravity) & advox.context-guard-statusbar-4.4.1 extension
 python3 "$CG_DIR/bin/install_harnesses.py" --install
 
 # Check status, preview dry-run, stage verified policy packs, or uninstall cleanly
@@ -153,7 +155,7 @@ python3 "$CG_DIR/bin/cg_status.py" --outcomes
 python3 "$CG_DIR/bin/cg_status.py" --usage
 python3 "$CG_DIR/bin/cg_status.py" --doctor
 python3 "$CG_DIR/bin/cg_status.py" --replay     # built-in isolated deterministic synthetic corpus
-python3 "$CG_DIR/bin/cg_status.py" --benchmark  # deterministic synthetic corpus benchmark
+python3 "$CG_DIR/bin/cg_status.py" --benchmark  # synthetic corpus: in-process engine vs subprocess E2E hook latency
 python3 "$CG_DIR/bin/cg_status.py" --public-json
 python3 "$CG_DIR/bin/cg_status.py" --json \
   --stats-path /tmp/stats.json --outcomes-path /tmp/outcomes.json \

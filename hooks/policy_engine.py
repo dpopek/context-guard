@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
-from hooks.config import resolve_user_config_path
+from hooks.config import LEGACY_SECURITY_DOMAIN_MAP, resolve_user_config_path
 from hooks.harness_adapter import NormalizedToolCall
 from hooks.state_store import warn
 from policies.api import (
@@ -227,7 +227,8 @@ def _run_policy_pass(
         dec = {"decision": "deny", "reason": f"CONTEXT-GUARD CONFIG ERROR (fail-closed): {cfg_err}"} if tool_scopes else None
         return dec, [], norm, None, bool(dec)
     packs = [p for p in (runtime_cfg.get("policy_packs") or []) if isinstance(p, Mapping) and p.get("enabled", True)]
-    if tuple(runtime_cfg.get("legacy_security_keys") or ()) and not any(p.get("kind") == "security" for p in packs):
+    legacy_keys = tuple(runtime_cfg.get("legacy_security_keys") or ())
+    if legacy_keys and not any(p.get("kind") == "security" for p in packs):
         dec = {"decision": "deny", "reason": "CONTEXT-GUARD UNMIGRATED SECURITY CONFIG (fail-closed): Run install_pack.py --stage."} if tool_scopes else None
         return dec, [], norm, None, bool(dec)
     if runtime_cfg.get("repo_map_path") and not packs:
@@ -237,6 +238,7 @@ def _run_policy_pass(
     cfg_path_raw = runtime_cfg.get("config_path")
     cfg_path = Path(str(cfg_path_raw)) if isinstance(cfg_path_raw, str) and cfg_path_raw else None
     eval_records: list[tuple[PolicyPackManifest, PolicyContext, PolicyDecision | None]] = []
+    covered_security_domains: set[str] = set()
     cur_norm = norm
     cur_overwrite: dict[str, Any] = {}
     for entry in packs:
@@ -251,6 +253,8 @@ def _run_policy_pass(
             continue
         try:
             manifest = load_verified_policy_pack(entry, config_path=cfg_path, cwd=cur_norm.cwd)
+            if manifest.kind != kind:
+                raise PolicyPackLoadError(f"manifest kind {manifest.kind!r} does not match entry kind {kind!r}")
         except PolicyPackLoadError as exc:
             if kind == "security":
                 deny_dec = _scoped_fail_closed(cur_norm, entry, f"CONTEXT-GUARD SECURITY PACK ERROR (fail-closed): {exc}")
@@ -259,6 +263,8 @@ def _run_policy_pass(
             else:
                 warn(f"optimization pack {pid!r} skipped: {exc}")
             continue
+        if kind == "security" and manifest.kind == "security":
+            covered_security_domains.update(str(d) for d in manifest.covered_domains)
         ctx = PolicyContext(
             harness=cur_norm.harness, call_id=getattr(cur_norm, "call_id", "") or "", canonical_tool=cur_norm.canonical_tool,
             canonical_args=dict(cur_norm.canonical_args), mutated_paths=cur_norm.mutated_paths,
@@ -286,6 +292,12 @@ def _run_policy_pass(
                 return {"decision": "deny", "reason": f"Disallowed overwrite proposed by security pack {pid} in Pass-2"}, eval_records, cur_norm, (cur_overwrite or None), False
             cur_overwrite.update(dict(p_dec.overwrite))
             cur_norm = _with_overwrite(cur_norm, p_dec.overwrite)
+    if legacy_keys and tool_scopes:
+        for lkey in legacy_keys:
+            req = LEGACY_SECURITY_DOMAIN_MAP.get(str(lkey), frozenset())
+            if not req or not (covered_security_domains & req):
+                reason = f"CONTEXT-GUARD UNMIGRATED SECURITY CONFIG (fail-closed): Legacy key {lkey!r} lacks verified pack domain coverage ({sorted(req)}). Run install_pack.py --stage."
+                return {"decision": "deny", "reason": reason}, eval_records, cur_norm, (cur_overwrite or None), True
     return None, eval_records, cur_norm, (cur_overwrite or None), False
 
 

@@ -238,3 +238,151 @@ def test_post_tool_use_deferred_range_trim_outcomes_and_shadow_invalidation(tmp_
     telemetry.record_shadow_read("sy", canon, 1, 50, 1, 0, "sha2", min_tier=0, shadow_path=sp)
     handle_post_tool_use("codex", {"session_id": "sy", "tool_name": "apply_patch", "cwd": str(tmp_path), "tool_input": {"patch": f"*** Begin Patch\n*** Update File: {src.name}\n@@\n*** End Patch"}, "tool_response": "ok"}, state_dir=str(sd_fresh))
     assert telemetry.load_shadow_ledger(sp)["sessions"].get("sy", {}).get("paths", {}) == {}
+
+
+@pytest.mark.parametrize("policy", ["strict", "bounded"])
+def test_shadow_mode_records_only_confirmed_claude_batch_reads(
+    policy: str, isolated_user_env: Path, tmp_path: Path
+) -> None:
+    import os
+    from hooks import config, pre_tool_use, telemetry
+    from tests.helpers import read_session_state
+
+    cfg_path = isolated_user_env / ".config" / "context-guard" / "config.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "read_confirm_policy": policy,
+                "optimizers": {"range_trim": "shadow", "auto_outline": "shadow", "cli_rewrites": "shadow"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config.clear_config_cache()
+
+    src = tmp_path / "mod.py"
+    lines = [f"v_{i} = {i}" for i in range(1, 251)]
+    src.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    sd = tmp_path / f"st_{policy}"
+    sd.mkdir()
+    sp = telemetry.shadow_path_for(sd)
+    assert sp is not None
+    canon_ph = telemetry.pseudonymize_shadow_path(os.path.realpath(str(src)))
+    stats_file, outcomes_file = sd / "telemetry_stats.json", sd / "outcomes.json"
+
+    def _pre(cid: str) -> bytes:
+        pre_tool_use.evaluate_hook(
+            {
+                "session_id": "s1",
+                "tool_use_id": cid,
+                "tool_name": "Read",
+                "tool_input": {"file_path": str(src), "offset": 1, "limit": 80},
+            },
+            state_dir=str(sd),
+            cli_harness="claude",
+        )
+        return stats_file.read_bytes()
+
+    # Claude PostToolUse alone (provisional) does NOT add reads
+    s_before = _pre("id-prov")
+    handle_post_tool_use(
+        "claude",
+        {
+            "session_id": "s1",
+            "tool_use_id": "id-prov",
+            "tool_name": "Read",
+            "tool_input": {"file_path": str(src), "offset": 1, "limit": 80},
+            "tool_response": "\n".join(lines[:80]),
+        },
+        state_dir=str(sd),
+        event_name="PostToolUse",
+    )
+    assert telemetry.load_shadow_ledger(sp)["sessions"]["s1"]["paths"][canon_ph]["reads"] == []
+    assert stats_file.read_bytes() == s_before and not outcomes_file.exists()
+
+    # PostToolUseFailure does NOT add reads
+    s_before = _pre("id-fail")
+    handle_post_tool_use(
+        "claude",
+        {
+            "session_id": "s1",
+            "tool_use_id": "id-fail",
+            "tool_name": "Read",
+            "tool_input": {"file_path": str(src), "offset": 1, "limit": 80},
+            "error": "read failed",
+        },
+        state_dir=str(sd),
+        event_name="PostToolUseFailure",
+    )
+    assert telemetry.load_shadow_ledger(sp)["sessions"]["s1"]["paths"][canon_ph]["reads"] == []
+    assert stats_file.read_bytes() == s_before and not outcomes_file.exists()
+
+    # PostToolBatch with mismatched or redacted text does NOT add reads
+    s_before = _pre("id-mismatch")
+    handle_post_tool_use(
+        "claude",
+        {
+            "session_id": "s1",
+            "tool_calls": [
+                {
+                    "tool_name": "Read",
+                    "tool_use_id": "id-mismatch",
+                    "tool_input": {"file_path": str(src), "offset": 1, "limit": 80},
+                    "tool_response": "\n".join(["tampered"] * 80),
+                }
+            ],
+        },
+        state_dir=str(sd),
+        event_name="PostToolBatch",
+    )
+    assert telemetry.load_shadow_ledger(sp)["sessions"]["s1"]["paths"][canon_ph]["reads"] == []
+    assert stats_file.read_bytes() == s_before and not outcomes_file.exists()
+
+    s_before = _pre("id-redacted")
+    handle_post_tool_use(
+        "claude",
+        {
+            "session_id": "s1",
+            "tool_calls": [
+                {
+                    "tool_name": "Read",
+                    "tool_use_id": "id-redacted",
+                    "tool_input": {"file_path": str(src), "offset": 1, "limit": 80},
+                    "tool_response": "[REDACTED]",
+                }
+            ],
+        },
+        state_dir=str(sd),
+        event_name="PostToolBatch",
+    )
+    assert telemetry.load_shadow_ledger(sp)["sessions"]["s1"]["paths"][canon_ph]["reads"] == []
+    assert stats_file.read_bytes() == s_before and not outcomes_file.exists()
+
+    # PostToolBatch with matching content fingerprint records [1, 80, step, 2] and leaves stats/outcomes untouched
+    s_before = _pre("id-ok")
+    pending_step = int(
+        read_session_state(sd)["files"][os.path.realpath(str(src))]["pending_reads"]["id-ok"]["step"]
+    )
+    handle_post_tool_use(
+        "claude",
+        {
+            "session_id": "s1",
+            "tool_calls": [
+                {
+                    "tool_name": "Read",
+                    "tool_use_id": "id-ok",
+                    "tool_input": {"file_path": str(src), "offset": 1, "limit": 80},
+                    "tool_response": "\n".join(lines[:80]),
+                }
+            ],
+        },
+        state_dir=str(sd),
+        event_name="PostToolBatch",
+    )
+    assert telemetry.load_shadow_ledger(sp)["sessions"]["s1"]["paths"][canon_ph]["reads"] == [
+        [1, 80, pending_step, 2]
+    ]
+    assert stats_file.read_bytes() == s_before
+    assert load_telemetry_stats(stats_file)["events"]["ranges_trimmed"] == 0
+    assert not outcomes_file.exists()

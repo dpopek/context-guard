@@ -6,7 +6,7 @@ Live token savings telemetry, status bar indicator, SVG donut ring side panel, a
 
 ## Overview
 
-**Context-Guard (v4.4.0)** is a zero-prompt Policy API v1 host, verified Read Ledger v2 (`range_trim`), and multi-harness telemetry plugin for **Google Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex CLI/App** using pure Python 3.9+ stdlib hooks.
+**Context-Guard (v4.4.1)** is a zero-prompt Policy API v1 host, verified Read Ledger v2 (`range_trim`), and multi-harness telemetry plugin for **Google Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex CLI/App** using pure Python 3.9+ stdlib hooks.
 
 This companion IDE extension reads `telemetry/stats.json`, `token_usage.json`, `outcomes.json` (Outcomes Schema v4), and `update.json` from your installed Context-Guard checkout (auto-refreshing missing or stale `token_usage.json` via `cg_status.py --usage`) to surface token savings and v4.4 insights in your editor.
 
@@ -39,7 +39,7 @@ This companion IDE extension reads `telemetry/stats.json`, `token_usage.json`, `
 
 - **Outlining & Artifact Unwrap (`PreToolUse`):** Provides `cg-outline`, unwraps `>=16 KB` MCP JSON, summarizes opt-in integration JSON (`>=6 KB`), and indexes `transcript*.jsonl`.
 - **Read Ledger v2 (`PreToolUse`):** Tracks `SHA-256` hashes, spans, and `confirm_tier` in `.context_guard_state.json`; default `"strict"` yields `0` savings on Antigravity/Codex unless `"bounded"`.
-- **Quiet CLI Rewrites:** Injects quiet flags (`pytest -q`, `git status -sb`, `cargo test -q`, `vitest`, `grep`, opt-in integrations) in Antigravity and auto-approved Claude/Cursor modes.
+- **Guardrailed Quiet CLI Rewrites:** Trims noisy test/grep boilerplate (`pytest -q`, `git status -sb`, `cargo test -q`, `vitest`, `grep`, opt-in integrations) without overriding explicit user flags.
 - **Verified Policy API v1 (`PreToolUse`):** Evaluates external `policy_packs` pinned by `file_hashes` and `tree_sha256` in memory, with Pass-2 security checks and Stage-2 scoped fail-closed fallbacks.
 - **Two-Stage Auto-Compact Sensor & Preamble Attribution:** Tracks transcript steps (`O(delta)`) in Antigravity, resets caches on compaction, measures shell bytes, and splits CLI vs Desktop preamble overhead.
 

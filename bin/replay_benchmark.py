@@ -7,6 +7,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Iterator, Mapping
@@ -49,31 +50,37 @@ _ENV_KEYS = ("HOME", "USERPROFILE", "XDG_CONFIG_HOME", "APPDATA", "LOCALAPPDATA"
 def _isolated_runtime(root: Path, cfg_payload: Mapping[str, Any]) -> Iterator[dict[str, Path]]:
     """Redirect env vars, telemetry paths, and caches strictly into TemporaryDirectory."""
     res = root.resolve()
-    home_d, cg_d, tel_d = res / "home", res / "cg_home", res / "telemetry"
-    for p in (home_d, res / "xdg", res / "appdata", res / "localappdata", cg_d, tel_d):
+    home_d, cg_d, tel_d, state_d = res / "home", res / "cg_home", res / "telemetry", res / "state"
+    for p in (home_d, res / "xdg", res / "appdata", res / "localappdata", cg_d, tel_d, state_d):
         p.mkdir(parents=True, exist_ok=True)
     cfg_p = res / "config.json"
     cfg_p.write_text(json.dumps(cfg_payload, indent=2), encoding="utf-8")
     saved_env = {k: os.environ.get(k) for k in _ENV_KEYS}
     saved_paths = (telemetry.DEFAULT_TELEMETRY_PATH, telemetry.DEFAULT_SHADOW_PATH, outcomes.DEFAULT_OUTCOMES_PATH)
+    saved_cfg_default = config.DEFAULT_USER_CONFIG_PATH
     try:
         os.environ.update({
             "HOME": str(home_d), "USERPROFILE": str(home_d), "XDG_CONFIG_HOME": str(res / "xdg"),
             "APPDATA": str(res / "appdata"), "LOCALAPPDATA": str(res / "localappdata"),
             "CONTEXT_GUARD_HOME": str(cg_d), "CONTEXT_GUARD_CONFIG_PATH": str(cfg_p),
         })
+        config.DEFAULT_USER_CONFIG_PATH = home_d / ".config" / "context-guard" / "config.json"
         telemetry.DEFAULT_TELEMETRY_PATH = tel_d / "stats.json"
         telemetry.DEFAULT_SHADOW_PATH = tel_d / "shadow.json"
         outcomes.DEFAULT_OUTCOMES_PATH = tel_d / "outcomes.json"
         config.clear_config_cache()
         policy_engine.clear_pack_cache()
-        yield {"root": res, "config_path": cfg_p, "stats_path": tel_d / "stats.json", "state_dir": res / "state"}
+        yield {
+            "root": res, "home_dir": home_d, "cg_home": cg_d,
+            "config_path": cfg_p, "stats_path": tel_d / "stats.json", "state_dir": state_d,
+        }
     finally:
         for k, v in saved_env.items():
             if v is None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+        config.DEFAULT_USER_CONFIG_PATH = saved_cfg_default
         telemetry.DEFAULT_TELEMETRY_PATH, telemetry.DEFAULT_SHADOW_PATH, outcomes.DEFAULT_OUTCOMES_PATH = saved_paths
         config.clear_config_cache()
         policy_engine.clear_pack_cache()
@@ -245,6 +252,48 @@ def run_deterministic_benchmark(iterations: int = 3) -> dict[str, Any]:
                     else:
                         pre_tool_use.evaluate_hook({**payload, "call_id": f"w-{rep_i}-{idx}", "tool_use_id": f"w-{rep_i}-{idx}"}, state_dir=sdir, cli_harness=harness)
             warm_ms = (time.perf_counter() - t1) * 1000.0
+            repo_root = Path(__file__).resolve().parent.parent
+            pre_tool_script = repo_root / "hooks" / "pre_tool_use.py"
+            sub_iters = max(1, min(iters, 3))
+            sub_payload = {
+                "tool_name": "Read",
+                "tool_input": {"file_path": str(small_py), "offset": 1, "limit": 50},
+                "session_id": "bench-cl-sub",
+                "call_id": "bench-sub-0",
+                "tool_use_id": "bench-sub-0",
+            }
+            sub_env = {
+                **os.environ,
+                "HOME": str(paths["home_dir"]),
+                "USERPROFILE": str(paths["home_dir"]),
+                "XDG_CONFIG_HOME": str(paths["root"] / "xdg"),
+                "APPDATA": str(paths["root"] / "appdata"),
+                "LOCALAPPDATA": str(paths["root"] / "localappdata"),
+                "CONTEXT_GUARD_HOME": str(paths["cg_home"]),
+                "CONTEXT_GUARD_CONFIG_PATH": str(paths["config_path"]),
+                "TMPDIR": str(paths["state_dir"]),
+                "TMP": str(paths["state_dir"]),
+                "TEMP": str(paths["state_dir"]),
+                "PYTHONPATH": str(repo_root),
+                "PYTHONIOENCODING": "utf-8",
+            }
+            sub_env.pop("CONTEXT_GUARD_STATE_DIR", None)
+            sub_ok = True
+            t2 = time.perf_counter()
+            for sub_i in range(sub_iters):
+                call_payload = {**sub_payload, "call_id": f"bench-sub-{sub_i}", "tool_use_id": f"bench-sub-{sub_i}"}
+                proc = subprocess.run(
+                    [sys.executable, str(pre_tool_script), "--harness", "claude"],
+                    input=json.dumps(call_payload),
+                    text=True,
+                    encoding="utf-8",
+                    capture_output=True,
+                    env=sub_env,
+                    check=False,
+                )
+                if proc.returncode != 0:
+                    sub_ok = False
+            sub_ms = (time.perf_counter() - t2) * 1000.0
             st = telemetry.load_telemetry_stats(stats_p)
             saved_bytes, saved_tokens = int(st.get("saved_bytes", 0) or 0), int(st.get("saved_tokens", 0) or 0)
             baseline_bytes = int(st.get("baseline_bytes", 0) or 0)
@@ -252,22 +301,48 @@ def run_deterministic_benchmark(iterations: int = 3) -> dict[str, Any]:
             delivered = max(0, total_raw - saved_bytes)
             pct = round(min(100.0, (saved_bytes / total_raw) * 100.0), 2)
             warm_calls = max(1, iters * len(corpus))
+    in_cold_ms, in_warm_ms = round(cold_ms, 3), round(warm_ms, 3)
+    in_warm_per_call = round(warm_ms / warm_calls, 4)
     return {
-        "ok": True, "isolated": True, "iterations": iters, "corpus_calls": len(corpus),
-        "cold_ms": round(cold_ms, 3), "warm_ms": round(warm_ms, 3), "warm_ms_per_call": round(warm_ms / warm_calls, 4),
-        "raw_bytes": total_raw, "delivered_bytes": delivered, "saved_bytes": saved_bytes, "saved_tokens": saved_tokens, "savings_pct": pct,
+        "ok": sub_ok,
+        "isolated": True,
+        "measurement_scope": "synthetic_corpus",
+        "iterations": iters,
+        "corpus_calls": len(corpus),
+        "cold_ms": in_cold_ms,
+        "warm_ms": in_warm_ms,
+        "warm_ms_per_call": in_warm_per_call,
+        "in_process_cold_ms": in_cold_ms,
+        "in_process_warm_ms": in_warm_ms,
+        "in_process_warm_ms_per_call": in_warm_per_call,
+        "subprocess_hook_ms_per_call": round(sub_ms / sub_iters, 3),
+        "raw_bytes": total_raw,
+        "delivered_bytes": delivered,
+        "saved_bytes": saved_bytes,
+        "saved_tokens": saved_tokens,
+        "savings_pct": pct,
     }
 
 
 def render_benchmark_report(result: Mapping[str, Any]) -> str:
     """Format benchmark result dict as Markdown."""
+    in_cold = result.get("in_process_cold_ms", result.get("cold_ms", 0))
+    in_warm = result.get("in_process_warm_ms", result.get("warm_ms", 0))
+    in_warm_pc = result.get("in_process_warm_ms_per_call", result.get("warm_ms_per_call", 0))
+    sub_pc = result.get("subprocess_hook_ms_per_call", 0)
     return "\n".join([
-        "## Context-Guard Deterministic Benchmark", "", "| Metric | Value |", "| :--- | ---: |",
+        "## Context-Guard Deterministic Benchmark",
+        "",
+        "| Metric | Value |",
+        "| :--- | ---: |",
         f"| Status | `{'OK' if result.get('ok') else 'FAIL'}` |",
-        f"| Cold corpus latency | `{result.get('cold_ms', 0)} ms` |",
-        f"| Warm latency (`{result.get('iterations', 0)}`x) | `{result.get('warm_ms', 0)} ms` (`{result.get('warm_ms_per_call', 0)} ms/call`) |",
-        f"| Bytes saved | `{result.get('saved_bytes', 0)}` (`{result.get('savings_pct', 0)}%`) |",
-        f"| Tokens saved | `{result.get('saved_tokens', 0)}` |", "",
+        "| Benchmark scope | `synthetic corpus (not live session A/B)` |",
+        f"| In-process engine cold latency | `{in_cold} ms` |",
+        f"| In-process engine warm latency (`{result.get('iterations', 0)}`x) | `{in_warm} ms` (`{in_warm_pc} ms/call`) |",
+        f"| Subprocess E2E hook latency (`PreToolUse`) | `{sub_pc} ms/call` |",
+        f"| Bytes saved (synthetic corpus) | `{result.get('saved_bytes', 0)}` (`{result.get('savings_pct', 0)}%`) |",
+        f"| Tokens saved (synthetic est.) | `{result.get('saved_tokens', 0)}` |",
+        "",
     ])
 
 

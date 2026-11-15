@@ -202,11 +202,12 @@ def _extract_item_call_id(item: dict[str, Any]) -> str:
 
 def _apply_read_confirmation(
     harness: str, payload: dict[str, Any], state_dir_path: Path, cfg: dict[str, Any],
-    stats_path: Path | None, *, eff_event: str,
+    stats_path: Path | None, *, eff_event: str, shadow_path: Path | None = None,
 ) -> None:
     if not state_store.state_file_in(state_dir_path).is_file():
         return
     min_tier = 1 if cfg.get("read_confirm_policy", "strict") == "bounded" else 2
+    is_shadow = (cfg.get("optimizers") or {}).get("range_trim") == "shadow"
     raw_c = payload.get("tool_calls") if eff_event == "PostToolBatch" else None
     items = (
         [x for x in raw_c if isinstance(x, dict)] if eff_event == "PostToolBatch" and isinstance(raw_c, list)
@@ -215,6 +216,7 @@ def _apply_read_confirmation(
     if not items:
         return
     credits: list[tuple[str, int, int, int, str | None]] = []
+    shadow_reads: list[tuple[str, int, int, int, int, str]] = []
     outcomes_path = ledger_path_for(str(state_dir_path))
     sess_id = str(payload.get("session_id") or payload.get("conversation_id") or payload.get("conversationId") or "default")
     cwd = raw.strip() if isinstance((raw := payload.get("cwd")), str) and raw.strip() else None
@@ -251,6 +253,10 @@ def _apply_read_confirmation(
                     read_planner.mirror_unwrapped_entry(
                         files_map, str(redir), int(pend["step"]), read_interval=iv,
                     )
+                if is_shadow and not int(pend.get("byte_offset") or 0):
+                    s_end = int(pend["delivered_end"]) if int(pend.get("delivered_end") or -1) > 0 else int(pend.get("exec_end") or -1)
+                    if s_end > 0:
+                        shadow_reads.append((str(pend.get("canonical_target") or canon), int(pend["exec_start"]), s_end, int(pend["step"]), tier, str(pend.get("sha256") or "")))
                 if pend.get("is_trim") and tier >= min_tier and not pend.get("credited"):
                     credited, pm_m = True, pend.get("model")
                     mod = pm_m if isinstance(pm_m, str) and pm_m not in ("", "unknown") else state_mod
@@ -264,6 +270,8 @@ def _apply_read_confirmation(
         record_telemetry_event(harness, "ranges_trimmed", req_b, saved_b, stats_path=stats_path)
         dispatch_direct_outcome(record_direct_outcome, harness, mod, "range_trim", "applied", outcomes_path,
                                 session_id=sess_id, step_idx=p_step, call_id=p_cid)
+    for s_canon, s_start, s_end, s_step, s_tier, s_sha in shadow_reads:
+        telemetry.record_shadow_read(sess_id, s_canon, s_start, s_end, s_step, s_tier, s_sha, min_tier=min_tier, shadow_path=shadow_path)
 
 def _apply_mutation_invalidation(payload: dict[str, Any], sdir: Path, shadow_path: Path | None = None) -> None:
     if (tn := _tool_name(payload)) not in _MUTATION_TOOLS:
@@ -302,11 +310,10 @@ def handle_post_tool_use(
             record_shell_output(harness, classify_family(call.command), meas, call.outcome, sp)
         cfg = config.load_runtime_config()
         sdir = state_store.resolve_state_dir(payload, str(state_dir) if state_dir is not None else None)
+        sh_path = telemetry.shadow_path_for(str(state_dir) if state_dir is not None else None)
         if ev == "PostToolUse":
-            _apply_mutation_invalidation(
-                payload, sdir, telemetry.shadow_path_for(str(state_dir) if state_dir is not None else None),
-            )
-        _apply_read_confirmation(harness, payload, sdir, cfg, sp, eff_event=ev)
+            _apply_mutation_invalidation(payload, sdir, sh_path)
+        _apply_read_confirmation(harness, payload, sdir, cfg, sp, eff_event=ev, shadow_path=sh_path)
         packs = cfg.get("policy_packs") or ()
         if ev != "PostToolBatch" and any(isinstance(p, dict) and p.get("enabled", True) for p in packs):
             norm = harness_adapter.normalize_pre_tool_payload(payload, cli_harness=harness)

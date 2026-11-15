@@ -457,7 +457,10 @@ def install_ide_extension(
             journal.swap_directory(dest_dir, target_dir)
         for old_dir in extensions_dir.glob(f"{EXTENSION_ID}-*"):
             if old_dir.is_dir() and old_dir != target_dir:
-                shutil.rmtree(old_dir, ignore_errors=True)
+                if journal is not None:
+                    journal.stage_directory_removal(old_dir)
+                else:
+                    shutil.rmtree(old_dir, ignore_errors=True)
 
     entry = {
         "identifier": {"id": EXTENSION_ID},

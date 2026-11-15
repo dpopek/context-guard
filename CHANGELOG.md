@@ -5,6 +5,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 
 ## [Unreleased]
 
+## [4.4.1] - 2026-11-15
+
+### Changed
+- **Benchmark latency split (`bin/replay_benchmark.py`):** Separated in-process engine vs subprocess `PreToolUse` E2E latency.
+- **Shadow Mode (`hooks/pre_tool_use.py`, `hooks/post_tool_use.py`):** Record `shadow.json` slices after post-tool confirmation.
+- **Docs (`README.md`):** Renamed `Lossless` to `Guardrailed Quiet CLI Rewrites`; clarified `--benchmark` and Shadow Mode.
+
+### Fixed
+- **Legacy domain guard (`hooks/policy_engine.py`):** Check security pack `covered_domains` against `legacy_security_keys`.
+- **Reversible IDE cleanup (`bin/migration_guard.py`):** Stage old extension removals in `RollbackJournal` for `install_harnesses.py`.
+
 ## [4.4.0] - 2026-11-15
 
 ### Added
