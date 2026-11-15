@@ -165,28 +165,14 @@ def test_claude_read_allows_normal_file_trims_overlap_and_outlines_mcp_output(tm
     big_py.write_text("".join(lines), encoding="utf-8")
     state_dir = str(tmp_path / "state")
 
-    # 1. Targeted Read offset=1, limit=30 -> allow ({})
-    res1 = evaluate_hook(
-        {
-            "session_id": "s1",
-            "tool_name": "Read",
-            "tool_input": {"file_path": str(big_py), "offset": 1, "limit": 30},
-        },
-        state_dir=state_dir,
-        cli_harness="claude",
-    )
+    from tests.helpers import claude_read
+
+    # 1. Targeted Read offset=1, limit=30 -> allow ({}) & confirmed via PostToolBatch
+    res1 = claude_read(big_py, state_dir, offset=1, limit=30, session_id="s1", confirm=True)
     assert res1 == {}
 
     # 2. Overlapping Read offset=20, limit=30 (lines 20..49) -> silent range_trim to offset=31, limit=19
-    res2 = evaluate_hook(
-        {
-            "session_id": "s1",
-            "tool_name": "Read",
-            "tool_input": {"file_path": str(big_py), "offset": 20, "limit": 30},
-        },
-        state_dir=state_dir,
-        cli_harness="claude",
-    )
+    res2 = claude_read(big_py, state_dir, offset=20, limit=30, session_id="s1", confirm=False)
     assert res2["hookSpecificOutput"]["permissionDecision"] == "allow"
     assert res2["hookSpecificOutput"]["updatedInput"] == {
         "file_path": str(big_py),
@@ -255,31 +241,21 @@ def test_claude_edit_invalidates_read_cache(tmp_path: Path) -> None:
 
 
 def test_pre_compact_clears_session_file_cache(tmp_path: Path) -> None:
+    from tests.helpers import claude_read
+
     f = tmp_path / "small.py"
     f.write_text("\n".join(f"a_{i} = {i}" for i in range(60)) + "\n", encoding="utf-8")
     state_dir = str(tmp_path / "compact_state")
 
-    evaluate_hook(
-        {"session_id": "c1", "tool_name": "Read", "tool_input": {"file_path": str(f), "offset": 1, "limit": 30}},
-        state_dir=state_dir,
-        cli_harness="claude",
-    )
-    overlapping = evaluate_hook(
-        {"session_id": "c1", "tool_name": "Read", "tool_input": {"file_path": str(f), "offset": 20, "limit": 30}},
-        state_dir=state_dir,
-        cli_harness="claude",
-    )
+    claude_read(f, state_dir, offset=1, limit=30, session_id="c1", confirm=True)
+    overlapping = claude_read(f, state_dir, offset=20, limit=30, session_id="c1", confirm=False)
     assert overlapping["hookSpecificOutput"]["updatedInput"]["offset"] == 31
 
     # Trigger PreCompact -> clears cache
     assert handle_pre_compact({"session_id": "c1"}, state_dir=state_dir) == {}
 
     # After compact: overlapping read [20, 49] is no longer trimmed
-    allowed = evaluate_hook(
-        {"session_id": "c1", "tool_name": "Read", "tool_input": {"file_path": str(f), "offset": 20, "limit": 30}},
-        state_dir=state_dir,
-        cli_harness="claude",
-    )
+    allowed = claude_read(f, state_dir, offset=20, limit=30, session_id="c1", confirm=False)
     assert allowed == {}
 
 
@@ -359,6 +335,7 @@ def test_installer_registers_shell_output_hooks(tmp_path: Path) -> None:
     plugin_root = Path(__file__).resolve().parent.parent
     py_cmd = resolve_python_command()
     post_script = format_hook_script_path(plugin_root / "hooks" / "post_tool_use.py")
+    session_end_script = format_hook_script_path(plugin_root / "hooks" / "session_end.py")
 
     install_all(plugin_root, claude_cfg, cursor_cfg, codex_cfg, codex_toml, dry_run=True)
     assert claude_cfg.read_text(encoding="utf-8") == "{}"
@@ -369,12 +346,20 @@ def test_installer_registers_shell_output_hooks(tmp_path: Path) -> None:
     for event in ("PostToolUse", "PostToolUseFailure"):
         assert claude["hooks"][event] == [
             {
+                "matcher": "Read|NotebookRead|Edit|MultiEdit|Write|NotebookEdit",
+                "hooks": [{"type": "command", "command": f"{py_cmd} {post_script} --harness claude"}],
+            },
+            {
                 "matcher": "Bash",
-                "hooks": [
-                    {"type": "command", "command": f"{py_cmd} {post_script} --harness claude", "async": True}
-                ],
-            }
+                "hooks": [{"type": "command", "command": f"{py_cmd} {post_script} --harness claude", "async": True}],
+            },
         ]
+    assert claude["hooks"]["PostToolBatch"] == [
+        {"hooks": [{"type": "command", "command": f"{py_cmd} {post_script} --harness claude --event PostToolBatch"}]}
+    ]
+    assert claude["hooks"]["SessionEnd"] == [
+        {"hooks": [{"type": "command", "command": f"{py_cmd} {session_end_script} --harness claude"}]}
+    ]
 
     codex = json.loads(codex_cfg.read_text(encoding="utf-8"))
     codex_cmd = f"{py_cmd} {post_script} --harness codex"
@@ -395,6 +380,7 @@ def test_installer_registers_shell_output_hooks(tmp_path: Path) -> None:
     uninstall_all(claude_cfg, cursor_cfg, codex_cfg, codex_toml)
     for cfg in (claude_cfg, cursor_cfg, codex_cfg, codex_toml):
         assert "post_tool_use" not in cfg.read_text(encoding="utf-8")
+        assert "session_end" not in cfg.read_text(encoding="utf-8")
 
 
 def test_evaluate_hook_env_detection_and_pack_matchers(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

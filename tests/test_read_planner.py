@@ -17,8 +17,10 @@ from hooks.read_planner import (
     normalize_recorded_ranges,
     trim_partially_covered_range,
 )
+from hooks.config import clear_config_cache
+from hooks.post_tool_use import handle_post_tool_use
 from hooks.telemetry import HARNESS_READ_CAPS, cap_end_line_for_harness, load_telemetry_stats
-from tests.helpers import read_outcomes_ledger, read_session_state, write_python_module
+from tests.helpers import ag_read, read_outcomes_ledger, read_session_state, write_python_module
 
 
 def test_byte_offset_pagination_logs_telemetry_without_trim(tmp_path: Path) -> None:
@@ -56,15 +58,21 @@ def test_antigravity_uncapped_read_on_2000_line_50kb_file_records_capped_slice(t
 
     assert (
         ptu.evaluate_hook(
-            {"conversationId": "c1", "stepIdx": 1, "toolCall": {"name": "read_file", "args": {"Path": str(big)}}},
+            {"conversationId": "c1", "stepIdx": 1, "toolCall": {"id": "ag_cap_1", "name": "read_file", "args": {"Path": str(big)}}},
             state_dir=str(state_dir),
         )
         == {"decision": "allow"}
     )
+    handle_post_tool_use(
+        "antigravity",
+        {"conversationId": "c1", "stepIdx": 1, "toolCall": {"id": "ag_cap_1", "name": "read_file", "args": {"Path": str(big)}}},
+        state_dir=state_dir,
+        event_name="PostToolUse",
+    )
     state = read_session_state(state_dir)
     reads = state["files"][canon]["reads"]
     assert len(reads) == 1
-    assert reads[0][0] == 1 and reads[0][1] <= 800
+    assert reads[0][0] == 1 and reads[0][1] <= 800 and reads[0][3] == 1
 
     # Because lines > 800 were not delivered, requesting lines 801..900 is allowed untouched
     assert (
@@ -170,33 +178,31 @@ def test_camel_case_transcript_path_extracts_model_in_pre_tool_use(tmp_path: Pat
     assert ledger["by_key"][key]["applied"] == 1
 
 
-def test_range_trim_records_telemetry_and_direct_outcome(tmp_path: Path) -> None:
-    target = write_python_module(tmp_path / "mod.py", funcs=25, body_lines=7)
-    state_dir = tmp_path / "state"
+def test_range_trim_records_telemetry_and_direct_outcome(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = tmp_path / "cg_cfg.json"
+    cfg.write_text(json.dumps({"read_confirm_policy": "bounded"}), encoding="utf-8")
+    monkeypatch.setenv("CONTEXT_GUARD_CONFIG_PATH", str(cfg))
+    clear_config_cache()
+    try:
+        target = write_python_module(tmp_path / "mod.py", funcs=25, body_lines=7)
+        state_dir = tmp_path / "state"
 
-    assert (
-        ptu.evaluate_hook(
-            {"conversationId": "c1", "stepIdx": 1, "toolCall": {"name": "read_file", "args": {"Path": str(target), "StartLine": 1, "EndLine": 100}}},
-            state_dir=str(state_dir),
-        )
-        == {"decision": "allow"}
-    )
-    res_trim = ptu.evaluate_hook(
-        {"conversationId": "c1", "stepIdx": 2, "toolCall": {"name": "read_file", "args": {"Path": str(target), "StartLine": 50, "EndLine": 150}}},
-        state_dir=str(state_dir),
-    )
-    assert res_trim == {"decision": "allow", "overwrite": {"StartLine": 101, "EndLine": 150}}
+        assert ag_read(target, state_dir, start_line=1, end_line=100, step_idx=1, confirm=True) == {"decision": "allow"}
+        res_trim = ag_read(target, state_dir, start_line=50, end_line=150, step_idx=2, confirm=True)
+        assert res_trim == {"decision": "allow", "overwrite": {"StartLine": 101, "EndLine": 150}}
 
-    stats = load_telemetry_stats(state_dir / "telemetry_stats.json")
-    assert stats["events"]["ranges_trimmed"] == 1
-    assert stats["saved_bytes"] > 0
+        stats = load_telemetry_stats(state_dir / "telemetry_stats.json")
+        assert stats["events"]["ranges_trimmed"] == 1
+        assert stats["saved_bytes"] > 0
 
-    ledger = read_outcomes_ledger(state_dir)
-    assert sum(row["total"] for k, row in ledger["by_key"].items() if k.endswith("|range_trim")) == 1
+        ledger = read_outcomes_ledger(state_dir)
+        assert sum(row["total"] for k, row in ledger["by_key"].items() if k.endswith("|range_trim")) == 1
+    finally:
+        clear_config_cache()
 
 
 def test_trim_bounds_and_interval_normalization_edge_cases() -> None:
-    reads = [[1, 50, 1], [100, 150, 2]]
+    reads = [[1, 50, 1, 2], [100, 150, 2, 2]]
     assert trim_partially_covered_range(reads, 60, 90, target_lines=200) is None  # disjoint
     assert trim_partially_covered_range(reads, 10, 40, target_lines=200) is None  # fully covered
     assert trim_partially_covered_range(reads, 30, 80, target_lines=200) == (51, 80)
@@ -205,8 +211,8 @@ def test_trim_bounds_and_interval_normalization_edge_cases() -> None:
     assert trim_partially_covered_range(reads, 1, -1, target_lines=0) is None
     assert normalize_effective_bounds(250, 300, target_lines=200) is None  # past EOF
 
-    normed = normalize_recorded_ranges([[1, -1, 3], [0, 10, 1]], target_lines=200)
-    assert normed == [[1, 200, 3]]
+    normed = normalize_recorded_ranges([[1, -1, 3, 2], [0, 10, 1, 2]], target_lines=200)
+    assert normed == [[1, 200, 3, 2]]
     assert covering_read_step(normed, 50, 150, target_lines=200) == 3
 
 

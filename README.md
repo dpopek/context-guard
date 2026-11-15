@@ -75,6 +75,7 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 | `hooks/pre_invocation.py` | Hook Entry | Antigravity incremental `O(delta)` transcript scanner, session transition hooks, and auto-compact sensor. |
 | `hooks/pre_compact.py` | Hook Entry | Claude Code, Cursor, and Codex `PreCompact` / `preCompact` read-cache and `policy_state` reset hook. |
 | `hooks/post_tool_use.py` | Hook Entry | `PostToolUse` / `postToolUse` hook measuring shell output bytes and dispatching `on_tool_completed`. |
+| `hooks/session_end.py` | Hook Entry | `SessionEnd` hook clearing transient `pending_reads` state and emitting session-end policy events. |
 | `hooks/harness_adapter.py` | Normalization | Normalizes tool payloads (`Read`, `Bash`, `exec_command`, `apply_patch`), permission modes, and verdicts. |
 | `hooks/read_planner.py` | Core Engine | Silent `range_trim` overlap trimmer, slice caps, and machine-artifact outline planner. |
 | `hooks/shell_parser.py` | Core Engine | Lossless quiet CLI flag rewriter, voluntary `cg-outline` detector, and bounded shell-read analyzer. |
@@ -101,10 +102,13 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 | `bin/transcript_parsers.py` | CLI & UI | Stateless record parsers and UTC day normalizer for Claude, Codex, Antigravity, and Cursor logs. |
 | `bin/preamble_attribution.py` | CLI & UI | Measures always-on instruction files, separates CLI/Desktop apps, and computes `sunset_verdict`. |
 | `bin/usage_report.py` | CLI & UI | Formats real token usage, cache read share, preamble breakdowns, and sunset advice. |
+| `bin/outcomes_report.py` | CLI & UI | Formats per-rule follow-up outcomes and estimated delivered cost insights (`--json`, `--rules`). |
+| `bin/tariffs.py` | CLI & UI | Loads bundled model token tariff tables and computes USD/saved cost estimates (`pricing_table.json`). |
 | `vscode-extension/extension.js` | IDE Extension | Status bar pill, 4s pulse, report panel, `update.lock` backoff, and one-click updater. |
 | `vscode-extension/view_model.js` | IDE Extension | Pure telemetry normalization, v4.x insights summarization, SemVer validation, and CSP. |
 | `vscode-extension/updater.js` | IDE Extension | Self-update runner, `plugin_root.json` resolver, and harness `probeDoctor`. |
 | `vscode-extension/renderers.js` | IDE Extension | Escaped tooltip Markdown, sidebar SVG donut HTML, and dashboard report views. |
+| `vscode-extension/cost_insights.js` | IDE Extension | Summarizes and formats cost savings and model attribution insights for extension views. |
 
 ---
 

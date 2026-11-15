@@ -28,6 +28,7 @@ from hooks.outcomes import DEFAULT_OUTCOMES_PATH, load_outcomes  # noqa: E402
 from hooks.state_store import resolve_plugin_root, warn  # noqa: E402
 from bin import token_usage, usage_report  # noqa: E402
 from bin.harness_status import check_status, verify_harness_hooks  # noqa: E402
+from bin.outcomes_report import render_outcomes_report  # noqa: E402
 from bin.update_check import UPDATE_LOCK, is_update_stale  # noqa: E402
 
 ROOT = resolve_plugin_root()
@@ -396,37 +397,6 @@ def _shell_output_lines(stats: dict[str, Any]) -> list[str]:
     return lines
 
 
-def render_outcomes_report(ledger: dict[str, Any]) -> str:
-    """Markdown table of intervention outcomes per harness × model × kind (counts only, no paths)."""
-    lines = ["# 🛡️ Context-Guard Intervention Outcomes", ""]
-    by_key = ledger.get("by_key") or {}
-    if not by_key:
-        lines.append("No interventions recorded yet.")
-    else:
-        lines.append("| Harness | Model | Kind | Interventions | Targeted follow-up | Full bypass | Shell bypass |")
-        lines.append("|---|---|---|---:|---:|---:|---:|")
-        for key in sorted(by_key):
-            row = by_key[key]
-            harness, _, rest = key.partition("|")
-            model, _, kind = rest.partition("|")
-            total = int(row.get("total") or 0)
-            if kind in ("outline", "outline_pull"):
-                followups = [
-                    f"{cnt:,} ({_pct(cnt, total)})"
-                    for cnt in (
-                        int(row.get(col) or 0) for col in ("targeted_followup", "full_bypass", "shell_bypass")
-                    )
-                ]
-            else:
-                followups = ["—", "—", "—"]
-            lines.append("| " + " | ".join([harness, model, kind, f"{total:,}", *followups]) + " |")
-    lines.append("")
-    lines.append(
-        f"_Schema: v{ledger.get('schema_version', 3)} · updated: {ledger.get('updated_at') or 'never'}_"
-    )
-    return "\n".join(lines) + "\n"
-
-
 def _usage_inputs(
     stats: dict[str, Any], usage_path: Path | None
 ) -> tuple[dict[str, Any], int, usage_report.PreambleBreakdown]:
@@ -744,7 +714,9 @@ def main(argv: list[str] | None = None) -> int:
             print(render_doctor_report(doc), end="")
             return 0 if doc.get("ok") else 1
         if args.outcomes:
-            print(render_outcomes_report(load_outcomes(args.outcomes_path)), end="")
+            u_path = args.usage_path or (token_usage.DEFAULT_USAGE_PATH if args.outcomes_path is None else None)
+            u_state = token_usage.restore_usage_state(u_path) if u_path and u_path.is_file() else None
+            print(render_outcomes_report(load_outcomes(args.outcomes_path), u_state), end="")
             return 0
         stats = load_telemetry_stats(args.stats_path)
         if args.claude_hud:

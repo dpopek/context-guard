@@ -404,52 +404,63 @@ def test_pre_tool_use_read_trim_refresh_and_claude_outline_pull_refresh(
         }) + "\n",
         encoding="utf-8",
     )
-    target = tmp_path / "app.py"
-    target.write_text("\n".join(f"line {i}" for i in range(1, 51)) + "\n", encoding="utf-8")
+    from hooks import config as cg_config, post_tool_use
+    from tests.helpers import ag_read
 
-    # Initial read at step 1 caches gemini4argonhigh.
-    pre_tool_use.evaluate_hook(
-        {"conversationId": "conv1", "artifactDirectoryPath": str(conv_dir), "stepIdx": 1, "toolCall": {"name": "read_file", "args": {"Path": str(target), "StartLine": 1, "EndLine": 10}}},
-        state_dir=str(conv_dir),
-    )
-    # Switch model and trigger overlapping range_trim at step 1 + MODEL_REFRESH_STEPS.
-    log.write_text(
-        json.dumps({
-            "step_index": 21,
-            "type": "USER_INPUT",
-            "content": "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from Gemini 4 Argon High to Claude Sonnet 4.6.\n</USER_SETTINGS_CHANGE>",
-        }) + "\n",
-        encoding="utf-8",
-    )
-    lock_free = False
-    real_record = pre_tool_use.record_direct_outcome
+    cfg_path = tmp_path / "cg_cfg.json"
+    cfg_path.write_text(json.dumps({"read_confirm_policy": "bounded"}), encoding="utf-8")
+    monkeypatch.setenv("CONTEXT_GUARD_CONFIG_PATH", str(cfg_path))
+    cg_config.clear_config_cache()
+    try:
+        target = tmp_path / "app.py"
+        target.write_text("\n".join(f"line {i}" for i in range(1, 51)) + "\n", encoding="utf-8")
 
-    def _checked(
-        harness: str,
-        model: str,
-        kind: str,
-        outcome: str,
-        ledger_path: Path | None,
-        *,
-        increment_total: bool = True,
-    ) -> None:
-        nonlocal lock_free
-        if fcntl_mod is not None:
-            with open(conv_dir / ".context_guard_state.lock", "a+", encoding="utf-8") as fh:
-                fcntl_mod.flock(fh.fileno(), fcntl_mod.LOCK_EX | fcntl_mod.LOCK_NB)
-                fcntl_mod.flock(fh.fileno(), fcntl_mod.LOCK_UN)
-        lock_free = True
-        real_record(harness, model, kind, outcome, ledger_path, increment_total=increment_total)
+        # Initial read at step 1 caches gemini4argonhigh.
+        ag_read(target, conv_dir, start_line=1, end_line=10, step_idx=1, conv_id="conv1", confirm=True)
+        # Switch model and trigger overlapping range_trim at step 1 + MODEL_REFRESH_STEPS.
+        log.write_text(
+            json.dumps({
+                "step_index": 21,
+                "type": "USER_INPUT",
+                "content": "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from Gemini 4 Argon High to Claude Sonnet 4.6.\n</USER_SETTINGS_CHANGE>",
+            }) + "\n",
+            encoding="utf-8",
+        )
+        lock_free = False
+        real_record = post_tool_use.record_direct_outcome
 
-    monkeypatch.setattr(pre_tool_use, "record_direct_outcome", _checked)
-    trim_res = pre_tool_use.evaluate_hook(
-        {"conversationId": "conv1", "artifactDirectoryPath": str(conv_dir), "stepIdx": 1 + mi.MODEL_REFRESH_STEPS, "toolCall": {"name": "read_file", "args": {"Path": str(target), "StartLine": 5, "EndLine": 20}}},
-        state_dir=str(conv_dir),
-    )
-    assert trim_res["overwrite"] == {"StartLine": 11, "EndLine": 20}
-    assert lock_free is True
-    assert read_session_state(conv_dir)["model"] == "claudesonnet4.6"
-    assert read_outcomes_ledger(conv_dir)["by_key"]["antigravity|claudesonnet4.6|range_trim"]["applied"] == 1
+        def _checked(
+            harness: str,
+            model: str,
+            kind: str,
+            outcome: str,
+            ledger_path: Path | None,
+            *,
+            increment_total: bool = True,
+        ) -> None:
+            nonlocal lock_free
+            if fcntl_mod is not None:
+                with open(conv_dir / ".context_guard_state.lock", "a+", encoding="utf-8") as fh:
+                    fcntl_mod.flock(fh.fileno(), fcntl_mod.LOCK_EX | fcntl_mod.LOCK_NB)
+                    fcntl_mod.flock(fh.fileno(), fcntl_mod.LOCK_UN)
+            lock_free = True
+            real_record(harness, model, kind, outcome, ledger_path, increment_total=increment_total)
+
+        monkeypatch.setattr(post_tool_use, "record_direct_outcome", _checked)
+        trim_payload = {
+            "conversationId": "conv1",
+            "artifactDirectoryPath": str(conv_dir),
+            "stepIdx": 1 + mi.MODEL_REFRESH_STEPS,
+            "toolCall": {"id": "ag-trim-2", "name": "read_file", "args": {"Path": str(target), "StartLine": 5, "EndLine": 20}},
+        }
+        trim_res = pre_tool_use.evaluate_hook(trim_payload, state_dir=str(conv_dir))
+        assert trim_res["overwrite"] == {"StartLine": 11, "EndLine": 20}
+        post_tool_use.handle_post_tool_use("antigravity", trim_payload, state_dir=str(conv_dir), event_name="PostToolUse")
+        assert lock_free is True
+        assert read_session_state(conv_dir)["model"] == "claudesonnet4.6"
+        assert read_outcomes_ledger(conv_dir)["by_key"]["antigravity|claudesonnet4.6|range_trim"]["applied"] == 1
+    finally:
+        cg_config.clear_config_cache()
 
     # Claude outline_pull advances auto_step_seq before memoize so prior `unknown` refreshes.
     cstate = tmp_path / "cstate"

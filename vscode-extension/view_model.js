@@ -1,14 +1,19 @@
 "use strict";
 
+const {
+  INPUT_USD_PER_MILLION,
+  COST_BASIS_NOTE,
+  finiteNonNeg,
+  clampNonNegativeInt,
+  estimateCostUsd,
+  parseIsoDayUtcMs,
+  computeSunsetVerdict,
+  summarizeOutcomesCostImpact,
+} = require("./cost_insights");
+
 const HARNESS_ORDER = ["antigravity", "claude", "cursor", "codex"];
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
-const ISO_DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
-const INPUT_USD_PER_MILLION = 4.0;
-const COST_BASIS_NOTE = "approx.: saved tokens × $4/M input (Claude Opus 5.5 list price), priced once";
 const RECENT_PREAMBLE_WINDOW = 10;
-const TARGET_WINDOW_DAYS = 30;
-const CACHE_READ_PRICE_RATIO = 0.1;
-const DENIAL_KINDS = new Set(["outline", "reread_block", "shell_block", "wide_followup"]);
 
 const PROTECTION_LAYERS = [
   { key: "outlines", shortLabel: "Outline", fullLabel: "AST, Markup & Diff Outlines", eventLabel: "AST, Markup & Diff Outline", codicon: "$(symbol-structure)", emoji: "🧬" },
@@ -63,16 +68,6 @@ function escapeMarkdownText(raw) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/([\\`*_{}[\]()#|$~!])/g, "\\$1");
-}
-
-function finiteNonNeg(value) {
-  if (typeof value === "boolean") return 0;
-  const n = Number(value);
-  return Number.isFinite(n) && n > 0 ? n : 0;
-}
-
-function clampNonNegativeInt(value) {
-  return Math.round(finiteNonNeg(value));
 }
 
 function normalizeStats(raw) {
@@ -169,12 +164,6 @@ function formatBlockGauge(pct, width = 5) {
   if (clamped > 0 && filled === 0) filled = 1;
   filled = Math.min(safeWidth, Math.max(0, filled));
   return "▰".repeat(filled) + "▱".repeat(safeWidth - filled);
-}
-
-function estimateCostUsd(tokens, ratePerMillion = INPUT_USD_PER_MILLION) {
-  const val = finiteNonNeg(tokens);
-  const rate = finiteNonNeg(ratePerMillion);
-  return ((val / 1000000) * rate).toFixed(2);
 }
 
 function cleanNonNegInts(values) {
@@ -315,123 +304,6 @@ function summarizeCacheHit(tokenUsage) {
   return { cacheHitPct: pct, cacheHitLabel: `${pct.toFixed(1)}%` };
 }
 
-function parseIsoDayUtcMs(dayStr) {
-  if (typeof dayStr !== "string" || !ISO_DAY_RE.test(dayStr)) return null;
-  const ms = Date.parse(`${dayStr}T00:00:00Z`);
-  if (!Number.isFinite(ms)) return null;
-  return new Date(ms).toISOString().slice(0, 10) === dayStr ? ms : null;
-}
-
-function dayDiffInclusive(since, until) {
-  const sinceMs = parseIsoDayUtcMs(since);
-  const untilMs = parseIsoDayUtcMs(until);
-  if (sinceMs === null || untilMs === null || untilMs < sinceMs) return 0;
-  return Math.round((untilMs - sinceMs) / 86400000) + 1;
-}
-
-function validIsoDayKeys(obj) {
-  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return [];
-  return Object.keys(obj)
-    .filter((d) => parseIsoDayUtcMs(d) !== null && obj[d] && typeof obj[d] === "object" && !Array.isArray(obj[d]))
-    .sort();
-}
-
-function sumUsageWindow(usageByDay, usageDays, since, until) {
-  let realInput = 0;
-  let events = 0;
-  for (const day of usageDays) {
-    if ((since && day < since) || (until && day > until)) continue;
-    for (const row of Object.values(usageByDay[day])) {
-      if (!row || typeof row !== "object") continue;
-      realInput += clampNonNegativeInt(row.input) + clampNonNegativeInt(row.cache_read) + clampNonNegativeInt(row.cache_write);
-      events += clampNonNegativeInt(row.events);
-    }
-  }
-  return { realInput, events };
-}
-
-function computeSunsetVerdict(norm, tokenUsage, outcomes) {
-  const usageByDay =
-    tokenUsage && typeof tokenUsage.by_day === "object" && !Array.isArray(tokenUsage.by_day) ? tokenUsage.by_day : {};
-  const usageDays = validIsoDayKeys(usageByDay);
-  if (!usageDays.length) return null;
-  const statsDays = validIsoDayKeys(norm.byDay);
-  const byDayTotalEvents = sumUsageWindow(usageByDay, usageDays, "", null).events;
-  let windowDays = 0;
-  let saved = 0;
-  let realInput = 0;
-  let windowEvents = 0;
-  if (statsDays.length) {
-    const since = statsDays[0] > usageDays[0] ? statsDays[0] : usageDays[0];
-    const until = statsDays[statsDays.length - 1] < usageDays[usageDays.length - 1] ? statsDays[statsDays.length - 1] : usageDays[usageDays.length - 1];
-    if (since <= until) {
-      windowDays = dayDiffInclusive(since, until);
-      let savedBytesSum = 0;
-      for (const d of statsDays) {
-        if (d >= since && d <= until) {
-          const rawSb = norm.byDay[d].saved_bytes;
-          const sb = typeof rawSb === "boolean" ? 0 : Number(rawSb);
-          if (Number.isFinite(sb)) savedBytesSum += Math.trunc(sb);
-        }
-      }
-      saved = Math.floor(Math.max(0, savedBytesSum) / 4);
-      ({ realInput, events: windowEvents } = sumUsageWindow(usageByDay, usageDays, since, until));
-    }
-  } else {
-    const rawStart = tokenUsage && typeof tokenUsage.started_at === "string" ? tokenUsage.started_at.slice(0, 10) : "";
-    const since = parseIsoDayUtcMs(rawStart) !== null ? rawStart : "";
-    windowDays = since ? dayDiffInclusive(since, usageDays[usageDays.length - 1]) : 0;
-    saved = Math.max(0, clampNonNegativeInt(norm.savedTokens) - clampNonNegativeInt(tokenUsage && tokenUsage.saved_tokens_at_start));
-    const win = sumUsageWindow(usageByDay, usageDays, since, null);
-    realInput = win.realInput;
-    if (since) windowEvents = win.events;
-  }
-  let denials = 0;
-  let denialTokens = 0;
-  if (
-    outcomes &&
-    typeof outcomes === "object" &&
-    (outcomes.schema_version === undefined || outcomes.schema_version === 3) &&
-    outcomes.by_key &&
-    typeof outcomes.by_key === "object"
-  ) {
-    const totals = tokenUsage && typeof tokenUsage.totals === "object" ? tokenUsage.totals : {};
-    const callsByHarness = {};
-    const cacheReadByHarness = {};
-    for (const [tk, row] of Object.entries(totals)) {
-      if (!row || typeof row !== "object") continue;
-      const harness = String(tk).split("|")[0];
-      const evCount = clampNonNegativeInt(row.events);
-      callsByHarness[harness] = (callsByHarness[harness] || 0) + evCount;
-      cacheReadByHarness[harness] = (cacheReadByHarness[harness] || 0) + clampNonNegativeInt(row.cache_read);
-    }
-    for (const [key, row] of Object.entries(outcomes.by_key)) {
-      if (!row || typeof row !== "object") continue;
-      const parts = String(key).split("|");
-      const kind = parts[parts.length - 1];
-      if (!DENIAL_KINDS.has(kind)) continue;
-      const harness = parts[0];
-      const count = clampNonNegativeInt(row.total) + clampNonNegativeInt(row.repeats);
-      if (!count) continue;
-      denials += count;
-      if (callsByHarness[harness] > 0 && cacheReadByHarness[harness] > 0) {
-        denialTokens += count * (cacheReadByHarness[harness] / callsByHarness[harness]) * CACHE_READ_PRICE_RATIO;
-      }
-    }
-  }
-  const totalEvents = byDayTotalEvents;
-  let roundedDenialTokens = Math.floor(denialTokens);
-  if (windowEvents > 0 && windowEvents < totalEvents) {
-    roundedDenialTokens = Math.floor((roundedDenialTokens * windowEvents) / totalEvents);
-  }
-  const netSaved = saved - roundedDenialTokens;
-  const denom = realInput + Math.max(0, netSaved);
-  const netSharePct = denom > 0 ? Math.round((netSaved / denom) * 10000) / 100 : 0;
-  const status =
-    windowDays < TARGET_WINDOW_DAYS ? "collecting_30d_window" : netSharePct < 0.5 ? "sunset_candidate" : "net_positive";
-  return { windowDays, targetDays: TARGET_WINDOW_DAYS, netSaved, netSharePct, denials, denialTokens: roundedDenialTokens, status };
-}
-
 function normalizeDoctor(doctor) {
   if (!doctor || typeof doctor !== "object" || typeof doctor.ok !== "boolean") {
     return { ok: null, registeredCount: 0, totalHarnesses: 0, statusLabel: "n/a" };
@@ -451,6 +323,7 @@ function summarizeV4Insights(stats, tokenUsage, outcomes, doctor) {
   const { cacheHitPct, cacheHitLabel } = summarizeCacheHit(tokenUsage);
   const { byHarness, preambleLast } = buildPreambleInsights(stats, norm, tokenUsage);
   const sunsetVerdict = computeSunsetVerdict(norm, tokenUsage, outcomes);
+  const costImpact = summarizeOutcomesCostImpact(outcomes, tokenUsage);
   return {
     cacheHitPct,
     cacheHitLabel,
@@ -458,6 +331,10 @@ function summarizeV4Insights(stats, tokenUsage, outcomes, doctor) {
     preambleByHarness: byHarness,
     sunsetVerdict,
     doctor: normalizeDoctor(doctor),
+    costImpact,
+    estimated_associated_model_cost_usd: costImpact.estimated_associated_model_cost_usd,
+    weighted_intervention_steps: costImpact.weighted_intervention_steps,
+    causal_ab: costImpact.causal_ab,
   };
 }
 

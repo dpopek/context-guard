@@ -13,9 +13,10 @@ from tests.helpers import read_outcomes_ledger, read_session_state
 
 
 def test_constants_and_ledger_path_helper(tmp_path: Path) -> None:
-    assert outcomes.SCHEMA_VERSION == 3
-    assert outcomes.OUTCOMES == ("applied", "targeted_followup", "full_bypass", "shell_bypass")
-    assert outcomes.ROW_KEYS == ("total", *outcomes.OUTCOMES)
+    assert outcomes.SCHEMA_VERSION == 4
+    assert outcomes.RECOVERY_KEYS == ("none", "targeted", "full", "pending_or_unknown")
+    assert outcomes.REGRET_KEYS == ("none", "suspected", "confirmed", "unknown")
+    assert outcomes.EVIDENCE_KEYS == ("observed", "heuristic", "replay", "causal_ab")
     assert not hasattr(outcomes, "WINDOW_STEPS")
     assert not hasattr(outcomes, "COVERAGE_THRESHOLD")
     assert outcomes.OUTCOMES_KINDS == outcomes.INTERVENTION_KINDS
@@ -30,18 +31,31 @@ def test_load_outcomes_normalises_rows_and_drops_garbage(tmp_path: Path) -> None
     ledger.write_text(
         json.dumps(
             {
-                "by_key": {"claude|m|outline": {"total": "7", "targeted": None, "bogus": 1}, "bad": 3},
+                "schema_version": 4,
+                "by_key": {"claude|m|outline": {"total": "7", "recovery": {"targeted": "2"}, "bogus": 1}, "bad": 3},
                 "updated_at": "2026-11-13T00:00:00+00:00",
             }
         ),
         encoding="utf-8",
     )
     data = outcomes.load_outcomes(ledger)
-    expected_row = {key: 0 for key in outcomes.ROW_KEYS}
-    expected_row["total"] = 7
-    assert set(data.keys()) == {"schema_version", "updated_at", "by_key"}
-    assert data["schema_version"] == outcomes.SCHEMA_VERSION
-    assert data["by_key"] == {"claude|m|outline": expected_row}
+    assert set(data.keys()) == {
+        "schema_version", "updated_at", "by_key", "step_ledger",
+        "archived_max_step_by_session", "archived_step_keys", "open_windows",
+        "unattributed_anon", "late_unattributed",
+    }
+    assert data["schema_version"] == 4
+    assert data["by_key"] == {
+        "claude|m|outline": {
+            "total": 7,
+            "applied": 0,
+            "recovery": {"none": 0, "targeted": 2, "full": 0, "pending_or_unknown": 0},
+            "regret": {"none": 0, "suspected": 0, "confirmed": 0, "unknown": 0},
+            "evidence": {"observed": 0, "heuristic": 0, "replay": 0, "causal_ab": 0},
+            "weighted_turns": 0.0,
+            "archived_weighted_turns": 0.0,
+        }
+    }
     assert outcomes.load_outcomes(tmp_path / "missing.json")["by_key"] == {}
 
     corrupt = tmp_path / "corrupt.json"
@@ -86,7 +100,9 @@ def test_record_direct_outcome_aggregates_and_quarantines_corrupt_ledger(
     out_row = data["by_key"]["claude|claude-opus-4-6|outline"]
     assert out_row["total"] == 1
     assert out_row["applied"] == 1
-    assert out_row["targeted_followup"] == 1
+    assert out_row["recovery"]["targeted"] == 1
+    assert out_row["regret"]["unknown"] == 1
+    assert out_row["evidence"]["heuristic"] == 1
 
     # Corrupt ledger is quarantined instead of crashing.
     bad_ledger = tmp_path / "bad_outcomes.json"
@@ -125,12 +141,12 @@ def test_load_and_record_outcomes_reset_legacy_v1_and_v2_schemas(tmp_path: Path)
             encoding="utf-8",
         )
         loaded = outcomes.load_outcomes(ledger)
-        assert loaded["schema_version"] == 3
+        assert loaded["schema_version"] == 4
         assert loaded["by_key"] == {}
 
         outcomes.record_direct_outcome("antigravity", "m", "outline_pull", "applied", ledger)
         persisted = json.loads(ledger.read_text(encoding="utf-8"))
-        assert persisted["schema_version"] == 3
+        assert persisted["schema_version"] == 4
         assert set(persisted["by_key"]) == {"antigravity|m|outline_pull"}
         assert persisted["by_key"]["antigravity|m|outline_pull"]["applied"] == 1
 
@@ -151,7 +167,7 @@ def test_e2e_transcript_auto_outline_targeted_followup_is_one_shot(tmp_path: Pat
     )
     assert r1["decision"] == "deny" and "AUTO-OUTLINE" in r1["reason"]
     row = read_outcomes_ledger(state_dir)["by_key"]["antigravity|unknown|outline"]
-    assert row["total"] == 1 and row["applied"] == 1 and row["targeted_followup"] == 0
+    assert row["total"] == 1 and row["applied"] == 1 and row["recovery"]["targeted"] == 0
 
     r2 = ptu.evaluate_hook(
         {
@@ -163,7 +179,7 @@ def test_e2e_transcript_auto_outline_targeted_followup_is_one_shot(tmp_path: Pat
     )
     assert r2["decision"] == "allow"
     row = read_outcomes_ledger(state_dir)["by_key"]["antigravity|unknown|outline"]
-    assert row["total"] == 1 and row["applied"] == 1 and row["targeted_followup"] == 1
+    assert row["total"] == 1 and row["applied"] == 1 and row["recovery"]["targeted"] == 1 and row["regret"]["unknown"] == 1
 
     r3 = ptu.evaluate_hook(
         {
@@ -175,7 +191,7 @@ def test_e2e_transcript_auto_outline_targeted_followup_is_one_shot(tmp_path: Pat
     )
     assert r3["decision"] == "allow"
     row = read_outcomes_ledger(state_dir)["by_key"]["antigravity|unknown|outline"]
-    assert row["total"] == 1 and row["applied"] == 1 and row["targeted_followup"] == 1
+    assert row["total"] == 1 and row["applied"] == 1 and row["recovery"]["targeted"] == 1
 
 
 def test_e2e_unwrapped_sibling_read_clears_pending_on_both_files(tmp_path: Path) -> None:
@@ -207,7 +223,7 @@ def test_e2e_unwrapped_sibling_read_clears_pending_on_both_files(tmp_path: Path)
     )
     assert r2["decision"] == "allow"
     row = read_outcomes_ledger(state_dir)["by_key"]["antigravity|unknown|outline"]
-    assert row["total"] == 1 and row["applied"] == 1 and row["targeted_followup"] == 1
+    assert row["total"] == 1 and row["applied"] == 1 and row["recovery"]["targeted"] == 1
 
     files_state = read_session_state(state_dir)["files"]
     for entry in files_state.values():
@@ -248,7 +264,7 @@ def test_e2e_small_twg_inline_read_does_not_set_pending_followup(
         state_dir=str(state_dir),
     )
     row = read_outcomes_ledger(state_dir)["by_key"]["antigravity|unknown|outline"]
-    assert row["total"] == 1 and row["applied"] == 1 and row["targeted_followup"] == 0
+    assert row["total"] == 1 and row["applied"] == 1 and row["recovery"]["targeted"] == 0
 
 
 def test_e2e_outline_pull_followed_by_unbounded_read_records_full_bypass(tmp_path: Path) -> None:
@@ -267,7 +283,7 @@ def test_e2e_outline_pull_followed_by_unbounded_read_records_full_bypass(tmp_pat
         cli_harness="claude",
     )
     row = read_outcomes_ledger(state_dir)["by_key"]["claude|unknown|outline_pull"]
-    assert row["total"] == 1 and row["applied"] == 1 and row["full_bypass"] == 1 and row["targeted_followup"] == 0
+    assert row["total"] == 1 and row["applied"] == 1 and row["recovery"]["full"] == 1 and row["regret"]["suspected"] == 1 and row["recovery"]["targeted"] == 0
 
 
 def test_e2e_outline_pull_shell_bypass_claude_vs_codex(tmp_path: Path) -> None:
@@ -286,7 +302,7 @@ def test_e2e_outline_pull_shell_bypass_claude_vs_codex(tmp_path: Path) -> None:
         cli_harness="claude",
     )
     cl_row = read_outcomes_ledger(cl_state)["by_key"]["claude|unknown|outline_pull"]
-    assert cl_row["total"] == 1 and cl_row["applied"] == 1 and cl_row["shell_bypass"] == 1
+    assert cl_row["total"] == 1 and cl_row["applied"] == 1 and cl_row["recovery"]["full"] == 1 and cl_row["regret"]["suspected"] == 1
 
     cx_state = tmp_path / "cx_state"
     ptu.evaluate_hook(
@@ -300,7 +316,7 @@ def test_e2e_outline_pull_shell_bypass_claude_vs_codex(tmp_path: Path) -> None:
         cli_harness="codex",
     )
     cx_row = read_outcomes_ledger(cx_state)["by_key"]["codex|unknown|outline_pull"]
-    assert cx_row["total"] == 1 and cx_row["applied"] == 1 and cx_row["targeted_followup"] == 1 and cx_row["shell_bypass"] == 0
+    assert cx_row["total"] == 1 and cx_row["applied"] == 1 and cx_row["recovery"]["targeted"] == 1 and cx_row["recovery"]["full"] == 0
 
     ptu.evaluate_hook(
         {"session_id": "cx-1", "tool_name": "exec_command", "tool_input": {"cmd": f"cat {target}"}},
@@ -308,7 +324,7 @@ def test_e2e_outline_pull_shell_bypass_claude_vs_codex(tmp_path: Path) -> None:
         cli_harness="codex",
     )
     cx_row = read_outcomes_ledger(cx_state)["by_key"]["codex|unknown|outline_pull"]
-    assert cx_row["total"] == 1 and cx_row["applied"] == 1 and cx_row["targeted_followup"] == 1 and cx_row["shell_bypass"] == 0
+    assert cx_row["total"] == 1 and cx_row["applied"] == 1 and cx_row["recovery"]["targeted"] == 1 and cx_row["recovery"]["full"] == 0
 
     cx_cat_state = tmp_path / "cx_cat_state"
     ptu.evaluate_hook(
@@ -322,7 +338,7 @@ def test_e2e_outline_pull_shell_bypass_claude_vs_codex(tmp_path: Path) -> None:
         cli_harness="codex",
     )
     cx_cat_row = read_outcomes_ledger(cx_cat_state)["by_key"]["codex|unknown|outline_pull"]
-    assert cx_cat_row["total"] == 1 and cx_cat_row["applied"] == 1 and cx_cat_row["shell_bypass"] == 1 and cx_cat_row["targeted_followup"] == 0
+    assert cx_cat_row["total"] == 1 and cx_cat_row["applied"] == 1 and cx_cat_row["recovery"]["full"] == 1 and cx_cat_row["recovery"]["targeted"] == 0
 
 
 def test_e2e_followup_max_lines_250_boundary_bounded_and_unbounded_tail(tmp_path: Path) -> None:
@@ -346,7 +362,7 @@ def test_e2e_followup_max_lines_250_boundary_bounded_and_unbounded_tail(tmp_path
             state_dir=str(state_dir),
         )
         row = read_outcomes_ledger(state_dir)["by_key"]["antigravity|unknown|outline_pull"]
-        assert (row["targeted_followup"], row["full_bypass"]) == (exp_targ, exp_full)
+        assert (row["recovery"]["targeted"], row["recovery"]["full"]) == (exp_targ, exp_full)
 
 
 def test_e2e_cold_shell_read_does_not_create_state_dir(tmp_path: Path) -> None:
@@ -379,7 +395,7 @@ def test_e2e_stale_sha256_shell_cat_clears_pending_without_bypass(tmp_path: Path
         cli_harness="claude",
     )
     row = read_outcomes_ledger(state_dir)["by_key"]["claude|unknown|outline_pull"]
-    assert row["total"] == 1 and row["applied"] == 1 and row["shell_bypass"] == 0
+    assert row["total"] == 1 and row["applied"] == 1 and row["recovery"]["full"] == 0
     assert "pending_followup_kind" not in read_session_state(state_dir)["files"][os.path.realpath(target)]
 
 
@@ -399,7 +415,7 @@ def test_e2e_antigravity_run_command_uses_cwd_for_outline_pull_and_shell_bypass(
         state_dir=str(state_dir),
     )
     row = read_outcomes_ledger(state_dir)["by_key"]["antigravity|unknown|outline_pull"]
-    assert row["total"] == 1 and row["applied"] == 1 and row["shell_bypass"] == 1
+    assert row["total"] == 1 and row["applied"] == 1 and row["recovery"]["full"] == 1 and row["regret"]["suspected"] == 1
 
 
 def test_e2e_small_twg_inline_read_clears_prior_outline_pull_pending_flag(
@@ -435,4 +451,203 @@ def test_e2e_small_twg_inline_read_clears_prior_outline_pull_pending_flag(
         state_dir=str(state_dir),
     )
     row = read_outcomes_ledger(state_dir)["by_key"]["antigravity|unknown|outline_pull"]
-    assert row["total"] == 1 and row["applied"] == 1 and row["targeted_followup"] == 0 and row["full_bypass"] == 0
+    assert row["total"] == 1 and row["applied"] == 1 and row["recovery"]["targeted"] == 0 and row["recovery"]["full"] == 0
+
+
+def test_shadow_mode_invalidates_on_file_edit_compaction_and_rewind_and_hashes_paths_0600(
+    tmp_path: Path,
+) -> None:
+    from hooks import telemetry
+
+    state_dir = tmp_path / "state"
+    shadow_path = telemetry.shadow_path_for(str(state_dir))
+    assert shadow_path == state_dir / "shadow.json"
+    secret_file = tmp_path / "secret_customer_file.py"
+    secret_file.write_text("x = 1\n", encoding="utf-8")
+    canon = os.path.realpath(secret_file)
+    hashed = telemetry.pseudonymize_shadow_path(canon)
+    assert len(hashed) == 32 and hashed == telemetry.pseudonymize_shadow_path(canon)
+    assert "secret_customer_file" not in hashed
+
+    assert telemetry.record_shadow_read("sess-1", canon, 1, 50, 2, 1, "sha-a", min_tier=2, shadow_path=shadow_path, now_ts=1_000.0)
+    assert telemetry.load_shadow_ledger(shadow_path, now_ts=1_000.0)["sessions"]["sess-1"]["paths"][hashed]["reads"] == []
+    assert telemetry.record_shadow_read("sess-1", canon, 1, 50, 3, 2, "sha-a", min_tier=2, shadow_path=shadow_path, now_ts=1_001.0)
+    assert telemetry.record_shadow_read("sess-1", canon, 51, 90, 6, 3, "sha-a", min_tier=2, shadow_path=shadow_path, now_ts=1_002.0)
+
+    if os.name == "posix":
+        assert (shadow_path.stat().st_mode & 0o777) == 0o600
+    raw_shadow_text = shadow_path.read_text(encoding="utf-8")
+    assert "secret_customer_file" not in raw_shadow_text
+    assert not (state_dir / "stats.json").exists()
+    assert not (state_dir / ".context_guard_state.json").exists()
+
+    # Compaction drops reads at or before checkpoint_step=3, preserves step 6.
+    assert telemetry.invalidate_shadow_ledger(
+        session_id="sess-1", checkpoint_step=3, shadow_path=shadow_path, now_ts=1_003.0
+    )
+    reads_after_compact = telemetry.load_shadow_ledger(shadow_path, now_ts=1_003.0)["sessions"]["sess-1"]["paths"][hashed]["reads"]
+    assert reads_after_compact == [[51, 90, 6, 3]]
+
+    # Rewind drops reads at or above max_step=6 when inclusive_rewind=True.
+    assert telemetry.record_shadow_read("sess-1", canon, 1, 20, 4, 2, "sha-a", min_tier=2, shadow_path=shadow_path, now_ts=1_004.0)
+    assert telemetry.invalidate_shadow_ledger(
+        session_id="sess-1", max_step=6, inclusive_rewind=True, shadow_path=shadow_path, now_ts=1_005.0
+    )
+    reads_after_rewind = telemetry.load_shadow_ledger(shadow_path, now_ts=1_005.0)["sessions"]["sess-1"]["paths"][hashed]["reads"]
+    assert reads_after_rewind == [[1, 20, 4, 2]]
+
+    # File edit mismatch invalidates entry; changed content_sha256 in record_shadow_read resets reads.
+    assert telemetry.invalidate_shadow_ledger(
+        session_id="sess-1", raw_path=str(secret_file), content_sha256="sha-b", shadow_path=shadow_path, now_ts=1_006.0
+    )
+    assert hashed not in telemetry.load_shadow_ledger(shadow_path, now_ts=1_006.0)["sessions"].get("sess-1", {}).get("paths", {})
+    assert telemetry.record_shadow_read("sess-1", canon, 1, 20, 7, 2, "sha-b", min_tier=2, shadow_path=shadow_path, now_ts=1_007.0)
+    assert telemetry.record_shadow_read("sess-1", canon, 21, 40, 8, 2, "sha-c", min_tier=2, shadow_path=shadow_path, now_ts=1_008.0)
+    assert telemetry.load_shadow_ledger(shadow_path, now_ts=1_008.0)["sessions"]["sess-1"]["paths"][hashed]["reads"] == [[21, 40, 8, 2]]
+
+    # Retention bounds: <= 16 sessions, <= 200 hashes/session, 7-day TTL.
+    for idx in range(20):
+        assert telemetry.record_shadow_read(
+            f"bulk-{idx}", str(tmp_path / f"f{idx}.py"), 1, 10, 1, 2, "sha", shadow_path=shadow_path, now_ts=2_000.0 + idx
+        )
+    loaded = telemetry.load_shadow_ledger(shadow_path, now_ts=2_030.0)
+    assert len(loaded["sessions"]) <= 16
+    for i in range(205):
+        assert telemetry.record_shadow_read(
+            "bulk-19", str(tmp_path / f"many_{i}.py"), 1, 10, 1, 2, "sha", shadow_path=shadow_path, now_ts=2_100.0 + i
+        )
+    assert len(telemetry.load_shadow_ledger(shadow_path, now_ts=2_400.0)["sessions"]["bulk-19"]["paths"]) <= 200
+    assert telemetry.load_shadow_ledger(shadow_path, now_ts=2_400.0 + 7 * 86400 + 1)["sessions"] == {}
+
+
+def test_v3_migration_maps_full_bypass_to_suspected_and_targeted_to_unknown_never_confirmed(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "outcomes.json"
+    ledger.write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "updated_at": "2026-11-10T00:00:00+00:00",
+                "by_key": {
+                    "claude|claude-sonnet-4-6|outline": {
+                        "total": 10,
+                        "applied": 9,
+                        "targeted_followup": 3,
+                        "full_bypass": 2,
+                        "shell_bypass": 1,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    migrated = outcomes.load_outcomes(ledger)
+    assert migrated["schema_version"] == 4
+    row = migrated["by_key"]["claude|claude-sonnet-4-6|outline"]
+    assert row["legacy_v3"] is True
+    assert row["total"] == 10
+    assert row["applied"] == 9
+    assert row["recovery"] == {"none": 0, "targeted": 3, "full": 3, "pending_or_unknown": 0}
+    assert row["regret"] == {"none": 0, "suspected": 3, "confirmed": 0, "unknown": 3}
+    assert row["evidence"] == {"observed": 0, "heuristic": 6, "replay": 0, "causal_ab": 0}
+    assert row["weighted_turns"] == 0.0
+    assert row["archived_weighted_turns"] == 0.0
+    rates = outcomes.compute_regret_rates(row)
+    assert rates["confirmed_regret_rate"] == 0.0
+    assert rates["suspected_regret_rate"] == pytest.approx(1.0)
+
+    v2_ledger = tmp_path / "v2.json"
+    v2_ledger.write_text(json.dumps({"schema_version": 2, "by_key": {"a|b|outline": {"total": 5}}}), encoding="utf-8")
+    assert outcomes.load_outcomes(v2_ledger)["by_key"] == {}
+
+
+def test_single_ledger_step_weights_survive_mid_write_failure_and_idempotent_event_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ledger = tmp_path / "outcomes.json"
+    outcomes.record_direct_outcome(
+        "claude", "claude-sonnet-4-6", "outline", "applied", ledger, session_id="s1", step_idx=1, call_id="c1"
+    )
+    outcomes.record_direct_outcome(
+        "claude", "claude-sonnet-4-6", "range_trim", "applied", ledger, session_id="s1", step_idx=1, call_id="c2"
+    )
+    # Idempotent replay of c1:outline must not add duplicate weight or increment total/applied.
+    outcomes.record_direct_outcome(
+        "claude", "claude-sonnet-4-6", "outline", "applied", ledger, session_id="s1", step_idx=1, call_id="c1"
+    )
+    state = outcomes.load_outcomes(ledger)
+    assert state["by_key"]["claude|claude-sonnet-4-6|outline"]["total"] == 1
+    assert state["by_key"]["claude|claude-sonnet-4-6|outline"]["weighted_turns"] == pytest.approx(0.5)
+    assert state["by_key"]["claude|claude-sonnet-4-6|range_trim"]["weighted_turns"] == pytest.approx(0.5)
+
+    real_replace = os.replace
+
+    def fail_once(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        raise OSError("simulated mid-write crash")
+
+    monkeypatch.setattr(os, "replace", fail_once)
+    outcomes.record_direct_outcome(
+        "claude", "claude-sonnet-4-6", "outline", "applied", ledger, session_id="s1", step_idx=2, call_id="c3"
+    )
+    monkeypatch.setattr(os, "replace", real_replace)
+    after_crash = outcomes.load_outcomes(ledger)
+    assert after_crash["by_key"]["claude|claude-sonnet-4-6|outline"]["weighted_turns"] == pytest.approx(0.5)
+
+    outcomes.record_direct_outcome(
+        "claude", "claude-sonnet-4-6", "outline", "applied", ledger, session_id="s1", step_idx=2, call_id="c3"
+    )
+    after_retry = outcomes.load_outcomes(ledger)
+    assert after_retry["by_key"]["claude|claude-sonnet-4-6|outline"]["weighted_turns"] == pytest.approx(1.5)
+
+
+def test_outcomes_unattributed_anon_archived_terminal_steps_and_open_windows(tmp_path: Path) -> None:
+    ledger = tmp_path / "outcomes.json"
+    outcomes.record_direct_outcome("claude", "claude-sonnet-4-6", "outline", "applied", ledger)
+    anon_state = outcomes.load_outcomes(ledger)
+    assert anon_state["step_ledger"] == {}
+    assert anon_state["unattributed_anon"]["total"] == 1
+    assert anon_state["by_key"]["claude|claude-sonnet-4-6|outline"]["weighted_turns"] == 0.0
+
+    for step in range(132):
+        outcomes.record_direct_outcome(
+            "claude",
+            "claude-sonnet-4-6",
+            "range_trim",
+            "applied",
+            ledger,
+            session_id="s-arch",
+            step_idx=step,
+            call_id=f"c-{step}",
+        )
+    archived_state = outcomes.load_outcomes(ledger)
+    assert len(archived_state["step_ledger"]) == 128
+    assert archived_state["archived_max_step_by_session"]["s-arch"] >= 3
+    assert archived_state["by_key"]["claude|claude-sonnet-4-6|range_trim"]["weighted_turns"] == pytest.approx(132.0)
+
+    # Late event for already archived step must record to late_unattributed only.
+    outcomes.record_direct_outcome(
+        "claude",
+        "claude-sonnet-4-6",
+        "range_trim",
+        "applied",
+        ledger,
+        session_id="s-arch",
+        step_idx=1,
+        call_id="c-late",
+    )
+    after_late = outcomes.load_outcomes(ledger)
+    assert "s-arch:1" not in after_late["step_ledger"]
+    assert after_late["late_unattributed"]["total"] == 1
+    assert after_late["by_key"]["claude|claude-sonnet-4-6|range_trim"]["weighted_turns"] == pytest.approx(132.0)
+
+    # Open window closes cleanly into recovery.none / regret.none / evidence.observed.
+    outcomes.open_outcome_window(
+        "claude", "claude-sonnet-4-6", "outline", "s-win", "/tmp/a.py", step_idx=5, regret_window_steps=3, ledger_path=ledger
+    )
+    outcomes.close_outcome_windows("s-win", current_step=9, ledger_path=ledger)
+    win_row = outcomes.load_outcomes(ledger)["by_key"]["claude|claude-sonnet-4-6|outline"]
+    assert win_row["recovery"]["none"] == 1
+    assert win_row["regret"]["none"] == 1
+    assert win_row["evidence"]["observed"] == 1
+

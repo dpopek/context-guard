@@ -27,13 +27,18 @@ from bin.codex_toml import (  # noqa: E402
 )
 from bin.harness_status import (  # noqa: E402
     CLAUDE_MATCHER,
+    CLAUDE_POST_MATCHER as CLAUDE_POST_MATCHER,
     CODEX_MATCHER,
+    CODEX_POST_MATCHER as CODEX_POST_MATCHER,
     CURSOR_MATCHER,
+    CURSOR_POST_MATCHER as CURSOR_POST_MATCHER,
     DEFAULT_CLAUDE_SETTINGS,
     DEFAULT_CODEX_HOOKS,
     DEFAULT_CURSOR_HOOKS,
     check_status as check_harness_status,
+    claude_post_hook_groups,
     merge_harness_matcher,
+    without_cg_handlers,
 )
 from bin.instruction_block import DEFAULT_INSTRUCTION_FILES, DEFAULT_SHIM_BIN_DIR, install_outline_pull, shim_installed, uninstall_outline_pull  # noqa: E402
 from bin.migration_guard import RollbackJournal, StagedPackTransaction, preflight_migration_check  # noqa: E402
@@ -60,10 +65,6 @@ DEFAULT_ANTIGRAVITY_EXTENSIONS = Path.home() / ".antigravity" / "extensions"
 DEFAULT_ANTIGRAVITY_IDE_EXTENSIONS = Path.home() / ".antigravity-ide" / "extensions"
 
 EXTENSION_ID = "advox.context-guard-statusbar"
-# PostToolUse shell-output measurement: shell tools only.
-CLAUDE_POST_MATCHER = "Bash"
-CODEX_POST_MATCHER = "^(Bash|shell|exec_command|exec)$"
-CURSOR_POST_MATCHER = "Shell|run_terminal_cmd"
 
 _SAFE_HOOK_PATH_RE = re.compile(r"[A-Za-z0-9_./:-]+")
 
@@ -93,16 +94,6 @@ def format_hook_script_path(path: Path) -> str:
         return posix_str
     escaped = posix_str.replace('"', '\\"')
     return f'"{escaped}"'
-
-
-_CG_HOOK_SCRIPTS = (
-    "/hooks/pre_tool_use.py",
-    "/hooks/pre_compact.py",
-    "/hooks/post_tool_use.py",
-    "\\hooks\\pre_tool_use.py",
-    "\\hooks\\pre_compact.py",
-    "\\hooks\\post_tool_use.py",
-)
 
 
 def _expand_pack_command(template: str, py_cmd: str, raw_ws: str | None) -> str | None:
@@ -177,60 +168,6 @@ def _collect_pack_contributions(
     return matchers, hooks_by_harness, frozenset(managed_cmds), tuple(managed_frags), frozenset(managed_events)
 
 
-def _is_cg_command(
-    cmd: Any,
-    managed_cmds: frozenset[str] = frozenset(),
-    managed_frags: tuple[tuple[str, ...], ...] = (),
-) -> bool:
-    """True for a Context-Guard hook command or verified pack-managed installer hook."""
-    if not isinstance(cmd, str):
-        return False
-    if cmd in managed_cmds:
-        return True
-    if any(script in cmd for script in _CG_HOOK_SCRIPTS):
-        return "--harness" in cmd or "context-guard" in cmd
-    norm_cmd = cmd.replace("\\", "/")
-    for frags in managed_frags:
-        pos = 0
-        matched = True
-        for frag in frags:
-            idx = norm_cmd.find(frag, pos)
-            if idx < 0:
-                matched = False
-                break
-            pos = idx + len(frag)
-        if matched:
-            return True
-    return False
-
-
-def _without_cg_handlers(
-    groups: list[Any],
-    managed_cmds: frozenset[str] = frozenset(),
-    managed_frags: tuple[tuple[str, ...], ...] = (),
-) -> list[Any]:
-    """Drop Context-Guard handlers from hook groups, keeping every other tool's handlers and groups."""
-    kept: list[Any] = []
-    for group in groups:
-        if not isinstance(group, dict):
-            kept.append(group)
-            continue
-        if _is_cg_command(group.get("command"), managed_cmds, managed_frags):
-            continue
-        handlers = group.get("hooks")
-        if isinstance(handlers, list):
-            rest = [
-                h for h in handlers
-                if not (isinstance(h, dict) and _is_cg_command(h.get("command"), managed_cmds, managed_frags))
-            ]
-            if len(rest) != len(handlers):
-                if not rest:
-                    continue
-                group = {**group, "hooks": rest}
-        kept.append(group)
-    return kept
-
-
 def _atomic_write_text(
     path: Path,
     content: str,
@@ -275,6 +212,8 @@ def _update_nested_hooks_json(
     post_events: tuple[str, ...] = (),
     post_matcher: str | None = None,
     post_handler_extra: dict[str, Any] | None = None,
+    post_groups: Sequence[dict[str, Any]] | None = None,
+    unmatchered_events: Sequence[tuple[str, str]] = (),
     extra_hooks: Sequence[InstallerHookSpec] = (),
     managed_cmds: frozenset[str] = frozenset(),
     managed_frags: tuple[tuple[str, ...], ...] = (),
@@ -296,13 +235,14 @@ def _update_nested_hooks_json(
         data["hooks"] = hooks_root
 
     events_to_clean = (
-        "PreToolUse", "PreCompact", "PostToolUse", "PostToolUseFailure", "SessionStart", "Stop",
+        "PreToolUse", "PreCompact", "PostToolUse", "PostToolUseFailure", "PostToolBatch",
+        "SessionStart", "SessionEnd", "Stop",
         *sorted(managed_events | {s.event_name for s in extra_hooks}),
     )
     for evt_key in dict.fromkeys(events_to_clean):
         existing = hooks_root.get(evt_key)
         if isinstance(existing, list):
-            filtered = _without_cg_handlers(existing, managed_cmds, managed_frags)
+            filtered = without_cg_handlers(existing, managed_cmds, managed_frags)
             if filtered:
                 hooks_root[evt_key] = filtered
             else:
@@ -316,7 +256,12 @@ def _update_nested_hooks_json(
         hooks_root.setdefault("PreCompact", []).append(
             {"hooks": [{"type": "command", "command": compact_cmd}]}
         )
-    if post_cmd is not None:
+    if post_groups is not None:
+        for evt_key in post_events:
+            hooks_root.setdefault(evt_key, []).extend(
+                {"matcher": g["matcher"], "hooks": [dict(h) for h in g["hooks"]]} for g in post_groups
+            )
+    elif post_cmd is not None:
         for evt_key in post_events:
             hooks_root.setdefault(evt_key, []).append(
                 {
@@ -324,6 +269,8 @@ def _update_nested_hooks_json(
                     "hooks": [{"type": "command", "command": post_cmd, **(post_handler_extra or {})}],
                 }
             )
+    for evt_key, cmd in unmatchered_events:
+        hooks_root.setdefault(evt_key, []).append({"hooks": [{"type": "command", "command": cmd}]})
     for spec in extra_hooks:
         handler: dict[str, Any] = {"type": "command", "command": spec.command}
         if spec.timeout is not None:
@@ -385,7 +332,7 @@ def _update_cursor_hooks_json(
     for evt_key in dict.fromkeys(events_to_clean):
         existing = hooks_root.get(evt_key)
         if isinstance(existing, list):
-            filtered = _without_cg_handlers(existing, managed_cmds, managed_frags)
+            filtered = without_cg_handlers(existing, managed_cmds, managed_frags)
             if filtered:
                 hooks_root[evt_key] = filtered
             else:
@@ -574,6 +521,7 @@ def install_all(
         compact_script = format_hook_script_path(Path(plugin_root) / "hooks" / "pre_compact.py")
         status_script = format_hook_script_path(Path(plugin_root) / "bin" / "cg_status.py")
         post_script = format_hook_script_path(Path(plugin_root) / "hooks" / "post_tool_use.py")
+        session_end_script = format_hook_script_path(Path(plugin_root) / "hooks" / "session_end.py")
 
         pack_matchers, pack_hooks, managed_cmds, managed_frags, managed_events = _collect_pack_contributions(
             py_cmd, workspace_root=workspace_root
@@ -581,6 +529,7 @@ def install_all(
         claude_matcher = merge_harness_matcher(CLAUDE_MATCHER, pack_matchers.get("claude", ()))
         cursor_matcher = merge_harness_matcher(CURSOR_MATCHER, pack_matchers.get("cursor", ()))
         codex_matcher = merge_harness_matcher(CODEX_MATCHER, pack_matchers.get("codex", ()), regex_anchored=True)
+        claude_post_cmd = f"{py_cmd} {post_script} --harness claude"
 
         claude_status, _ = _update_nested_hooks_json(
             claude_settings_path,
@@ -590,10 +539,12 @@ def install_all(
             dry_run=dry_run,
             statusline_cmd=f"{py_cmd} {status_script} --claude-hud",
             manage_statusline=True,
-            post_cmd=f"{py_cmd} {post_script} --harness claude",
             post_events=("PostToolUse", "PostToolUseFailure"),
-            post_matcher=CLAUDE_POST_MATCHER,
-            post_handler_extra={"async": True},
+            post_groups=claude_post_hook_groups(claude_post_cmd),
+            unmatchered_events=(
+                ("PostToolBatch", f"{claude_post_cmd} --event PostToolBatch"),
+                ("SessionEnd", f"{py_cmd} {session_end_script} --harness claude"),
+            ),
             extra_hooks=pack_hooks.get("claude", ()),
             managed_cmds=managed_cmds,
             managed_frags=managed_frags,

@@ -268,16 +268,19 @@ def test_system_python3_executes_mcp_auto_outline_and_silent_range_trim(tmp_path
         encoding="utf-8",
     )
 
+    cfg_path = cg_home / "config.json"
+    cfg_path.write_text(json.dumps({"read_confirm_policy": "bounded"}), encoding="utf-8")
     env = {
         **os.environ,
         "HOME": str(tmp_path),
         "CONTEXT_GUARD_HOME": str(cg_home),
         "CONTEXT_GUARD_STATE_DIR": str(state_dir),
+        "CONTEXT_GUARD_CONFIG_PATH": str(cfg_path),
     }
 
-    def _run_pre_tool(payload: dict[str, object]) -> dict[str, object]:
+    def _run_hook(rel_script: str, payload: dict[str, object], *extra_args: str) -> dict[str, object]:
         proc = subprocess.run(
-            [py, str(ROOT / "hooks" / "pre_tool_use.py")],
+            [py, str(ROOT / rel_script), *extra_args],
             input=json.dumps(payload),
             capture_output=True,
             text=True,
@@ -288,31 +291,40 @@ def test_system_python3_executes_mcp_auto_outline_and_silent_range_trim(tmp_path
         return json.loads(proc.stdout)
 
     # 1. Overlapping read_file gets silently trimmed to unread tail (StartLine=101)
-    r1 = _run_pre_tool(
-        {
-            "conversationId": "py39-read-smoke",
-            "stepIdx": 1,
-            "toolCall": {"name": "read_file", "args": {"Path": str(sample), "StartLine": 1, "EndLine": 100}},
-        }
-    )
+    p1: dict[str, object] = {
+        "conversationId": "py39-read-smoke",
+        "stepIdx": 1,
+        "toolCall": {
+            "id": "py39-r1",
+            "name": "read_file",
+            "args": {"Path": str(sample), "StartLine": 1, "EndLine": 100},
+        },
+    }
+    r1 = _run_hook("hooks/pre_tool_use.py", p1)
     assert r1.get("decision") == "allow"
-    r2 = _run_pre_tool(
-        {
-            "conversationId": "py39-read-smoke",
-            "stepIdx": 2,
-            "toolCall": {"name": "read_file", "args": {"Path": str(sample), "StartLine": 50, "EndLine": 150}},
-        }
-    )
+    _run_hook("hooks/post_tool_use.py", p1, "--harness", "antigravity")
+    p2: dict[str, object] = {
+        "conversationId": "py39-read-smoke",
+        "stepIdx": 2,
+        "toolCall": {
+            "id": "py39-r2",
+            "name": "read_file",
+            "args": {"Path": str(sample), "StartLine": 50, "EndLine": 150},
+        },
+    }
+    r2 = _run_hook("hooks/pre_tool_use.py", p2)
     assert r2.get("decision") == "allow"
     assert r2.get("overwrite") == {"StartLine": 101, "EndLine": 150}
+    _run_hook("hooks/post_tool_use.py", p2, "--harness", "antigravity")
 
     # 2. Large MCP steps/<N>/output.txt artifact is auto-outlined and denied on first touch
-    r_mcp = _run_pre_tool(
+    r_mcp = _run_hook(
+        "hooks/pre_tool_use.py",
         {
             "conversationId": "py39-read-smoke",
             "stepIdx": 3,
             "toolCall": {"name": "read_file", "args": {"Path": str(mcp_out)}},
-        }
+        },
     )
     assert r_mcp.get("decision") == "deny"
     assert "AUTO-OUTLINE" in str(r_mcp.get("reason", ""))

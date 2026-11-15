@@ -107,14 +107,15 @@ def test_checkpoint_resets_step_and_byte_counters_and_prunes_old_reads(
     state_file.write_text(
         json.dumps(
             {
+                "read_ledger_schema": 2,
                 "files": {
                     "/tmp/old.py": {
                         "sha256": "aaa",
-                        "reads": [[1, 100, 120], [101, 200, 250]],
+                        "reads": [[1, 100, 120, 2], [101, 200, 250, 2]],
                     },
                     "/tmp/mixed.py": {
                         "sha256": "bbb",
-                        "reads": [[1, 50, 200], [51, 100, 262]],
+                        "reads": [[1, 50, 200, 2], [51, 100, 262, 2]],
                     },
                 },
                 "last_compact_warn_step": 240,
@@ -155,7 +156,7 @@ def test_checkpoint_resets_step_and_byte_counters_and_prunes_old_reads(
     updated_state = json.loads(state_file.read_text(encoding="utf-8"))
     assert updated_state["last_checkpoint_step"] == 258
     assert "/tmp/old.py" not in updated_state["files"]
-    assert updated_state["files"]["/tmp/mixed.py"]["reads"] == [[51, 100, 262]]
+    assert updated_state["files"]["/tmp/mixed.py"]["reads"] == [[51, 100, 262, 2]]
 
 
 def test_multiple_checkpoints_use_latest_checkpoint_and_handle_malformed_jsonl(
@@ -264,9 +265,10 @@ def test_rewind_to_earlier_step_lowers_invocation_high_water_mark(
     state_file.write_text(
         json.dumps(
             {
+                "read_ledger_schema": 2,
                 "files": {
-                    "/tmp/early.md": {"sha256": "abc", "reads": [[1, -1, 2]]},
-                    "/tmp/late.md": {"sha256": "def", "reads": [[1, -1, 7]]},
+                    "/tmp/early.md": {"sha256": "abc", "reads": [[1, -1, 2, 2]]},
+                    "/tmp/late.md": {"sha256": "def", "reads": [[1, -1, 7, 2]]},
                 },
                 "max_step_idx": 25,
                 "max_inv_steps": 25,
@@ -290,7 +292,7 @@ def test_rewind_to_earlier_step_lowers_invocation_high_water_mark(
     assert updated["max_inv_steps"] == 5
     assert updated["max_step_idx"] == 5
     assert list(updated["files"]) == ["/tmp/early.md"]
-    assert updated["files"]["/tmp/early.md"]["reads"] == [[1, -1, 2]]
+    assert updated["files"]["/tmp/early.md"]["reads"] == [[1, -1, 2, 2]]
 
 
 def test_rewind_to_zero_in_pre_invocation_clears_cached_reads_and_cursor(
@@ -301,10 +303,11 @@ def test_rewind_to_zero_in_pre_invocation_clears_cached_reads_and_cursor(
     state_file.write_text(
         json.dumps(
             {
+                "read_ledger_schema": 2,
                 "files": {
                     "/tmp/skill.md": {
                         "sha256": "abc",
-                        "reads": [[1, -1, 2]],
+                        "reads": [[1, -1, 2, 2]],
                         "outlined": True,
                         "outlined_step": 2,
                     }

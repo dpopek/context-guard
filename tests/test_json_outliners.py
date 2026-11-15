@@ -146,7 +146,7 @@ def test_unredirected_twg_and_mcp_envelopes_preserve_physical_line_count(
     assert res2 == {"decision": "allow"}
     saved_twg = json.loads(state_file_in(state_twg).read_text(encoding="utf-8"))
     assert saved_twg["files"][twg_canon]["outlined_total_lines"] >= 20
-    assert saved_twg["files"][twg_canon]["reads"] == [[1, 1, 2]]
+    assert any([r["exec_start"], r["delivered_end"], r["step"]] == [1, 1, 2] for r in saved_twg["files"][twg_canon]["pending_reads"].values())
 
     res3 = evaluate_hook(
         {
@@ -189,7 +189,7 @@ def test_unredirected_twg_and_mcp_envelopes_preserve_physical_line_count(
     )
     assert out_m2.decision["decision"] == "allow"
     saved_mcp = json.loads(state_file_in(state_mcp).read_text(encoding="utf-8"))
-    assert saved_mcp["files"][mcp_canon]["reads"] == [[1, 1, 2]]
+    assert any([r["exec_start"], r["delivered_end"], r["step"]] == [1, 1, 2] for r in saved_mcp["files"][mcp_canon]["pending_reads"].values())
 
 
 def test_transition_from_unredirected_envelope_to_unwrap_guards_coordinate_space(
@@ -223,7 +223,7 @@ def test_transition_from_unredirected_envelope_to_unwrap_guards_coordinate_space
     out_a2 = handle_file_read_verdict(state_a, str(mcp_a), 1, 30, 0, 2, can_redirect_path=False)
     assert out_a2.decision["decision"] == "allow"
     saved_a2 = json.loads(state_file_in(state_a).read_text(encoding="utf-8"))
-    assert saved_a2["files"][mcp_a_canon]["reads"] == [[1, 30, 2]]
+    assert any([r["exec_start"], r["delivered_end"], r["step"]] == [1, 30, 2] for r in saved_a2["files"][mcp_a_canon]["pending_reads"].values())
     assert "unwrapped_path" not in saved_a2["files"][mcp_a_canon]
 
     out_a3 = handle_file_read_verdict(state_a, str(mcp_a), 1, 60, 0, 3, can_redirect_path=True)
@@ -238,11 +238,13 @@ def test_transition_from_unredirected_envelope_to_unwrap_guards_coordinate_space
     assert handle_file_read_verdict(state_b, str(mcp_b), 1, -1, 0, 1, can_redirect_path=False).decision["decision"] == "deny"
     assert handle_file_read_verdict(state_b, str(mcp_b), 1, 30, 0, 2, can_redirect_path=False).decision["decision"] == "allow"
 
-    out_b3 = handle_file_read_verdict(state_b, str(mcp_b), 1, 20, 0, 3, can_redirect_path=True)
+    out_b3 = handle_file_read_verdict(state_b, str(mcp_b), 1, 20, 0, 3, harness="claude", call_id="b3", can_redirect_path=True)
     assert out_b3.decision["decision"] == "allow"
     assert out_b3.decision["overwrite"] == {"Path": target_b_canon}
+    from tests.helpers import confirm_read_slice
 
-    out_b4 = handle_file_read_verdict(state_b, str(mcp_b), 1, 60, 0, 4, can_redirect_path=True)
+    confirm_read_slice("claude", state_b, target_b_canon, 1, 20, "b3")
+    out_b4 = handle_file_read_verdict(state_b, str(mcp_b), 1, 60, 0, 4, harness="claude", can_redirect_path=True)
     assert out_b4.decision["decision"] == "allow"
     assert out_b4.decision["overwrite"] == {"StartLine": 21, "EndLine": 60, "Path": target_b_canon}
 

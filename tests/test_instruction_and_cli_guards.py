@@ -22,150 +22,133 @@ from hooks.read_planner import (
 )
 from hooks.shell_parser import rewrite_quiet_cli_flags
 from hooks.telemetry import load_telemetry_stats
+from tests.helpers import ag_read
 
 
 def _load_ledger(state_dir: str | Path) -> dict[str, Any]:
     return json.loads((Path(state_dir) / ".context_guard_state.json").read_text(encoding="utf-8"))
 
 
+def _set_bounded_policy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = tmp_path / "cg_cfg.json"
+    cfg.write_text(json.dumps({"read_confirm_policy": "bounded"}), encoding="utf-8")
+    monkeypatch.setenv("CONTEXT_GUARD_CONFIG_PATH", str(cfg))
+    clear_config_cache()
+
+
 def test_instruction_files_and_large_markdown_allowed_cleanly_and_partial_trims(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    skill = tmp_path / "skills" / "demo" / "SKILL.md"
-    skill.parent.mkdir(parents=True)
-    skill.write_text(
-        "".join(f"## Section {i}\nBody {i}\n" for i in range(142)) + "End\n",
-        encoding="utf-8",
-    )  # 285 LOC
-    sd = str(tmp_path / "state")
-    canon = os.path.realpath(str(skill))
+    _set_bounded_policy(tmp_path, monkeypatch)
+    try:
+        skill = tmp_path / "skills" / "demo" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text(
+            "".join(f"## Section {i}\nBody {i}\n" for i in range(142)) + "End\n",
+            encoding="utf-8",
+        )  # 285 LOC
+        sd = str(tmp_path / "state")
+        canon = os.path.realpath(str(skill))
 
-    # Full read (1..-1) allowed cleanly and recorded as [1, 285, 1]
-    r1 = evaluate_hook(
-        {"conversationId": "c1", "stepIdx": 1, "toolCall": {"name": "read_file", "args": {"Path": str(skill)}}},
-        state_dir=sd,
-    )
-    assert r1 == {"decision": "allow"}
-    ledger = _load_ledger(sd)
-    assert ledger["files"][canon]["reads"] == [[1, 285, 1]]
-    stats = load_telemetry_stats(Path(sd) / "telemetry_stats.json")
-    assert stats["events"]["allowed_reads"] == 1
+        # Full read (1..-1) allowed cleanly and recorded as [1, 285, 1, 1] after PostToolUse
+        r1 = ag_read(skill, sd, step_idx=1, conv_id="c1", confirm=True)
+        assert r1 == {"decision": "allow"}
+        ledger = _load_ledger(sd)
+        assert ledger["files"][canon]["reads"] == [[1, 285, 1, 1]]
+        stats = load_telemetry_stats(Path(sd) / "telemetry_stats.json")
+        assert stats["events"]["allowed_reads"] == 1
 
-    # Partial read 1..50 followed by full read 1..-1 trims silently to 51..285
-    agents_md = tmp_path / "AGENTS.md"
-    agents_md.write_text(
-        "".join(f"## Rule {i}\nText {i}\n" for i in range(142)) + "Tail\n",
-        encoding="utf-8",
-    )  # 285 LOC
-    assert evaluate_hook(
-        {
-            "conversationId": "c2",
-            "stepIdx": 1,
-            "toolCall": {"name": "read_file", "args": {"Path": str(agents_md), "StartLine": 1, "EndLine": 50}},
-        },
-        state_dir=sd,
-    ) == {"decision": "allow"}
-    r_trim = evaluate_hook(
-        {"conversationId": "c2", "stepIdx": 2, "toolCall": {"name": "read_file", "args": {"Path": str(agents_md)}}},
-        state_dir=sd,
-    )
-    assert r_trim == {"decision": "allow", "overwrite": {"StartLine": 51, "EndLine": 285}}
-    canon_agents = os.path.realpath(str(agents_md))
-    assert _load_ledger(sd)["files"][canon_agents]["reads"] == [[1, 50, 1], [51, 285, 2]]
+        # Partial read 1..50 followed by full read 1..-1 trims silently to 51..285
+        agents_md = tmp_path / "AGENTS.md"
+        agents_md.write_text(
+            "".join(f"## Rule {i}\nText {i}\n" for i in range(142)) + "Tail\n",
+            encoding="utf-8",
+        )  # 285 LOC
+        assert ag_read(agents_md, sd, start_line=1, end_line=50, step_idx=1, conv_id="c2", confirm=True) == {"decision": "allow"}
+        r_trim = ag_read(agents_md, sd, step_idx=2, conv_id="c2", confirm=True)
+        assert r_trim == {"decision": "allow", "overwrite": {"StartLine": 51, "EndLine": 285}}
+        canon_agents = os.path.realpath(str(agents_md))
+        assert _load_ledger(sd)["files"][canon_agents]["reads"] == [[1, 285, 2, 1]]
 
-    # 401-LOC CLAUDE.md also allowed directly in v4 without blocking
-    claude_big = tmp_path / "CLAUDE.md"
-    claude_big.write_text(
-        "".join(f"## Heading {i}\nBody {i}\n" for i in range(200)) + "Extra\n",
-        encoding="utf-8",
-    )  # 401 LOC
-    r_big = evaluate_hook(
-        {"conversationId": "c3", "stepIdx": 1, "toolCall": {"name": "read_file", "args": {"Path": str(claude_big)}}},
-        state_dir=str(tmp_path / "state_big"),
-    )
-    assert r_big == {"decision": "allow"}
+        # 401-LOC CLAUDE.md also allowed directly in v4 without blocking
+        claude_big = tmp_path / "CLAUDE.md"
+        claude_big.write_text(
+            "".join(f"## Heading {i}\nBody {i}\n" for i in range(200)) + "Extra\n",
+            encoding="utf-8",
+        )  # 401 LOC
+        r_big = ag_read(claude_big, tmp_path / "state_big", step_idx=1, conv_id="c3", confirm=True)
+        assert r_big == {"decision": "allow"}
+    finally:
+        clear_config_cache()
 
 
 def test_legacy_minus_one_interval_normalized_before_merge_intervals() -> None:
-    assert normalize_recorded_ranges([[1, 100, 1], [101, -1, 2]], 285) == [
-        [1, 100, 1],
-        [101, 285, 2],
+    assert normalize_recorded_ranges([[1, 100, 1, 2], [101, -1, 2, 2]], 285) == [
+        [1, 100, 1, 2],
+        [101, 285, 2, 2],
     ]
-    assert covering_read_step([[1, 100, 1], [101, -1, 2]], 1, 285, target_lines=285) == 2
-    assert covering_read_step([[1, 285, 1]], 1, -1, target_lines=285) == 1
-    assert trim_partially_covered_range([[1, 50, 1]], 1, -1, target_lines=285) == (51, 285)
+    assert covering_read_step([[1, 100, 1, 2], [101, -1, 2, 2]], 1, 285, target_lines=285) == 2
+    assert covering_read_step([[1, 285, 1, 2]], 1, -1, target_lines=285) == 1
+    assert trim_partially_covered_range([[1, 50, 1, 2]], 1, -1, target_lines=285) == (51, 285)
     assert normalize_effective_bounds(0, 10, 285) is None
     assert normalize_effective_bounds(1, -5, 285) is None
     assert normalize_effective_bounds(300, 350, 285) is None
-    assert covering_read_step([[1, 285, 1]], 0, 10, target_lines=285) is None
-    assert covering_read_step([[1, 285, 1]], 1, -5, target_lines=285) is None
+    assert covering_read_step([[1, 285, 1, 2]], 0, 10, target_lines=285) is None
+    assert covering_read_step([[1, 285, 1, 2]], 1, -5, target_lines=285) is None
 
 
-def test_antigravity_mutation_tools_and_claude_bash_no_rewrite(tmp_path: Path) -> None:
-    f = tmp_path / "mod.py"
-    f.write_text("x = 1\ny = 2\n", encoding="utf-8")
-    canon = os.path.realpath(str(f))
-    sd = str(tmp_path / "state")
-    assert (
-        evaluate_hook(
-            {"conversationId": "ag1", "stepIdx": 1, "toolCall": {"name": "read_file", "args": {"Path": str(f), "StartLine": 1, "EndLine": 1}}},
-            state_dir=sd,
-        )
-        == {"decision": "allow"}
-    )
-    # Partial overlap before mutation trims silently to line 2
-    assert (
-        evaluate_hook(
-            {"conversationId": "ag1", "stepIdx": 2, "toolCall": {"name": "read_file", "args": {"Path": str(f)}}},
-            state_dir=sd,
-        )
-        == {"decision": "allow", "overwrite": {"StartLine": 2, "EndLine": 2}}
-    )
-    for idx, mut_tool in enumerate(
-        ("replace_file_content", "multi_replace_file_content", "write_to_file"), start=3
-    ):
+def test_antigravity_mutation_tools_and_claude_bash_no_rewrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_bounded_policy(tmp_path, monkeypatch)
+    try:
+        f = tmp_path / "mod.py"
+        f.write_text("x = 1\ny = 2\n", encoding="utf-8")
+        canon = os.path.realpath(str(f))
+        sd = str(tmp_path / "state")
+        assert ag_read(f, sd, start_line=1, end_line=1, step_idx=1, conv_id="ag1", confirm=True) == {"decision": "allow"}
+        # Partial overlap before mutation trims silently to line 2
+        assert ag_read(f, sd, step_idx=2, conv_id="ag1", confirm=True) == {
+            "decision": "allow",
+            "overwrite": {"StartLine": 2, "EndLine": 2},
+        }
+        for idx, mut_tool in enumerate(
+            ("replace_file_content", "multi_replace_file_content", "write_to_file"), start=3
+        ):
+            assert (
+                evaluate_hook(
+                    {
+                        "conversationId": "ag1",
+                        "stepIdx": idx * 2,
+                        "toolCall": {"name": mut_tool, "args": {"TargetFile": str(f)}},
+                    },
+                    state_dir=sd,
+                )
+                == {"decision": "allow"}
+            )
+            assert canon not in _load_ledger(sd).get("files", {})
+            assert ag_read(f, sd, step_idx=idx * 2 + 1, conv_id="ag1", confirm=True) == {"decision": "allow"}
+
+        # Claude Bash is not rewritten (preserves native permissions/headless), Antigravity run_command IS rewritten
         assert (
             evaluate_hook(
-                {
-                    "conversationId": "ag1",
-                    "stepIdx": idx * 2,
-                    "toolCall": {"name": mut_tool, "args": {"TargetFile": str(f)}},
-                },
+                {"session_id": "cl1", "tool_name": "Bash", "tool_input": {"command": "pytest tests/"}},
                 state_dir=sd,
+                cli_harness="claude",
             )
-            == {"decision": "allow"}
+            == {}
         )
-        assert canon not in _load_ledger(sd).get("files", {})
-        assert (
-            evaluate_hook(
-                {
-                    "conversationId": "ag1",
-                    "stepIdx": idx * 2 + 1,
-                    "toolCall": {"name": "read_file", "args": {"Path": str(f)}},
-                },
-                state_dir=sd,
-            )
-            == {"decision": "allow"}
-        )
-
-    # Claude Bash is not rewritten (preserves native permissions/headless), Antigravity run_command IS rewritten
-    assert (
-        evaluate_hook(
-            {"session_id": "cl1", "tool_name": "Bash", "tool_input": {"command": "pytest tests/"}},
+        ag_cmd = evaluate_hook(
+            {
+                "conversationId": "ag1",
+                "stepIdx": 20,
+                "toolCall": {"name": "run_command", "args": {"CommandLine": "pytest tests/"}},
+            },
             state_dir=sd,
-            cli_harness="claude",
         )
-        == {}
-    )
-    ag_cmd = evaluate_hook(
-        {
-            "conversationId": "ag1",
-            "stepIdx": 20,
-            "toolCall": {"name": "run_command", "args": {"CommandLine": "pytest tests/"}},
-        },
-        state_dir=sd,
-    )
-    assert ag_cmd["overwrite"]["CommandLine"] == "pytest tests/ -q --tb=short --no-header"
+        assert ag_cmd["overwrite"]["CommandLine"] == "pytest tests/ -q --tb=short --no-header"
+    finally:
+        clear_config_cache()
 
 
 def test_cli_grep_single_quoted_exclusions_and_double_dash_runner_guard() -> None:

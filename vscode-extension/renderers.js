@@ -41,7 +41,22 @@ function insightsView(insights) {
   const preLast = src.preambleLast && typeof src.preambleLast === "object" ? src.preambleLast : null;
   const byHarness =
     src.preambleByHarness && typeof src.preambleByHarness === "object" ? src.preambleByHarness : {};
-  return { hasInsights: Boolean(insights), cacheHit, docLabel, verdictStatus, verdictDetail, preLast, byHarness };
+  const ci = src.costImpact && typeof src.costImpact === "object" ? src.costImpact : null;
+  const rawCost = ci ? ci.estimated_associated_model_cost_usd : src.estimated_associated_model_cost_usd;
+  const hasCost = typeof rawCost === "number" && Number.isFinite(rawCost);
+  const costImpactValue = hasCost
+    ? `$${rawCost >= 0.01 ? rawCost.toFixed(2) : rawCost.toFixed(4)}${ci && ci.budget_capped ? " (capped)" : ""}`
+    : ci && ci.unpriced
+      ? "n/a (unpriced)"
+      : "n/a";
+  const rawSteps = ci ? ci.weighted_intervention_steps : src.weighted_intervention_steps;
+  const weightedStepsValue = typeof rawSteps === "number" && Number.isFinite(rawSteps) ? rawSteps.toFixed(2) : "0.00";
+  const causalAbStatus = ci && ci.causal_ab && ci.causal_ab.status ? String(ci.causal_ab.status) : "not_run";
+  return {
+    hasInsights: Boolean(insights), cacheHit, docLabel, verdictStatus, verdictDetail, preLast, byHarness,
+    costImpactLabel: (ci && ci.costImpactLabel) || "Estimated Cost Impact (non-counterfactual)",
+    costImpactValue, weightedStepsValue, causalAbStatus,
+  };
 }
 
 function buildTooltipMarkdown(MarkdownStringCls, version, stats, updateLine = "", insights = null) {
@@ -278,7 +293,8 @@ function renderWebviewHtml(version, stats, insights = null) {
     <div class="card"><div class="label">Cache Hit</div><div class="value">${escapeHtml(iv.cacheHit)}</div></div>
     <div class="card"><div class="label">Preamble (Last)</div><div class="value">${preVal}</div><div class="label">${preSub}</div></div>
     <div class="card"><div class="label">Doctor</div><div class="value">${escapeHtml(iv.docLabel)}</div></div>
-    <div class="card"><div class="label">30d Verdict</div><div class="value">${escapeHtml(iv.verdictStatus)}</div>${iv.verdictDetail ? `<div class="label">${escapeHtml(iv.verdictDetail)}</div>` : ""}</div>`;
+    <div class="card"><div class="label">30d Verdict</div><div class="value">${escapeHtml(iv.verdictStatus)}</div>${iv.verdictDetail ? `<div class="label">${escapeHtml(iv.verdictDetail)}</div>` : ""}</div>
+    <div class="card"><div class="label">${escapeHtml(iv.costImpactLabel)}</div><div class="value">${escapeHtml(iv.costImpactValue)}</div><div class="label">Steps: ${escapeHtml(iv.weightedStepsValue)} &bull; A/B: ${escapeHtml(iv.causalAbStatus)}</div></div>`;
     const preEntries = Object.entries(iv.byHarness);
     if (preEntries.length) {
       const preRows = preEntries

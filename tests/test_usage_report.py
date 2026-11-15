@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
 from bin.preamble_attribution import CODEX_CLI_HARNESS, CODEX_DESKTOP_HARNESS
 from bin.token_usage import empty_usage_state
 from bin.usage_report import (
@@ -509,4 +511,73 @@ def test_sunset_verdict_empty_stats_without_started_at_and_denial_proration() ->
     )
     assert share_started["window_events"] == 30 and share_started["total_events"] == 90
     assert sunset_verdict(share_started, {"denials": 3, "tokens": 9000})["net_saved"] == 17_000
+
+
+def test_tariffs_compute_and_attribute_turn_cost_per_million_and_unpriced() -> None:
+    from bin.tariffs import TARIFF_EFFECTIVE_DATE, attribute_turn_cost, compute_turn_tariff_cost_usd
+
+    assert TARIFF_EFFECTIVE_DATE == "2026-11-01"
+    cost = compute_turn_tariff_cost_usd(
+        "claude-sonnet-4-6",
+        input_tokens=1_000_000,
+        cache_write_tokens=1_000_000,
+        cache_read_tokens=1_000_000,
+        output_tokens=1_000_000,
+    )
+    assert cost == pytest.approx(3.0 + 3.75 + 0.30 + 15.0)
+    assert compute_turn_tariff_cost_usd("unknown", input_tokens=1000) is None
+    assert compute_turn_tariff_cost_usd("custom-unpriced-model", input_tokens=1000) is None
+    assert compute_turn_tariff_cost_usd("claude-sonnet-4-6", input_tokens=1000, total_only=True) is None
+
+    attributed = attribute_turn_cost(
+        {
+            "claude|claude-sonnet-4-6": {
+                "events": 10,
+                "input": 1_000_000,
+                "cache_write": 0,
+                "cache_read": 0,
+                "output": 0,
+                "total_only": 0,
+            },
+            "codex|unknown": {"events": 5, "input": 500_000, "total_only": 0},
+        }
+    )
+    assert attributed["claude|claude-sonnet-4-6"]["measured_cost_usd"] == pytest.approx(3.0)
+    assert attributed["claude|claude-sonnet-4-6"]["mean_event_cost_usd"] == pytest.approx(0.3)
+    assert attributed["codex|unknown"]["measured_cost_usd"] is None
+
+
+def test_usage_summary_accepts_outcomes_v4_and_attaches_tariff_costs() -> None:
+    state = dict(ledger())
+    state["totals"] = {
+        "claude|claude-sonnet-4-6": {
+            "events": 10,
+            "input": 1_000_000,
+            "cache_write": 0,
+            "cache_read": 1_000_000,
+            "output": 0,
+            "total_only": 0,
+        }
+    }
+    v4_out = {
+        "schema_version": 4,
+        "by_key": {
+            "claude|claude-sonnet-4-6|outline": {
+                "total": 2,
+                "applied": 2,
+                "recovery": {"none": 1, "targeted": 1, "full": 0, "pending_or_unknown": 0},
+                "regret": {"none": 1, "suspected": 0, "confirmed": 0, "unknown": 1},
+                "evidence": {"observed": 1, "heuristic": 1, "replay": 0, "causal_ab": 0},
+                "weighted_turns": 2.0,
+                "archived_weighted_turns": 0.0,
+            },
+            "claude|claude-sonnet-4-6|advised_shell": {"total": 3, "applied": 3},
+        },
+    }
+    summary = usage_summary(state, 50_000, BREAKDOWN, outcomes_state=v4_out)
+    assert summary["advisories"] == {"outline": 0, "reread": 0, "shell": 3, "inline_python": 0}
+    assert summary["denial_overhead"] == {"denials": 2, "tokens": 20_000}
+    assert summary["tariff_effective_date"] == "2026-11-01"
+    assert summary["tariff_costs"]["claude|claude-sonnet-4-6"]["measured_cost_usd"] == pytest.approx(3.3)
+
 

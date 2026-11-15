@@ -33,6 +33,7 @@ from bin.preamble_attribution import (  # noqa: E402
     split_codex_parts,
     summarize_parts,
 )
+from bin.tariffs import TARIFF_EFFECTIVE_DATE, attribute_turn_cost  # noqa: E402
 from hooks.outcomes import SCHEMA_VERSION as OUTCOMES_SCHEMA_VERSION  # noqa: E402
 
 PREAMBLE_HOME = Path.home()
@@ -513,7 +514,7 @@ _ADVISORY_LABELS = (
 def _active_outcomes_by_key(outcomes_state: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(outcomes_state, dict):
         return {}
-    if "schema_version" in outcomes_state and outcomes_state.get("schema_version") != OUTCOMES_SCHEMA_VERSION:
+    if "schema_version" in outcomes_state and outcomes_state.get("schema_version") not in (3, OUTCOMES_SCHEMA_VERSION):
         return {}
     by_key = outcomes_state.get("by_key")
     return by_key if isinstance(by_key, dict) else {}
@@ -759,6 +760,8 @@ def usage_summary(
         "advisories": advisory_counts(outcomes_state),
         "denial_overhead": overhead,
         "sunset_verdict": sunset_verdict(share, overhead),
+        "tariff_effective_date": TARIFF_EFFECTIVE_DATE,
+        "tariff_costs": attribute_turn_cost(state.get("totals") or {}),
         "breakdown": [{"component": label, "tokens": tokens} for label, tokens in breakdown.components],
         "antigravity_breakdown": [{"component": label, "tokens": tokens} for label, tokens in breakdown.antigravity_components],
         "attribution": _attribution(state),

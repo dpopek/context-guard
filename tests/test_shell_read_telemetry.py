@@ -163,7 +163,7 @@ def test_e2e_codex_bounded_shell_followups_and_non_codex_behavior(tmp_path: Path
         )
         row = read_outcomes_ledger(sd)["by_key"]["codex|unknown|outline_pull"]
         assert row["total"] == 1 and row["applied"] == 1
-        assert row["targeted_followup"] == 1 and row["shell_bypass"] == 0, bounded_cmd
+        assert row["recovery"]["targeted"] == 1 and row["recovery"]["full"] == 0, bounded_cmd
         assert "pending_followup_kind" not in read_session_state(sd)["files"][os.path.realpath(target)]
 
         # Second shell read does not double-count shell_bypass after targeted_followup resolved.
@@ -173,9 +173,9 @@ def test_e2e_codex_bounded_shell_followups_and_non_codex_behavior(tmp_path: Path
             cli_harness="codex",
         )
         row2 = read_outcomes_ledger(sd)["by_key"]["codex|unknown|outline_pull"]
-        assert row2["shell_bypass"] == 0 and row2["total"] == 1
+        assert row2["recovery"]["full"] == 0 and row2["total"] == 1
 
-    # Unbounded Codex reads record shell_bypass.
+    # Unbounded Codex reads record full recovery + suspected regret.
     for idx, bad_cmd in enumerate((f"cat {target}", f"sed '1,20p' {target}", f"head -n 260 {target}")):
         sd = tmp_path / f"cx_u_{idx}"
         ptu.evaluate_hook(
@@ -189,9 +189,9 @@ def test_e2e_codex_bounded_shell_followups_and_non_codex_behavior(tmp_path: Path
             cli_harness="codex",
         )
         row = read_outcomes_ledger(sd)["by_key"]["codex|unknown|outline_pull"]
-        assert row["targeted_followup"] == 0 and row["shell_bypass"] == 1, bad_cmd
+        assert row["recovery"]["targeted"] == 0 and row["recovery"]["full"] == 1 and row["regret"]["suspected"] == 1, bad_cmd
 
-    # Non-codex harness still treats bounded shell sed as shell_bypass, while sed -i does not trigger bypass.
+    # Non-codex harness still treats bounded shell sed as full bypass, while sed -i does not trigger bypass.
     cl_sd = tmp_path / "cl_sed"
     ptu.evaluate_hook(
         {"session_id": "cls", "tool_name": "Bash", "tool_input": {"command": f"cg-outline {target}"}},
@@ -203,7 +203,7 @@ def test_e2e_codex_bounded_shell_followups_and_non_codex_behavior(tmp_path: Path
         state_dir=str(cl_sd),
         cli_harness="claude",
     )
-    assert read_outcomes_ledger(cl_sd)["by_key"]["claude|unknown|outline_pull"]["shell_bypass"] == 0
+    assert read_outcomes_ledger(cl_sd)["by_key"]["claude|unknown|outline_pull"]["recovery"]["full"] == 0
     assert "pending_followup_kind" in read_session_state(cl_sd)["files"][os.path.realpath(target)]
 
     ptu.evaluate_hook(
@@ -211,7 +211,8 @@ def test_e2e_codex_bounded_shell_followups_and_non_codex_behavior(tmp_path: Path
         state_dir=str(cl_sd),
         cli_harness="claude",
     )
-    assert read_outcomes_ledger(cl_sd)["by_key"]["claude|unknown|outline_pull"]["shell_bypass"] == 1
+    cl_row = read_outcomes_ledger(cl_sd)["by_key"]["claude|unknown|outline_pull"]
+    assert cl_row["recovery"]["full"] == 1 and cl_row["regret"]["suspected"] == 1
 
 
 def test_e2e_codex_mcp_auto_outline_bounded_sed_records_targeted_followup(tmp_path: Path) -> None:
@@ -237,7 +238,7 @@ def test_e2e_codex_mcp_auto_outline_bounded_sed_records_targeted_followup(tmp_pa
     )
     row = read_outcomes_ledger(sd)["by_key"]["codex|unknown|outline"]
     assert row["total"] == 1 and row["applied"] == 1
-    assert row["targeted_followup"] == 1 and row["shell_bypass"] == 0
+    assert row["recovery"]["targeted"] == 1 and row["recovery"]["full"] == 0
 
 
 def test_e2e_multi_target_outline_pull_scales_count_to_keep_rate_at_most_100_pct(tmp_path: Path) -> None:
@@ -267,7 +268,7 @@ def test_e2e_multi_target_outline_pull_scales_count_to_keep_rate_at_most_100_pct
         )
     ledger = read_outcomes_ledger(sd)
     row = ledger["by_key"]["antigravity|unknown|outline_pull"]
-    assert row["total"] == 3 and row["applied"] == 3 and row["targeted_followup"] == 3
+    assert row["total"] == 3 and row["applied"] == 3 and row["recovery"]["targeted"] == 3
     report = render_outcomes_report(ledger)
     assert "3 (100%)" in report
 
@@ -304,7 +305,7 @@ def test_e2e_outline_pull_rewind_and_compaction_step_tracking(tmp_path: Path) ->
         state_dir=str(sd_a),
     )
     row_a = read_outcomes_ledger(sd_a)["by_key"]["antigravity|unknown|outline_pull"]
-    assert row_a["full_bypass"] == 0 and row_a["targeted_followup"] == 0
+    assert row_a["recovery"]["full"] == 0 and row_a["recovery"]["targeted"] == 0
 
     # Scenario B: rewind to step 8 after cg-outline at step 6 preserves outline_pull_step=6 and records targeted_followup.
     sd_b = tmp_path / "sd_b"
@@ -321,7 +322,7 @@ def test_e2e_outline_pull_rewind_and_compaction_step_tracking(tmp_path: Path) ->
         state_dir=str(sd_b),
     )
     row_b = read_outcomes_ledger(sd_b)["by_key"]["antigravity|unknown|outline_pull"]
-    assert row_b["targeted_followup"] == 1 and row_b["full_bypass"] == 0
+    assert row_b["recovery"]["targeted"] == 1 and row_b["recovery"]["full"] == 0
 
     # Scenario C: compaction boundary keeps outline_pull after checkpoint and drops earlier pull.
     state = {

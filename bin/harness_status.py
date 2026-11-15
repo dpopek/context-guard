@@ -13,11 +13,91 @@ DEFAULT_CURSOR_HOOKS = Path.home() / ".cursor" / "hooks.json"
 DEFAULT_CODEX_HOOKS = Path.home() / ".codex" / "hooks.json"
 
 CLAUDE_MATCHER = "Read|NotebookRead|Edit|MultiEdit|Write|NotebookEdit|Bash"
+CLAUDE_POST_SYNC_MATCHER = "Read|NotebookRead|Edit|MultiEdit|Write|NotebookEdit"
+CLAUDE_POST_ASYNC_MATCHER = "Bash"
+CLAUDE_POST_MATCHER = CLAUDE_POST_ASYNC_MATCHER
 CURSOR_MATCHER = (
     "Shell|Read|Edit|Write|StrReplace|MultiStrReplace|EditFile|WriteFile|DeleteFile|"
     "read_file|edit_file|write_file|run_terminal_cmd"
 )
+CURSOR_POST_MATCHER = (
+    "Shell|run_terminal_cmd|Read|read_file|Edit|Write|StrReplace|MultiStrReplace|"
+    "EditFile|WriteFile|Delete|DeleteFile|edit_file|write_file"
+)
 CODEX_MATCHER = "^(Bash|shell|exec_command|exec|apply_patch|Edit|Write|mcp__.*)$"
+CODEX_POST_MATCHER = "^(Bash|shell|exec_command|exec|apply_patch|Edit|Write)$"
+CG_HOOK_SCRIPTS = (
+    "/hooks/pre_tool_use.py",
+    "/hooks/pre_compact.py",
+    "/hooks/post_tool_use.py",
+    "/hooks/session_end.py",
+    "\\hooks\\pre_tool_use.py",
+    "\\hooks\\pre_compact.py",
+    "\\hooks\\post_tool_use.py",
+    "\\hooks\\session_end.py",
+)
+
+
+def claude_post_hook_groups(post_cmd: str) -> list[dict[str, Any]]:
+    """Return Claude PostToolUse/PostToolUseFailure sync file + async Bash hook groups."""
+    return [
+        {"matcher": CLAUDE_POST_SYNC_MATCHER, "hooks": [{"type": "command", "command": post_cmd}]},
+        {"matcher": CLAUDE_POST_ASYNC_MATCHER, "hooks": [{"type": "command", "command": post_cmd, "async": True}]},
+    ]
+
+
+def is_cg_command(
+    cmd: Any,
+    managed_cmds: frozenset[str] = frozenset(),
+    managed_frags: tuple[tuple[str, ...], ...] = (),
+) -> bool:
+    """True for a Context-Guard hook command or verified pack-managed installer hook."""
+    if not isinstance(cmd, str):
+        return False
+    if cmd in managed_cmds:
+        return True
+    if any(script in cmd for script in CG_HOOK_SCRIPTS):
+        return "--harness" in cmd or "context-guard" in cmd
+    norm_cmd = cmd.replace("\\", "/")
+    for frags in managed_frags:
+        pos = 0
+        matched = True
+        for frag in frags:
+            idx = norm_cmd.find(frag, pos)
+            if idx < 0:
+                matched = False
+                break
+            pos = idx + len(frag)
+        if matched:
+            return True
+    return False
+
+
+def without_cg_handlers(
+    groups: list[Any],
+    managed_cmds: frozenset[str] = frozenset(),
+    managed_frags: tuple[tuple[str, ...], ...] = (),
+) -> list[Any]:
+    """Drop Context-Guard handlers from hook groups, keeping every other tool's handlers and groups."""
+    kept: list[Any] = []
+    for group in groups:
+        if not isinstance(group, dict):
+            kept.append(group)
+            continue
+        if is_cg_command(group.get("command"), managed_cmds, managed_frags):
+            continue
+        handlers = group.get("hooks")
+        if isinstance(handlers, list):
+            rest = [
+                h for h in handlers
+                if not (isinstance(h, dict) and is_cg_command(h.get("command"), managed_cmds, managed_frags))
+            ]
+            if len(rest) != len(handlers):
+                if not rest:
+                    continue
+                group = {**group, "hooks": rest}
+        kept.append(group)
+    return kept
 
 
 def merge_harness_matcher(

@@ -87,7 +87,7 @@ def test_no_private_names_cross_module_boundaries() -> None:
 
 
 def test_one_operator_diagnostic() -> None:
-    from hooks import outcomes, policy_engine, post_tool_use, pre_compact, pre_invocation, pre_tool_use, state_store, telemetry
+    from hooks import outcomes, policy_engine, post_tool_use, pre_compact, pre_invocation, pre_tool_use, session_end, state_store, telemetry
 
     assert (
         telemetry.warn
@@ -97,6 +97,7 @@ def test_one_operator_diagnostic() -> None:
         is pre_tool_use.warn
         is pre_compact.warn
         is pre_invocation.warn
+        is session_end.warn
         is state_store.warn
     )
 

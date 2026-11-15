@@ -665,8 +665,8 @@ def test_classify_special_read_target_handles_posix_and_windows_paths() -> None:
 def test_read_planner_stays_under_800_loc() -> None:
     from hooks import read_planner
 
-    assert read_planner.covering_read_step([[1, 50, 2]], 10, 30) == 2
-    assert read_planner.trim_partially_covered_range([[1, 20, 1]], 15, 40) == (21, 40)
+    assert read_planner.covering_read_step([[1, 50, 2, 2]], 10, 30) == 2
+    assert read_planner.trim_partially_covered_range([[1, 20, 1, 2]], 15, 40) == (21, 40)
     planner_loc = len(Path(read_planner.__file__).read_text(encoding="utf-8").splitlines())
     assert planner_loc <= 800
 

@@ -6,6 +6,7 @@ import json
 import pytest
 from pathlib import Path
 
+from hooks.post_tool_use import handle_post_tool_use
 from hooks.pre_tool_use import evaluate_hook
 from hooks.telemetry import load_telemetry_stats
 
@@ -45,33 +46,44 @@ def test_telemetry_accumulates_mcp_outline_and_range_trim_savings(tmp_path: Path
     assert s1["reduction_pct"] > 50.0
     installed_ts = s1["installed_at"]
 
+    big_lines = big_py.read_text(encoding="utf-8").splitlines()
     # 2. Targeted source read lines 1..30 -> allowed_reads (increases baseline, saved unchanged)
-    r2 = evaluate_hook(
-        {
-            "session_id": "t1",
-            "tool_name": "Read",
-            "tool_input": {"file_path": str(big_py), "offset": 1, "limit": 30},
-        },
-        state_dir=str(state_dir),
-        cli_harness="cursor",
-    )
+    r2_payload = {
+        "session_id": "t1",
+        "call_id": "cur-r2",
+        "tool_name": "Read",
+        "tool_input": {"file_path": str(big_py), "offset": 1, "limit": 30},
+    }
+    r2 = evaluate_hook(r2_payload, state_dir=str(state_dir), cli_harness="cursor")
     assert r2 == {}
+    handle_post_tool_use(
+        "cursor",
+        {**r2_payload, "tool_output": "\n".join(big_lines[:30])},
+        stats_path=stats_file,
+        state_dir=state_dir,
+        event_name="PostToolUse",
+    )
     s2 = load_telemetry_stats(stats_file)
     assert s2["events"]["allowed_reads"] == 1
     assert s2["baseline_bytes"] > s1["baseline_bytes"]
     assert s2["installed_at"] == installed_ts
 
     # 3. Partially overlapping read lines 20..50 -> ranges_trimmed (lines 20..30 saved)
-    r3 = evaluate_hook(
-        {
-            "session_id": "t1",
-            "tool_name": "Read",
-            "tool_input": {"file_path": str(big_py), "offset": 20, "limit": 31},
-        },
-        state_dir=str(state_dir),
-        cli_harness="cursor",
-    )
+    r3_payload = {
+        "session_id": "t1",
+        "call_id": "cur-r3",
+        "tool_name": "Read",
+        "tool_input": {"file_path": str(big_py), "offset": 20, "limit": 31},
+    }
+    r3 = evaluate_hook(r3_payload, state_dir=str(state_dir), cli_harness="cursor")
     assert r3["hookSpecificOutput"]["permissionDecision"] == "allow"
+    handle_post_tool_use(
+        "cursor",
+        {**r3_payload, "tool_output": "\n".join(big_lines[30:50])},
+        stats_path=stats_file,
+        state_dir=state_dir,
+        event_name="PostToolUse",
+    )
     s3 = load_telemetry_stats(stats_file)
     assert s3["events"]["ranges_trimmed"] == 1
     assert s3["saved_bytes"] > s2["saved_bytes"]
@@ -505,46 +517,73 @@ def test_write_json_atomic_writes_indented_json_and_leaves_no_temp_files(tmp_pat
     assert sorted(p.name for p in tmp_path.iterdir()) == ["out.json"]
 
 
-def _outcomes_ledger(rows: dict[str, dict[str, int]], updated_at: str | None = "2026-10-30T12:00:00Z") -> dict:
+def _outcomes_ledger(rows: dict[str, dict], updated_at: str | None = "2026-10-30T12:00:00Z") -> dict:
     import hooks.outcomes as outcomes
 
     ledger = outcomes.default_outcomes_dict()
     ledger["updated_at"] = updated_at
     for key, counts in rows.items():
-        row = {k: 0 for k in outcomes.ROW_KEYS}
-        row.update(counts)
+        row = {
+            "total": int(counts.get("total", 0)),
+            "applied": int(counts.get("applied", 0)),
+            "recovery": {"none": 0, "targeted": 0, "full": 0, "pending_or_unknown": 0, **counts.get("recovery", {})},
+            "regret": {"none": 0, "suspected": 0, "confirmed": 0, "unknown": 0, **counts.get("regret", {})},
+            "evidence": {"observed": 0, "heuristic": 0, "replay": 0, "causal_ab": 0, **counts.get("evidence", {})},
+            "weighted_turns": float(counts.get("weighted_turns", 0.0)),
+            "archived_weighted_turns": float(counts.get("archived_weighted_turns", 0.0)),
+        }
         ledger["by_key"][key] = row
     return ledger
 
 
 def test_render_outcomes_report_rows_percentages_and_footer() -> None:
     from bin.cg_status import render_outcomes_report
+    from bin.outcomes_report import compute_associated_model_costs
 
     ledger = _outcomes_ledger(
         {
-            "claude|claude-fable-5-1|outline": {
-                "total": 10, "applied": 10, "targeted_followup": 6, "full_bypass": 2, "shell_bypass": 1,
+            "claude|claude-sonnet-4-6|outline": {
+                "total": 10,
+                "applied": 10,
+                "recovery": {"targeted": 6, "full": 3},
+                "regret": {"suspected": 3, "confirmed": 0, "unknown": 6},
+                "evidence": {"heuristic": 9},
+                "weighted_turns": 6.0,
             },
-            "antigravity|unknown|range_trim": {"total": 4, "applied": 4},
-            "antigravity|unknown|cli_rewrite": {"total": 2, "applied": 2},
-            "claude|claude-fable-5-1|outline_pull": {"total": 0},
+            "antigravity|unknown|range_trim": {"total": 4, "applied": 4, "weighted_turns": 4.0},
+            "antigravity|unknown|cli_rewrite": {"total": 2, "applied": 2, "weighted_turns": 0.0},
+            "claude|claude-sonnet-4-6|outline_pull": {"total": 0, "weighted_turns": 8.0},
         }
     )
-    report = render_outcomes_report(ledger)
+    usage = {
+        "totals": {
+            "claude|claude-sonnet-4-6": {
+                "events": 10,
+                "input": 1_000_000,
+                "cache_write": 0,
+                "cache_read": 0,
+                "output": 0,
+                "total_only": 0,
+            }
+        }
+    }
+    costs = compute_associated_model_costs(ledger, usage)
+    assert costs["causal_ab"] == {"status": "not_run"}
+    assert costs["tariff_effective_date"] == "2026-11-01"
+    # Group claude|claude-sonnet-4-6 measured cost = $3.00 ($0.30/event). Raw = (6+8)*0.30 = $4.20 > $3.00 -> budget-capped!
+    assert costs["budget_capped"] is True
+    assert costs["estimated_associated_model_cost_usd"] == pytest.approx(3.0)
+    assert costs["by_key"]["antigravity|unknown|range_trim"]["estimated_associated_model_cost_usd"] is None
+
+    report = render_outcomes_report(ledger, usage)
     lines = report.splitlines()
     assert lines[0] == "# 🛡️ Context-Guard Intervention Outcomes"
-    assert (
-        "| Harness | Model | Kind | Interventions | Targeted follow-up | Full bypass | Shell bypass |"
-    ) in lines
-    assert "|---|---|---|---:|---:|---:|---:|" in lines
-    assert "| antigravity | unknown | cli_rewrite | 2 | — | — | — |" in lines
-    assert "| antigravity | unknown | range_trim | 4 | — | — | — |" in lines
-    assert "| claude | claude-fable-5-1 | outline | 10 | 6 (60%) | 2 (20%) | 1 (10%) |" in lines
-    assert "| claude | claude-fable-5-1 | outline_pull | 0 | 0 (n/a) | 0 (n/a) | 0 (n/a) |" in lines
-    assert lines.index("| antigravity | unknown | cli_rewrite | 2 | — | — | — |") < lines.index(
-        "| claude | claude-fable-5-1 | outline | 10 | 6 (60%) | 2 (20%) | 1 (10%) |"
-    )
-    assert lines[-1] == "_Schema: v3 · updated: 2026-10-30T12:00:00Z_"
+    assert any("antigravity | unknown | cli_rewrite | 2 |" in ln for ln in lines)
+    assert any("claude | claude-sonnet-4-6 | outline | 10 | 6 (60%) | 3 (30%)" in ln for ln in lines)
+    assert any("claude | claude-sonnet-4-6 | outline_pull | 0 | 0 (n/a)" in ln for ln in lines)
+    assert any("n/a (unpriced)" in ln for ln in lines)
+    assert any("non-causal" in ln.lower() for ln in lines)
+    assert lines[-1] == "_Schema: v4 · updated: 2026-10-30T12:00:00Z_"
     assert report.endswith("\n")
 
 
@@ -553,7 +592,7 @@ def test_render_outcomes_report_empty_ledger() -> None:
 
     report = render_outcomes_report(_outcomes_ledger({}, updated_at=None))
     assert "No interventions recorded yet." in report
-    assert "_Schema: v3 · updated: never_" in report
+    assert "_Schema: v4 · updated: never_" in report
 
 
 def test_cg_status_outcomes_flag_reads_ledger_path(tmp_path, capsys) -> None:
@@ -561,12 +600,24 @@ def test_cg_status_outcomes_flag_reads_ledger_path(tmp_path, capsys) -> None:
 
     ledger = tmp_path / "outcomes.json"
     ledger.write_text(
-        json.dumps(_outcomes_ledger({"claude|m|outline": {"total": 1, "applied": 1, "targeted_followup": 1}})),
+        json.dumps(
+            _outcomes_ledger(
+                {
+                    "claude|m|outline": {
+                        "total": 1,
+                        "applied": 1,
+                        "recovery": {"targeted": 1},
+                        "regret": {"unknown": 1},
+                        "evidence": {"heuristic": 1},
+                    }
+                }
+            )
+        ),
         encoding="utf-8",
     )
     assert cg_status_main(["--outcomes", "--outcomes-path", str(ledger)]) == 0
     out = capsys.readouterr().out
-    assert "| claude | m | outline | 1 | 1 (100%) | 0 (0%) | 0 (0%) |" in out
+    assert "| claude | m | outline | 1 | 1 (100%) | 0 (0%) |" in out
 
 
 def test_cli_rewrite_is_counted_without_claiming_bytes(tmp_path: Path) -> None:

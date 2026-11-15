@@ -1,7 +1,6 @@
 """Owner of the per-session state ledger and its shared primitives.
 
-This is the leaf module that both `hooks.pre_tool_use` and `hooks.outcomes` import.
-It must never import anything from `hooks`, or the two would form an import cycle.
+This leaf module must never import anything from `hooks` (avoids cycles with `hooks.outcomes`).
 """
 from __future__ import annotations
 
@@ -55,6 +54,15 @@ except ImportError:  # pragma: no cover - Windows
 
     fcntl = _WindowsFcntlCompat()
 
+STATE_FILENAME = ".context_guard_state.json"
+LOCK_FILENAME = ".context_guard_state.lock"
+MUTATED_REPOS_SCHEMA = 2
+READ_LEDGER_SCHEMA = 2
+VALID_CONFIRM_TIERS = (1, 2)
+_OUTLINE_META_KEYS = (
+    "outlined", "outlined_step", "outlined_total_lines", "unwrapped_path",
+    "pending_followup_kind", "outline_pull_step", "mirror_source",
+)
 
 def warn(message: object) -> None:
     """Operator-facing diagnostic; never raises or leaves dirty C buffers on fd 2."""
@@ -63,99 +71,89 @@ def warn(message: object) -> None:
     except Exception:
         text = "context-guard: <unprintable diagnostic>\n"
     try:
-        stream = sys.stderr
-        if stream is None:
+        if (stream := sys.stderr) is None:
             return
-        raw_stderr = sys.__stderr__
-        if raw_stderr is not None and stream is raw_stderr:
-            os.write(raw_stderr.fileno(), text.encode("utf-8", errors="replace"))
+        if (raw := sys.__stderr__) is not None and stream is raw:
+            os.write(raw.fileno(), text.encode("utf-8", errors="replace"))
         else:
             stream.write(text)
             stream.flush()
     except Exception:
         pass
 
-
 def run_telemetry_safely(op: Callable[[], object], context: str = "telemetry") -> None:
     """Execute a post-decision telemetry/observation side effect without ever raising Exception."""
     try:
         op()
     except Exception as exc:
+        detail = ""
         try:
-            warn(f"{context} error ignored after decision ({type(exc).__name__}): {exc}")
+            detail = f": {exc}"
         except Exception:
-            try:
-                warn(f"{context} error ignored after decision ({type(exc).__name__})")
-            except Exception:
-                pass
-
-
-def sanitize_stderr_before_exit() -> None:
-    """Ensure CPython Py_FinalizeEx will not exit with status 120 due to buffered writes on a broken stderr."""
-    if sys.stderr is None:
-        return
-    try:
-        sys.stderr.flush()
-    except Exception:
+            pass
         try:
-            sys.stderr = io.StringIO()
+            warn(f"{context} error ignored after decision ({type(exc).__name__}){detail}")
         except Exception:
             pass
 
+def _neutralize_stream(attr: str) -> None:
+    try:
+        setattr(sys, attr, io.StringIO())
+    except Exception:
+        pass
+
+def sanitize_stderr_before_exit() -> None:
+    """Ensure CPython Py_FinalizeEx will not exit 120 due to buffered writes on broken stderr."""
+    if sys.stderr is not None:
+        try:
+            sys.stderr.flush()
+        except Exception:
+            _neutralize_stream("stderr")
 
 def emit_json_and_sanitize_stdio(payload: dict[str, Any]) -> int:
-    """Emit a single JSON line to stdout once and neutralize broken stdout/stderr buffers before exit."""
+    """Emit one JSON line to stdout and neutralize broken stdout/stderr buffers before exit."""
     line = json.dumps(payload) + "\n"
     if sys.stdout is not None:
         try:
             sys.stdout.write(line)
             sys.stdout.flush()
         except Exception:
-            try:
-                sys.stdout = io.StringIO()
-            except Exception:
-                pass
+            _neutralize_stream("stdout")
     sanitize_stderr_before_exit()
     return 0
 
+def _fresh_state() -> dict[str, Any]:
+    return {"files": {}, "read_ledger_schema": READ_LEDGER_SCHEMA}
 
-def _load_state_unlocked(state_file: Path) -> dict[str, Any]:
+def _read_state_raw(state_file: Path) -> tuple[dict[str, Any] | None, str | None]:
     if not state_file.is_file():
-        return {"files": {}}
+        return _fresh_state(), None
     try:
         data = json.loads(state_file.read_text(encoding="utf-8"))
         if isinstance(data, dict) and isinstance(data.get("files"), dict):
-            return data
-    except (OSError, ValueError, TypeError):
-        pass
-    return {"files": {}}
-
+            return data, None
+        return None, "missing or non-dict 'files' map"
+    except (OSError, ValueError, TypeError) as exc:
+        return None, f"{type(exc).__name__}: {exc}"
 
 def _open_or_quarantine_state_unlocked(state_file: Path) -> dict[str, Any]:
     """Load session state under the lock; quarantine corrupt files and warn on failure."""
-    if not state_file.is_file():
-        return {"files": {}}
-    try:
-        data = json.loads(state_file.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and isinstance(data.get("files"), dict):
-            return data
-        detail = "missing or non-dict 'files' map"
-    except (OSError, ValueError, TypeError) as exc:
-        detail = f"{type(exc).__name__}: {exc}"
+    data, detail = _read_state_raw(state_file)
+    if data is not None:
+        return data
     quarantine_path = state_file.with_name(f"{state_file.name}.corrupt")
     try:
         os.replace(str(state_file), str(quarantine_path))
         warn(f"corrupt session state ({detail}) quarantined to {quarantine_path}")
     except OSError as q_exc:
         warn(f"corrupt session state ({detail}) reset in memory; quarantine failed: {q_exc}")
-    return {"files": {}}
-
+    return _fresh_state()
 
 def _save_state_atomic_unlocked(state_file: Path, state: dict[str, Any]) -> bool:
-    """Persist state via mkstemp + os.replace; False (plus a stderr note) when the ledger could not be written."""
+    """Persist state via mkstemp + os.replace; False (with stderr note) on failure."""
     try:
         state_file.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(prefix=".context_guard_state.", suffix=".tmp", dir=str(state_file.parent))
+        fd, tmp_path = tempfile.mkstemp(prefix=".cg_state.", suffix=".tmp", dir=str(state_file.parent))
     except OSError as exc:
         warn(f"state not saved ({state_file}): {exc}")
         return False
@@ -172,47 +170,50 @@ def _save_state_atomic_unlocked(state_file: Path, state: dict[str, Any]) -> bool
         warn(f"state not saved ({state_file}): {exc}")
         return False
 
+def is_valid_read_interval(item: Any) -> bool:
+    """Return True iff `item` is a 4-tuple `[start, end, step, confirm_tier]` with valid tier."""
+    return (
+        isinstance(item, (list, tuple)) and len(item) >= 4
+        and all(isinstance(x, int) and not isinstance(x, bool) for x in item[:4])
+        and int(item[3]) in VALID_CONFIRM_TIERS
+    )
 
-STATE_FILENAME = ".context_guard_state.json"
-LOCK_FILENAME = ".context_guard_state.lock"
-MUTATED_REPOS_SCHEMA = 2
-
+def _purge_stale_read_ledger_unlocked(state: dict[str, Any]) -> None:
+    if isinstance((files_map := state.get("files")), dict):
+        for entry in files_map.values():
+            if isinstance(entry, dict):
+                if "reads" in entry:
+                    entry["reads"] = []
+                entry.pop("pending_reads", None)
+                entry.pop("completed_read_ids", None)
+    state["read_ledger_schema"] = READ_LEDGER_SCHEMA
 
 def resolve_plugin_root(default_root: Path | None = None) -> Path:
-    """Canonical Context-Guard root: CONTEXT_GUARD_HOME env override, explicit default, or checkout root."""
-    env_home = os.environ.get("CONTEXT_GUARD_HOME", "").strip()
-    if env_home:
+    """Canonical Context-Guard root: CONTEXT_GUARD_HOME override, explicit default, or checkout."""
+    if (env_home := os.environ.get("CONTEXT_GUARD_HOME", "").strip()):
         return Path(env_home).expanduser().resolve()
     if default_root is not None:
         return Path(default_root).expanduser().resolve()
     return Path(__file__).resolve().parent.parent
 
-
 def resolve_state_dir(payload: dict[str, Any], state_dir: str | None) -> Path:
-    """Session ledger directory: explicit override, then the harness artifact dir, then a temp dir per session."""
+    """Session ledger directory: explicit override, harness artifact dir, or temp dir."""
     if state_dir:
         base = Path(state_dir)
     else:
-        artifact_dir = payload.get("artifactDirectoryPath")
-        if isinstance(artifact_dir, str) and artifact_dir.strip():
-            return Path(artifact_dir.strip())
+        if isinstance((art := payload.get("artifactDirectoryPath")), str) and art.strip():
+            return Path(art.strip())
         conv_id = str(
-            payload.get("conversationId")
-            or payload.get("session_id")
-            or payload.get("conversation_id")
-            or "default"
+            payload.get("conversationId") or payload.get("session_id")
+            or payload.get("conversation_id") or "default"
         )
-        safe_conv = re.sub(r"[^a-zA-Z0-9_.-]", "_", conv_id)
-        base = Path(tempfile.gettempdir()) / f"context-guard-{safe_conv}"
-
-    raw_agent = payload.get("agent_id")
-    if isinstance(raw_agent, str) and raw_agent.strip():
+        base = Path(tempfile.gettempdir()) / f"context-guard-{re.sub(r'[^a-zA-Z0-9_.-]', '_', conv_id)}"
+    if isinstance((raw_agent := payload.get("agent_id")), str) and raw_agent.strip():
         agent_clean = raw_agent.strip()
         safe_agent = re.sub(r"[^a-zA-Z0-9_.-]", "_", agent_clean)[:32] or "agent"
         agent_digest = hashlib.sha256(agent_clean.encode("utf-8")).hexdigest()[:12]
         return base / "subagents" / f"{safe_agent}-{agent_digest}"
     return base
-
 
 def advance_session_step(state_dir_path: Path) -> int:
     """Increment and return `auto_step_seq` when `state_dir_path` already exists; 0 otherwise."""
@@ -228,70 +229,73 @@ def advance_session_step(state_dir_path: Path) -> int:
         warn(f"advance_session_step skipped: {exc}")
         return 0
 
-
 def state_file_in(state_dir_path: Path) -> Path:
     return state_dir_path / STATE_FILENAME
 
+@contextmanager
+def _dir_lock(state_dir_path: Path) -> Iterator[None]:
+    with open(state_dir_path / LOCK_FILENAME, "a+", encoding="utf-8") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+def read_state_snapshot(state_dir_path: Path) -> dict[str, Any]:
+    """Read session ledger under lock without creating files or persisting schema writes."""
+    state_file = state_file_in(state_dir_path)
+    if not state_dir_path.is_dir() or not state_file.is_file():
+        return _fresh_state()
+    with _dir_lock(state_dir_path):
+        data, _ = _read_state_raw(state_file)
+        state = data if data is not None else _fresh_state()
+        if state.get("read_ledger_schema") != READ_LEDGER_SCHEMA:
+            _purge_stale_read_ledger_unlocked(state)
+        return state
 
 class StateTxn:
     """One locked read-modify-write of the session ledger; see `locked_state`."""
 
     def __init__(self, state_file: Path, state: dict[str, Any]) -> None:
-        self.state_file = state_file
-        self.state = state
-        self.dirty = False
+        self.state_file, self.state, self.dirty = state_file, state, False
 
     def save(self) -> bool:
-        """Persist `state` now, still under the lock; True when written. Clears `dirty` either way."""
+        """Persist `state` now, still under the lock; True when written. Clears `dirty`."""
         self.dirty = False
         return _save_state_atomic_unlocked(self.state_file, self.state)
 
-
 @contextmanager
 def locked_state(state_dir_path: Path, *, create: bool = True) -> Iterator[StateTxn]:
-    """Hold the session ledger lock and yield its state; save on a normal exit when `dirty` is set.
-
-    OSError propagates, including FileNotFoundError when `create` is False and the directory
-    is missing: each caller owns its own failure policy. An exception inside the block
-    discards the changes. A failed exit save is only logged; call `txn.save()` inside the
-    block when the result matters. Not re-entrant: never call while already inside a
-    `locked_state` block.
-    """
+    """Hold the session ledger lock and yield its state; save on normal exit when `dirty`."""
     if create:
         state_dir_path.mkdir(parents=True, exist_ok=True)
     elif not state_dir_path.is_dir():
         raise FileNotFoundError(str(state_dir_path))
     state_file = state_file_in(state_dir_path)
-    with open(state_dir_path / LOCK_FILENAME, "a+", encoding="utf-8") as lock_fh:
-        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
-        try:
-            txn = StateTxn(state_file, _open_or_quarantine_state_unlocked(state_file))
-            if "mutated_repos" in txn.state and txn.state.get("mutated_repos_schema") != MUTATED_REPOS_SCHEMA:
-                txn.state.pop("mutated_repos", None)
-                txn.state["mutated_repos_schema"] = MUTATED_REPOS_SCHEMA
-                txn.dirty = True
-            yield txn
-            if txn.dirty:
-                txn.save()
-        finally:
-            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+    with _dir_lock(state_dir_path):
+        txn = StateTxn(state_file, _open_or_quarantine_state_unlocked(state_file))
+        st = txn.state
+        if "mutated_repos" in st and st.get("mutated_repos_schema") != MUTATED_REPOS_SCHEMA:
+            st.pop("mutated_repos", None)
+            st["mutated_repos_schema"], txn.dirty = MUTATED_REPOS_SCHEMA, True
+        if st.get("read_ledger_schema") != READ_LEDGER_SCHEMA:
+            _purge_stale_read_ledger_unlocked(st)
+            txn.dirty = True
+        yield txn
+        if txn.dirty:
+            txn.save()
 
+def _is_int(val: Any) -> bool:
+    return isinstance(val, int) and not isinstance(val, bool)
 
 def filter_reads(
-    state: dict[str, Any],
-    keep_read: Callable[[int], bool],
+    state: dict[str, Any], keep_read: Callable[[int], bool],
     keep_outline: Callable[[int], bool] | None = None,
 ) -> bool:
-    """Drop read ranges and outlines whose step fails the predicate; True when anything changed.
-
-    `keep_outline` defaults to `keep_read`. An entry that is not a dict, whose `reads` is not a
-    list, or that is left with neither reads nor an outline is deleted; read records shorter
-    than [start, end, step] are dropped.
-    """
+    """Drop read ranges, pending reads, and outlines failing predicates; True when mutated."""
     raw_files = state.get("files")
     files_map: dict[str, Any] = raw_files if isinstance(raw_files, dict) else {}
-    keep_out = keep_outline or keep_read
-    mutated = False
+    keep_out, mutated = (keep_outline or keep_read), False
     for path_key in list(files_map):
         entry = files_map[path_key]
         reads = entry.get("reads") if isinstance(entry, dict) else None
@@ -299,53 +303,62 @@ def filter_reads(
             del files_map[path_key]
             mutated = True
             continue
-        def _valid_triple(item: Any) -> bool:
-            return (isinstance(item, list) and len(item) >= 3
-                    and all(isinstance(x, int) and not isinstance(x, bool) for x in item[:3]))
-
-        kept = [r for r in reads if _valid_triple(r) and keep_read(r[2])]
+        kept = [[int(r[0]), int(r[1]), int(r[2]), int(r[3])] for r in reads
+                if is_valid_read_interval(r) and keep_read(int(r[2]))]
         if len(kept) != len(reads):
-            entry["reads"] = kept
+            entry["reads"], mutated = kept, True
+        raw_pending, kept_pending = entry.get("pending_reads"), {}
+        if isinstance(raw_pending, dict):
+            kept_pending = {
+                cid: rec for cid, rec in raw_pending.items()
+                if isinstance(cid, str) and isinstance(rec, dict)
+                and _is_int(rec.get("step")) and keep_read(int(rec["step"]))
+            }
+            if len(kept_pending) != len(raw_pending):
+                mutated = True
+                if kept_pending:
+                    entry["pending_reads"] = kept_pending
+                else:
+                    entry.pop("pending_reads", None)
+        elif "pending_reads" in entry:
+            entry.pop("pending_reads", None)
             mutated = True
-        raw_out_step = entry.get("outlined_step")
-        out_step = raw_out_step if isinstance(raw_out_step, int) and not isinstance(raw_out_step, bool) else 0
-        if entry.get("outlined") and not keep_out(out_step):
-            for k in ("outlined", "outlined_step", "outlined_total_lines",
-                      "unwrapped_path", "pending_followup_kind", "outline_pull_step", "mirror_source"):
+        out_s = int(r) if _is_int((r := entry.get("outlined_step"))) else 0
+        if entry.get("outlined") and not keep_out(out_s):
+            for k in _OUTLINE_META_KEYS:
                 entry.pop(k, None)
             mutated = True
-        if entry.get("pending_followup_kind") == "outline_pull":
-            raw_pull_step = entry.get("outline_pull_step")
-            pull_step = raw_pull_step if isinstance(raw_pull_step, int) and not isinstance(raw_pull_step, bool) else 0
-            if not keep_out(pull_step):
-                entry.pop("pending_followup_kind", None)
-                entry.pop("outline_pull_step", None)
-                mutated = True
-        if not kept and not entry.get("outlined") and entry.get("pending_followup_kind") != "outline_pull":
+        if entry.get("pending_followup_kind") == "outline_pull" and not keep_out(
+            int(rp) if _is_int((rp := entry.get("outline_pull_step"))) else 0
+        ):
+            entry.pop("pending_followup_kind", None)
+            entry.pop("outline_pull_step", None)
+            mutated = True
+        has_pull = entry.get("pending_followup_kind") == "outline_pull"
+        if not (kept or kept_pending or entry.get("outlined") or has_pull):
             del files_map[path_key]
             mutated = True
     return mutated
 
-
 def merge_intervals(reads: list[list[int]]) -> list[list[int]]:
-    """Merge overlapping or adjacent [start, end, step_idx] intervals in memory."""
-    parsed: list[tuple[int, float, int]] = []
-    for entry in reads:
-        if len(entry) >= 3:
-            r_start, r_end, r_step = int(entry[0]), int(entry[1]), int(entry[2])
-            parsed.append((r_start, float("inf") if r_end == -1 else float(r_end), r_step))
-
-    if not parsed:
+    """Merge overlapping/adjacent `[start, end, step_idx, confirm_tier]` sharing `confirm_tier`."""
+    by_tier: dict[int, list[tuple[int, float, int]]] = {}
+    for e in reads:
+        if is_valid_read_interval(e):
+            by_tier.setdefault(int(e[3]), []).append(
+                (int(e[0]), float("inf") if int(e[1]) == -1 else float(e[1]), int(e[2])),
+            )
+    if not by_tier:
         return []
-
-    parsed.sort(key=lambda item: (item[0], item[1]))
-    merged: list[list[float | int]] = [[parsed[0][0], parsed[0][1], parsed[0][2]]]
-    for nxt_start, nxt_end, nxt_step in parsed[1:]:
-        cur = merged[-1]
-        if cur[1] + 1 >= nxt_start:
-            cur[1] = max(cur[1], nxt_end)
-            cur[2] = max(int(cur[2]), nxt_step)
-        else:
-            merged.append([nxt_start, nxt_end, nxt_step])
-
-    return [[int(m[0]), -1 if m[1] == float("inf") else int(m[1]), int(m[2])] for m in merged]
+    out: list[list[int]] = []
+    for tier, parsed in by_tier.items():
+        parsed.sort(key=lambda item: (item[0], item[1]))
+        merged: list[list[float | int]] = [[parsed[0][0], parsed[0][1], parsed[0][2]]]
+        for nxt_s, nxt_e, nxt_step in parsed[1:]:
+            if merged[-1][1] + 1 >= nxt_s:
+                merged[-1][1], merged[-1][2] = max(merged[-1][1], nxt_e), max(int(merged[-1][2]), nxt_step)
+            else:
+                merged.append([nxt_s, nxt_e, nxt_step])
+        out.extend([int(m[0]), -1 if m[1] == float("inf") else int(m[1]), int(m[2]), tier] for m in merged)
+    out.sort(key=lambda item: (item[0], float("inf") if item[1] == -1 else float(item[1]), item[3]))
+    return out

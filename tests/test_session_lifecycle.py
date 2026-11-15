@@ -50,7 +50,7 @@ def test_corrupt_session_state_quarantined_with_warn_and_hooks_log_errors(
     sf.write_text("{broken json", encoding="utf-8")
 
     with state_store.locked_state(sd) as txn:
-        assert txn.state == {"files": {}}
+        assert txn.state == {"files": {}, "read_ledger_schema": 2}
 
     err_state = capsys.readouterr().err
     assert "corrupt" in err_state.lower()
@@ -84,9 +84,10 @@ def test_checkpoint_prunes_pre_checkpoint_files_and_preserves_newer_ones(
     transcript = tmp_path / "transcript.jsonl"
 
     state: dict[str, Any] = {
+        "read_ledger_schema": 2,
         "files": {
-            "/tmp/pre_cp.py": {"sha256": "aaa", "reads": [[1, 40, 120]]},
-            "/tmp/post_cp.py": {"sha256": "bbb", "reads": [[1, 40, 262]]},
+            "/tmp/pre_cp.py": {"sha256": "aaa", "reads": [[1, 40, 120, 2]]},
+            "/tmp/post_cp.py": {"sha256": "bbb", "reads": [[1, 40, 262, 2]]},
         },
         "gitlab_fallback_allowed": ["group/repo-a"],
         "bq_raw_fallback_allowed": ["proj.dataset.tbl"],
@@ -139,9 +140,10 @@ def test_rewind_never_raises_max_tool_step_idx_upwards(tmp_path: Path) -> None:
     sf.write_text(
         json.dumps(
             {
+                "read_ledger_schema": 2,
                 "files": {
-                    "/tmp/keep.py": {"sha256": "k", "reads": [[1, 10, 2]]},
-                    "/tmp/drop.py": {"sha256": "d", "reads": [[1, 10, 12]]},
+                    "/tmp/keep.py": {"sha256": "k", "reads": [[1, 10, 2, 2]]},
+                    "/tmp/drop.py": {"sha256": "d", "reads": [[1, 10, 12, 2]]},
                 },
                 "max_inv_steps": 30,
                 "max_tool_step_idx": 4,
@@ -293,34 +295,30 @@ def test_rewind_in_pre_tool_use_prunes_future_reads_and_outlines(tmp_path: Path)
     assert "CONTEXT-GUARD AUTO-OUTLINE" in res_reoutline["reason"]
 
 
-def test_parallel_reads_in_same_step_do_not_trigger_rewind_prune(tmp_path: Path) -> None:
-    from hooks.pre_tool_use import evaluate_hook
+def test_parallel_reads_in_same_step_do_not_trigger_rewind_prune(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hooks.config import clear_config_cache
+    from tests.helpers import ag_read
 
-    sample_file = tmp_path / "sample.py"
-    sample_file.write_text("\n".join(f"line {i}" for i in range(1, 201)), encoding="utf-8")
-    state_dir = str(tmp_path / "state")
-    evaluate_hook(
-        {
-            "conversationId": "c1",
-            "stepIdx": 5,
-            "toolCall": {"name": "read_file", "args": {"Path": str(sample_file), "StartLine": 1, "EndLine": 40}},
-        },
-        state_dir=state_dir,
-    )
-    res_trim_same_step = evaluate_hook(
-        {
-            "conversationId": "c1",
-            "stepIdx": 5,
-            "toolCall": {"name": "read_file", "args": {"Path": str(sample_file), "StartLine": 20, "EndLine": 60}},
-        },
-        state_dir=state_dir,
-    )
-    assert res_trim_same_step == {"decision": "allow", "overwrite": {"StartLine": 41, "EndLine": 60}}
+    cfg = tmp_path / "cg_cfg.json"
+    cfg.write_text(json.dumps({"read_confirm_policy": "bounded"}), encoding="utf-8")
+    monkeypatch.setenv("CONTEXT_GUARD_CONFIG_PATH", str(cfg))
+    clear_config_cache()
+    try:
+        sample_file = tmp_path / "sample.py"
+        sample_file.write_text("\n".join(f"line {i}" for i in range(1, 201)), encoding="utf-8")
+        state_dir = str(tmp_path / "state")
+        ag_read(sample_file, state_dir, start_line=1, end_line=40, step_idx=5, confirm=True)
+        res_trim_same_step = ag_read(sample_file, state_dir, start_line=20, end_line=60, step_idx=5, confirm=False)
+        assert res_trim_same_step == {"decision": "allow", "overwrite": {"StartLine": 41, "EndLine": 60}}
+    finally:
+        clear_config_cache()
 
 
 def test_prune_on_tool_rewind_keeps_invocation_high_water_mark() -> None:
     state = {
-        "files": {"/x.py": {"sha256": "a", "reads": [[1, -1, 12]]}},
+        "files": {"/x.py": {"sha256": "a", "reads": [[1, -1, 12, 2]]}},
         "max_inv_steps": 25,
         "max_tool_step_idx": 12,
         "max_step_idx": 12,
@@ -337,11 +335,11 @@ def test_rewind_deletes_entry_with_malformed_reads() -> None:
         "files": {
             "/bad": {"sha256": "a", "reads": "oops", "outlined": True, "outlined_step": 1},
             "/missing": {"sha256": "c", "outlined": True, "outlined_step": 1},
-            "/ok": {"sha256": "b", "reads": [[1, 5, 1]]},
+            "/ok": {"sha256": "b", "reads": [[1, 5, 1, 2]]},
         }
     }
     assert prune_state_on_rewind(state, 3, inclusive=True) is True
-    assert state["files"] == {"/ok": {"sha256": "b", "reads": [[1, 5, 1]]}}
+    assert state["files"] == {"/ok": {"sha256": "b", "reads": [[1, 5, 1, 2]]}}
 
 
 def test_auto_outline_large_transcript_jsonl_and_targeted_read(tmp_path: Path) -> None:
