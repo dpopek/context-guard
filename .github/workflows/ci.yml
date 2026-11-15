@@ -42,8 +42,11 @@ jobs:
 
       - name: Run static type and lint checks
         run: |
-          python -m mypy hooks bin policies integrations tests
-          python -m ruff check hooks bin policies integrations tests
+          python -m mypy spool hooks bin policies integrations tests
+          python -m mypy --python-version 3.9 --platform darwin spool hooks bin policies integrations
+          python -m mypy --python-version 3.9 --platform linux spool hooks bin policies integrations
+          python -m mypy --python-version 3.9 --platform win32 spool hooks bin policies integrations
+          python -m ruff check spool hooks bin policies integrations tests
           python -c "import glob, shutil, subprocess; nb = shutil.which('node') or 'node'; fs = sorted(glob.glob('vscode-extension/*.js')); assert fs; [subprocess.run([nb, '--check', f], check=True) for f in fs]"
 
       - name: Run replay, benchmark, public-json, and release hygiene smoke checks

@@ -654,3 +654,109 @@ def test_non_antigravity_format_preserves_capital_path_key() -> None:
     )
     fmt = format_pre_tool_output({"decision": "allow", "overwrite": {"Path": "/new.py"}}, norm)
     assert fmt["hookSpecificOutput"]["updatedInput"] == {"Path": "/new.py", "StartLine": 1, "EndLine": 50}
+
+
+def test_installer_output_spool_hooks_mcp_verify_and_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from bin.harness_status import (
+        CLAUDE_POST_SPOOL_MATCHER, CLAUDE_POST_SYNC_MATCHER, CURSOR_POST_SPOOL_MATCHER,
+        verify_harness_hooks, without_cg_handlers,
+    )
+    from bin.install_harnesses import check_status as install_check_status
+
+    plugin_root = Path(__file__).resolve().parent.parent
+    cfg_path = tmp_path / "cfg" / "config.json"
+    cfg_path.parent.mkdir(parents=True)
+    cfg_path.write_text(json.dumps({"optimizers": {"output_spool": "active"}, "integrations": {"cursor_spool_mcp": "active"}}), encoding="utf-8")
+    monkeypatch.setenv("CONTEXT_GUARD_CONFIG_PATH", str(cfg_path))
+    guard_config.clear_config_cache()
+    monkeypatch.setattr("bin.instruction_block.IS_WINDOWS", False)
+
+    claude_cfg = tmp_path / "claude" / "settings.json"
+    cursor_dir = tmp_path / "cursor"
+    cursor_cfg, cursor_mcp = cursor_dir / "hooks.json", cursor_dir / "mcp.json"
+    codex_cfg, codex_toml, bin_dir = tmp_path / "codex" / "hooks.json", tmp_path / "codex" / "config.toml", tmp_path / "bin"
+    for p, txt in ((claude_cfg, "{}"), (cursor_cfg, "{}"), (codex_cfg, "{}"), (codex_toml, 'model = "x"\n')):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(txt, encoding="utf-8")
+
+    dry = install_all(plugin_root, claude_cfg, cursor_cfg, codex_cfg, codex_toml, dry_run=True, shim_bin_dir=bin_dir)
+    assert dry["cursor_spool_mcp"] == "created" and not cursor_mcp.exists()
+
+    res = install_all(plugin_root, claude_cfg, cursor_cfg, codex_cfg, codex_toml, shim_bin_dir=bin_dir)
+    assert res["cursor_spool_mcp"] == "created"
+    cl_hooks = json.loads(claude_cfg.read_text(encoding="utf-8"))["hooks"]
+    assert [g["matcher"] for g in cl_hooks["PostToolUse"]] == [CLAUDE_POST_SYNC_MATCHER, CLAUDE_POST_SPOOL_MATCHER]
+    assert cl_hooks["PostToolUse"][1]["hooks"][0]["timeout"] == 10
+    assert "async" not in cl_hooks["PostToolUse"][1]["hooks"][0]
+    assert cl_hooks["PostToolUseFailure"][1]["matcher"] == "Bash"
+    assert cl_hooks["PostToolUseFailure"][1]["hooks"][0]["async"] is True
+    assert "timeout" not in cl_hooks["PostToolUseFailure"][1]["hooks"][0]
+    cu_hooks = json.loads(cursor_cfg.read_text(encoding="utf-8"))["hooks"]
+    assert cu_hooks["postToolUse"][0]["matcher"] == CURSOR_POST_SPOOL_MATCHER
+    mcp_data = json.loads(cursor_mcp.read_text(encoding="utf-8"))
+    assert mcp_data["mcpServers"]["context-guard-spool"]["args"][0].endswith("cg_spool.py")
+
+    vh_on = verify_harness_hooks(claude_cfg, cursor_cfg, codex_cfg, output_spool_mode="active")
+    vh_off = verify_harness_hooks(claude_cfg, cursor_cfg, codex_cfg, output_spool_mode="off")
+    assert vh_on["claude"]["spool_hook_ok"] is True and vh_on["cursor"]["spool_hook_ok"] is True
+    assert vh_off["claude"]["spool_hook_ok"] is False and vh_off["cursor"]["spool_hook_ok"] is False
+    st = install_check_status(claude_cfg, cursor_cfg, codex_cfg, shim_bin_dir=bin_dir, cursor_mcp_path=cursor_mcp)
+    assert st["claude"] and st["cursor"] and st["cg_spool_shim"] and st["cursor_spool_mcp"]
+
+    assert without_cg_handlers(cl_hooks["PostToolUse"]) == []
+    assert without_cg_handlers(cu_hooks["postToolUse"]) == []
+
+    # shadow hooks keep spool matchers, while mcp=off removes cursor_spool_mcp
+    cfg_path.write_text(json.dumps({"optimizers": {"output_spool": "shadow"}, "integrations": {"cursor_spool_mcp": "off"}}), encoding="utf-8")
+    guard_config.clear_config_cache()
+    res_sh = install_all(plugin_root, claude_cfg, cursor_cfg, codex_cfg, codex_toml, shim_bin_dir=bin_dir, cursor_mcp_path=cursor_mcp)
+    assert res_sh["cursor_spool_mcp"] == "removed"
+    assert install_check_status(claude_cfg, cursor_cfg, codex_cfg, shim_bin_dir=bin_dir, cursor_mcp_path=cursor_mcp)["cursor_spool_mcp"] is False
+
+    # Malformed mcp.json returns an error status instead of raising
+    cursor_mcp.write_text("{corrupt", encoding="utf-8")
+    res_err = install_all(plugin_root, claude_cfg, cursor_cfg, codex_cfg, codex_toml, shim_bin_dir=bin_dir, cursor_mcp_path=cursor_mcp)
+    assert res_err["cursor_spool_mcp"].startswith("error (")
+    cursor_mcp.write_text(json.dumps({"mcpServers": {"context-guard-spool": {"command": "x"}}}), encoding="utf-8")
+    out = uninstall_all(claude_cfg, cursor_cfg, codex_cfg, codex_toml, shim_bin_dir=bin_dir, cursor_mcp_path=cursor_mcp)
+    assert out["cursor_spool_mcp"] == "removed"
+
+
+def test_installer_rollback_restores_cg_spool_and_cursor_mcp(
+    isolated_user_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plugin_root = Path(__file__).resolve().parent.parent
+    monkeypatch.setattr("bin.instruction_block.IS_WINDOWS", False)
+    cfg_path = isolated_user_env / ".config" / "context-guard" / "config.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(json.dumps({"optimizers": {"output_spool": "active"}, "integrations": {"cursor_spool_mcp": "active"}}), encoding="utf-8")
+    guard_config.clear_config_cache()
+
+    pack_src = tmp_path / "pack_src"
+    pack_src.mkdir()
+    (pack_src / "pack.py").write_text(
+        "from policies.api import ALL_SECURITY_SCOPES, PolicyDecision, PolicyPackManifest\n"
+        "PACK_MANIFEST = PolicyPackManifest(pack_id='sec-rb', api_version=1, kind='security', "
+        "covered_domains=('governance_guard', 'local_repo_guard', 'bigquery_guard'), "
+        "evaluate=lambda _c: PolicyDecision(decision='allow'), inspect_config=lambda _s: [])\n",
+        encoding="utf-8",
+    )
+    claude_cfg, cursor_cfg = tmp_path / "claude" / "settings.json", tmp_path / "cursor" / "hooks.json"
+    codex_cfg, codex_toml = tmp_path / "codex" / "hooks.json", tmp_path / "codex" / "config.toml"
+    cursor_mcp, bin_dir, bad_inst = tmp_path / "cursor" / "mcp.json", tmp_path / "bin", tmp_path / "AGENTS.md"
+    for p, txt in ((claude_cfg, "{}\n"), (cursor_cfg, "{}\n"), (codex_cfg, "{}\n"), (codex_toml, "")):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(txt, encoding="utf-8")
+    orig_mcp = json.dumps({"mcpServers": {"other": {"command": "echo"}}}, indent=2) + "\n"
+    cursor_mcp.write_text(orig_mcp, encoding="utf-8")
+    bad_inst.write_bytes(b"\xff\xfe invalid utf8\n")
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.defpath}")
+
+    with pytest.raises(RuntimeError, match="harness installation error"):
+        install_all(
+            plugin_root, claude_cfg, cursor_cfg, codex_cfg, codex_toml,
+            shim_bin_dir=bin_dir, instruction_files=(bad_inst,), pack_source=pack_src, cursor_mcp_path=cursor_mcp,
+        )
+    assert cursor_mcp.read_text(encoding="utf-8") == orig_mcp
+    assert not (bin_dir / "cg-spool").exists()
+    assert not (bin_dir / "cg-outline").exists()

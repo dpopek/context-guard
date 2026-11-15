@@ -5,6 +5,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 
 ## [Unreleased]
 
+## [4.5.0] - 2026-11-15
+
+### Added
+- **Reversible output spool (`spool/store.py`, `bin/cg_spool.py`):** Content-addressed blobs, head/tail summaries, and `cg-spool` CLI.
+- **Stdio MCP spool (`spool/mcp_server.py`):** Exposes `cg_spool_slice`/`grep`/`list` over NDJSON/LSP and syncs Cursor `mcp.json`.
+- **Multi-step regret (`hooks/outcomes.py`):** Added `output_spool`, `cli_rewrite` verbose override, and `range_trim` overlap correlation.
+- **Spool telemetry & doctor (`hooks/telemetry.py`, `bin/cg_status.py`):** Added `outputs_spooled`, `shadow_spools`, and health checks.
+
+### Changed
+- **PostToolUse spooling (`hooks/post_tool_use.py`, `bin/harness_status.py`):** Sync Claude `Bash|mcp__.*` and Cursor MCP spool matchers.
+- **Installer & shim sync (`bin/install_harnesses.py`, `bin/instruction_block.py`):** Manages `cg-spool` shim and `"cursor_spool_mcp"`.
+- **Replay & scrubbing (`bin/replay_benchmark.py`):** Added `post_spool` / `spool_slice_recovery` steps and spool path scrubbing.
+- **CI & boundary gates (`pyproject.toml`, `tests/`):** Enforced mypy, ruff, Python 3.9, and acyclic DAG checks across `spool/`.
+
 ## [4.4.1] - 2026-11-15
 
 ### Changed

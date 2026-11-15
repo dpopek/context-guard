@@ -15,6 +15,7 @@ DEFAULT_CODEX_HOOKS = Path.home() / ".codex" / "hooks.json"
 CLAUDE_MATCHER = "Read|NotebookRead|Edit|MultiEdit|Write|NotebookEdit|Bash"
 CLAUDE_POST_SYNC_MATCHER = "Read|NotebookRead|Edit|MultiEdit|Write|NotebookEdit"
 CLAUDE_POST_ASYNC_MATCHER = "Bash"
+CLAUDE_POST_SPOOL_MATCHER = "Bash|mcp__.*"
 CLAUDE_POST_MATCHER = CLAUDE_POST_ASYNC_MATCHER
 CURSOR_MATCHER = (
     "Shell|Read|Edit|Write|StrReplace|MultiStrReplace|EditFile|WriteFile|DeleteFile|"
@@ -24,6 +25,7 @@ CURSOR_POST_MATCHER = (
     "Shell|run_terminal_cmd|Read|read_file|Edit|Write|StrReplace|MultiStrReplace|"
     "EditFile|WriteFile|Delete|DeleteFile|edit_file|write_file"
 )
+CURSOR_POST_SPOOL_MATCHER = f"{CURSOR_POST_MATCHER}|MCP:.*|mcp__.*"
 CODEX_MATCHER = "^(Bash|shell|exec_command|exec|apply_patch|Edit|Write|mcp__.*)$"
 CODEX_POST_MATCHER = "^(Bash|shell|exec_command|exec|apply_patch|Edit|Write)$"
 CG_HOOK_SCRIPTS = (
@@ -38,12 +40,23 @@ CG_HOOK_SCRIPTS = (
 )
 
 
-def claude_post_hook_groups(post_cmd: str) -> list[dict[str, Any]]:
-    """Return Claude PostToolUse/PostToolUseFailure sync file + async Bash hook groups."""
-    return [
-        {"matcher": CLAUDE_POST_SYNC_MATCHER, "hooks": [{"type": "command", "command": post_cmd}]},
-        {"matcher": CLAUDE_POST_ASYNC_MATCHER, "hooks": [{"type": "command", "command": post_cmd, "async": True}]},
-    ]
+def claude_post_hook_groups(
+    post_cmd: str,
+    *,
+    output_spool_mode: str = "off",
+    event_name: str = "PostToolUse",
+) -> list[dict[str, Any]]:
+    """Return Claude PostToolUse/PostToolUseFailure sync file + Bash/MCP hook groups."""
+    if output_spool_mode in ("active", "shadow") and event_name == "PostToolUse":
+        tail = {"matcher": CLAUDE_POST_SPOOL_MATCHER, "hooks": [{"type": "command", "command": post_cmd, "timeout": 10}]}
+    else:
+        tail = {"matcher": CLAUDE_POST_ASYNC_MATCHER, "hooks": [{"type": "command", "command": post_cmd, "async": True}]}
+    return [{"matcher": CLAUDE_POST_SYNC_MATCHER, "hooks": [{"type": "command", "command": post_cmd}]}, tail]
+
+
+def cursor_post_matcher(output_spool_mode: str = "off") -> str:
+    """Return Cursor postToolUse matcher for the configured `output_spool` mode."""
+    return CURSOR_POST_SPOOL_MATCHER if output_spool_mode in ("active", "shadow") else CURSOR_POST_MATCHER
 
 
 def is_cg_command(
@@ -165,14 +178,33 @@ def _extract_pre_tool_use_target(cmd: str) -> str | None:
     return match.group(2) if match.group(2) is not None else match.group(3)
 
 
-def _inspect_harness_config(path: Path) -> dict[str, Any]:
+def _is_post_tool_use_command(cmd: Any) -> bool:
+    return isinstance(cmd, str) and (("/hooks/post_tool_use.py" in cmd) or ("\\hooks\\post_tool_use.py" in cmd))
+
+
+def _spool_hook_ok(harness: str, hooks_obj: dict[str, Any], mode: str) -> bool:
+    if harness not in ("claude", "cursor"):
+        return True
+    spool_on = mode in ("active", "shadow")
+    raw = hooks_obj.get("PostToolUse" if harness == "claude" else "postToolUse")
+    if not isinstance(raw, list):
+        return False
+    if harness == "claude":
+        exp, bad = (CLAUDE_POST_SPOOL_MATCHER, None) if spool_on else (CLAUDE_POST_ASYNC_MATCHER, CLAUDE_POST_SPOOL_MATCHER)
+        cg: list[tuple[Any, dict[str, Any]]] = [
+            (g.get("matcher"), h) for g in raw if isinstance(g, dict) if isinstance((hs := g.get("hooks")), list)
+            for h in hs if isinstance(h, dict) and _is_post_tool_use_command(h.get("command"))
+        ]
+        return any(m == exp and (not spool_on or not h.get("async")) for m, h in cg) and not any(m == bad for m, _ in cg)
+    exp, bad = cursor_post_matcher(mode), (None if spool_on else CURSOR_POST_SPOOL_MATCHER)
+    cg_cu = [g.get("matcher") for g in raw if isinstance(g, dict) and _is_post_tool_use_command(g.get("command"))]
+    return exp in cg_cu and bad not in cg_cu
+
+
+def _inspect_harness_config(path: Path, *, harness: str = "", output_spool_mode: str = "off") -> dict[str, Any]:
     base: dict[str, Any] = {
-        "config_path": str(path),
-        "registered": False,
-        "targets": [],
-        "target": None,
-        "target_exists": False,
-        "ok": False,
+        "config_path": str(path), "registered": False, "targets": [],
+        "target": None, "target_exists": False, "ok": False, "spool_hook_ok": False,
     }
     if not path.exists():
         return base
@@ -193,19 +225,14 @@ def _inspect_harness_config(path: Path) -> dict[str, Any]:
             targets.append(target)
     target_exists = bool(targets) and all(Path(t).expanduser().is_file() for t in targets)
     return {
-        "config_path": str(path),
-        "registered": True,
-        "targets": targets,
-        "target": targets[0] if targets else None,
-        "target_exists": target_exists,
-        "ok": target_exists,
+        "config_path": str(path), "registered": True, "targets": targets,
+        "target": targets[0] if targets else None, "target_exists": target_exists,
+        "ok": target_exists, "spool_hook_ok": _spool_hook_ok(harness, data["hooks"], output_spool_mode),
     }
 
 
 def _resolve_harness_paths(
-    claude_settings_path: Path | None,
-    cursor_hooks_path: Path | None,
-    codex_hooks_path: Path | None,
+    claude_settings_path: Path | None, cursor_hooks_path: Path | None, codex_hooks_path: Path | None
 ) -> tuple[tuple[str, Path], ...]:
     return (
         ("claude", claude_settings_path if claude_settings_path is not None else DEFAULT_CLAUDE_SETTINGS),
@@ -215,34 +242,24 @@ def _resolve_harness_paths(
 
 
 def verify_harness_hooks(
-    claude_settings_path: Path | None = None,
-    cursor_hooks_path: Path | None = None,
-    codex_hooks_path: Path | None = None,
+    claude_settings_path: Path | None = None, cursor_hooks_path: Path | None = None,
+    codex_hooks_path: Path | None = None, *, output_spool_mode: str = "off",
 ) -> dict[str, dict[str, Any]]:
     """Verify registered hook configs and check on-disk existence of extracted `pre_tool_use.py` targets."""
-    return {
-        name: _inspect_harness_config(path)
-        for name, path in _resolve_harness_paths(claude_settings_path, cursor_hooks_path, codex_hooks_path)
-    }
+    paths = _resolve_harness_paths(claude_settings_path, cursor_hooks_path, codex_hooks_path)
+    return {name: _inspect_harness_config(p, harness=name, output_spool_mode=output_spool_mode) for name, p in paths}
 
 
 def check_status(
-    claude_settings_path: Path | None = None,
-    cursor_hooks_path: Path | None = None,
-    codex_hooks_path: Path | None = None,
+    claude_settings_path: Path | None = None, cursor_hooks_path: Path | None = None, codex_hooks_path: Path | None = None
 ) -> dict[str, bool]:
     """Return whether Context-Guard is installed in each harness config."""
-    return {
-        name: bool(_inspect_harness_config(path)["registered"])
-        for name, path in _resolve_harness_paths(claude_settings_path, cursor_hooks_path, codex_hooks_path)
-    }
+    paths = _resolve_harness_paths(claude_settings_path, cursor_hooks_path, codex_hooks_path)
+    return {name: bool(_inspect_harness_config(p, harness=name)["registered"]) for name, p in paths}
 
 
 def native_fail_closed_hook_extras(
-    runtime_cfg: Mapping[str, Any],
-    *,
-    claude_version: tuple[int, int, int] | None = None,
-    probe_claude_fn: Any = None,
+    runtime_cfg: Mapping[str, Any], *, claude_version: tuple[int, int, int] | None = None, probe_claude_fn: Any = None
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Return `(claude_pre_extra, cursor_pre_extra)` when security policy enforcement is active."""
     packs = runtime_cfg.get("policy_packs")
@@ -252,9 +269,7 @@ def native_fail_closed_hook_extras(
         or (
             isinstance(packs, list)
             and any(
-                isinstance(e, Mapping)
-                and e.get("enabled", True)
-                and str(e.get("kind") or "security") == "security"
+                isinstance(e, Mapping) and e.get("enabled", True) and str(e.get("kind") or "security") == "security"
                 for e in packs
             )
         )
@@ -262,12 +277,6 @@ def native_fail_closed_hook_extras(
     if not sec_active:
         return None, None
     cursor_extra: dict[str, Any] = {"failClosed": True, "timeout": 10}
-    eff_ver = claude_version
-    if eff_ver is None and probe_claude_fn is not None:
-        eff_ver = probe_claude_fn()
-    claude_extra: dict[str, Any] | None = (
-        {"onFailure": "block", "timeout": 15}
-        if (eff_ver is not None and eff_ver >= (2, 1, 295))
-        else None
-    )
+    eff_ver = probe_claude_fn() if (claude_version is None and probe_claude_fn is not None) else claude_version
+    claude_extra = {"onFailure": "block", "timeout": 15} if (eff_ver is not None and eff_ver >= (2, 1, 295)) else None
     return claude_extra, cursor_extra

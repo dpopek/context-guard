@@ -163,6 +163,7 @@ def default_runtime_config() -> dict[str, Any]:
         },
         "integrations": {
             "atlassian_twg": "off",
+            "cursor_spool_mcp": "off",
         },
         "regret_window_steps": 2,
         "policy_packs": [],
@@ -211,11 +212,12 @@ def load_runtime_config(config_path: Path | None = None) -> dict[str, Any]:
     if raw_ints is not None:
         if not isinstance(raw_ints, dict):
             return {**defaults, "config_path": str(eff_path), "config_error": "invalid 'integrations': expected object"}
-        if "atlassian_twg" in raw_ints:
-            twg_val = raw_ints["atlassian_twg"]
-            if not isinstance(twg_val, str) or twg_val not in INTEGRATION_MODES:
-                return {**defaults, "config_path": str(eff_path), "config_error": "invalid 'integrations.atlassian_twg'"}
-            int_out["atlassian_twg"] = twg_val
+        for key in ("atlassian_twg", "cursor_spool_mcp"):
+            if key in raw_ints:
+                val = raw_ints[key]
+                if not isinstance(val, str) or val not in INTEGRATION_MODES:
+                    return {**defaults, "config_path": str(eff_path), "config_error": f"invalid 'integrations.{key}'"}
+                int_out[key] = val
 
     regret_raw = raw.get("regret_window_steps", 2)
     if isinstance(regret_raw, bool) or not isinstance(regret_raw, int) or regret_raw < 1:

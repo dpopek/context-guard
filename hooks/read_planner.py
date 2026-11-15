@@ -293,6 +293,8 @@ def plan_file_read_verdict(
     if trimmed is not None and t_lines > 0 and trimmed[0] > t_lines:
         trimmed = None
     es, ee = trimmed or (start_line, end_line)
+    eff_e = t_lines if (t_lines > 0 and probe_e == -1) else (min(probe_e, t_lines) if (t_lines > 0 and probe_e > 0) else probe_e)
+    trim_meta = ({"trimmed_start": start_line, "trimmed_end": es - 1} if es > start_line else ({"trimmed_start": ee + 1, "trimmed_end": eff_e} if eff_e > 0 and ee < eff_e else {})) if trimmed is not None else {}
     cap_e = telemetry.cap_end_line_for_harness(harness, es, ee)
     cap_re = telemetry.cap_end_line_for_harness(harness, start_line, end_line)
     slice_b = _measure_slice(read_target, p_lines, es, cap_e)
@@ -314,7 +316,7 @@ def plan_file_read_verdict(
         "byte_offset": byte_offset, "redirect_path": redir_p, "is_trim": trimmed is not None,
         "is_redirect": redir_p is not None, "req_bytes": req_b, "trimmed_bytes": slice_b,
         "saved_bytes": max(0, req_b - slice_b) if trimmed is not None else 0, "synthetic_id": synth,
-        "post_stage": "pending", "credited": False, "model": model, "ts": time.time(),
+        "post_stage": "pending", "credited": False, "model": model, "ts": time.time(), **trim_meta,
     }
     meta = {"sha": sha256, "step": step_idx, "inc": auto_increment_step, "ol": False, "pw": redir_pw,
             "rl": t_lines, "pk": path_arg_key, "cid": call_id, "pending": pending_record,

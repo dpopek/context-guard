@@ -146,7 +146,7 @@ def render_outcomes_report(
             rec_f = _dim_int(row, "recovery", "full")
             reg_s = _dim_int(row, "regret", "suspected")
             reg_c = _dim_int(row, "regret", "confirmed")
-            if kind in ("outline", "outline_pull") or any((rec_t, rec_f, reg_s, reg_c)):
+            if kind in ("outline", "outline_pull", "output_spool") or any((rec_t, rec_f, reg_s, reg_c)):
                 cols = [f"{c:,} ({_pct_label(c, total)})" for c in (rec_t, rec_f, reg_s, reg_c)]
             else:
                 cols = ["—", "—", "—", "—"]

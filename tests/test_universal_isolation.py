@@ -476,7 +476,7 @@ def test_exported_rules_agents_md_and_root_agents_md_enforce_universal_isolation
         )
 
     antigravity_home_re = re.compile(r'Path\.home\(\)\s*/\s*["\']Antigravity["\']')
-    for folder in ("hooks", "bin", "policies", "integrations"):
+    for folder in ("hooks", "bin", "policies", "integrations", "spool"):
         for py_path in sorted((ROOT / folder).glob("*.py")):
             src = py_path.read_text(encoding="utf-8")
             assert antigravity_home_re.search(src) is None, (

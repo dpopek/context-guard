@@ -20,7 +20,7 @@ def test_constants_and_ledger_path_helper(tmp_path: Path) -> None:
     assert not hasattr(outcomes, "WINDOW_STEPS")
     assert not hasattr(outcomes, "COVERAGE_THRESHOLD")
     assert outcomes.OUTCOMES_KINDS == outcomes.INTERVENTION_KINDS
-    assert set(outcomes.OUTCOMES_KINDS) == {"outline", "range_trim", "cli_rewrite", "outline_pull"}
+    assert set(outcomes.OUTCOMES_KINDS) == {"outline", "range_trim", "cli_rewrite", "outline_pull", "output_spool"}
     assert outcomes.ledger_path_for(None) is None
     assert outcomes.ledger_path_for("") is None
     assert outcomes.ledger_path_for(str(tmp_path)) == tmp_path / "outcomes.json"
@@ -708,5 +708,60 @@ def test_pre_tool_use_attribution_and_window_consumption_no_double_count(tmp_pat
     )
     row_pull = read_outcomes_ledger(sd_w)["by_key"]["antigravity|unknown|outline_pull"]
     assert row_pull["recovery"]["none"] == 1 and row_pull["regret"]["none"] == 1
+
+
+def test_open_outcome_window_preserves_scalar_meta_across_normalisation(tmp_path: Path) -> None:
+    ledger = tmp_path / "outcomes.json"
+    long_text = "x" * 200
+    outcomes.open_outcome_window(
+        "claude",
+        "claude-sonnet-4-6",
+        "output_spool",
+        "s-meta",
+        "spool:sp_001",
+        step_idx=3,
+        regret_window_steps=4,
+        ledger_path=ledger,
+        meta={
+            "spool_id": "sp_001",
+            "cmd_sig": "shell:pytest",
+            "total_lines": 250,
+            "ratio": 0.5,
+            "flag": True,
+            "long_str": long_text,
+            "k7": 7,
+            "k8": 8,
+            "k9_dropped": 9,
+            "nested": {"bad": 1},
+            "list_val": [1, 2],
+            "": "empty_key_dropped",
+        },
+    )
+    # Trigger another unrelated write so _normalise_outcomes runs against the persisted open window
+    outcomes.record_direct_outcome(
+        "claude",
+        "claude-sonnet-4-6",
+        "outline",
+        "applied",
+        ledger,
+        session_id="s-other",
+        step_idx=1,
+        call_id="c-other",
+    )
+    loaded = outcomes.load_outcomes(ledger)
+    windows = loaded["open_windows"]
+    assert len(windows) == 1
+    meta = next(iter(windows.values()))["meta"]
+    assert meta["spool_id"] == "sp_001"
+    assert meta["cmd_sig"] == "shell:pytest"
+    assert meta["total_lines"] == 250
+    assert meta["ratio"] == 0.5
+    assert meta["flag"] is True
+    assert meta["long_str"] == "x" * 160
+    assert len(meta) == 8
+    assert "k9_dropped" not in meta
+    assert "nested" not in meta
+    assert "list_val" not in meta
+    assert "" not in meta
 
 

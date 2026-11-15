@@ -13,7 +13,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path, PurePath
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import quote
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
@@ -26,27 +26,21 @@ from bin.codex_toml import (  # noqa: E402
     sync_codex_config_toml as sync_codex_config_toml,
 )
 from bin.harness_status import (  # noqa: E402
-    CLAUDE_MATCHER,
-    CLAUDE_POST_MATCHER as CLAUDE_POST_MATCHER,
-    CODEX_MATCHER,
-    CODEX_POST_MATCHER as CODEX_POST_MATCHER,
-    CURSOR_MATCHER,
-    CURSOR_POST_MATCHER as CURSOR_POST_MATCHER,
-    DEFAULT_CLAUDE_SETTINGS,
-    DEFAULT_CODEX_HOOKS,
-    DEFAULT_CURSOR_HOOKS,
-    check_status as check_harness_status,
-    claude_post_hook_groups,
-    merge_harness_matcher,
-    native_fail_closed_hook_extras,
-    without_cg_handlers,
+    CLAUDE_MATCHER, CLAUDE_POST_MATCHER as CLAUDE_POST_MATCHER, CODEX_MATCHER, CODEX_POST_MATCHER as CODEX_POST_MATCHER,
+    CURSOR_MATCHER, CURSOR_POST_MATCHER as CURSOR_POST_MATCHER, DEFAULT_CLAUDE_SETTINGS, DEFAULT_CODEX_HOOKS,
+    DEFAULT_CURSOR_HOOKS, check_status as check_harness_status, claude_post_hook_groups, cursor_post_matcher,
+    merge_harness_matcher, native_fail_closed_hook_extras, verify_harness_hooks, without_cg_handlers,
 )
-from bin.instruction_block import DEFAULT_INSTRUCTION_FILES, DEFAULT_SHIM_BIN_DIR, install_outline_pull, shim_installed, uninstall_outline_pull  # noqa: E402
+from bin.instruction_block import (  # noqa: E402
+    DEFAULT_INSTRUCTION_FILES, DEFAULT_SHIM_BIN_DIR, SPOOL_SHIM_MARKER, SPOOL_SHIM_NAME,
+    install_outline_pull, shim_installed, uninstall_outline_pull,
+)
 from bin.migration_guard import RollbackJournal, StagedPackTransaction, preflight_migration_check  # noqa: E402
 from hooks.config import cached_raw_config_status, clear_config_cache, load_runtime_config, probe_claude_cli_version, resolve_user_config_path  # noqa: E402
 from hooks.policy_engine import PolicyPackLoadError, load_verified_policy_pack  # noqa: E402
 from hooks.state_store import resolve_plugin_root, warn  # noqa: E402
 from policies.api import InstallerHookSpec  # noqa: E402
+from spool.mcp_server import sync_cursor_spool_mcp  # noqa: E402
 
 _INITIAL_PLUGIN_ROOT = resolve_plugin_root()
 DEFAULT_PLUGIN_ROOT = _INITIAL_PLUGIN_ROOT
@@ -61,6 +55,7 @@ def _active_plugin_root(plugin_root: Path | None = None) -> Path:
 
 
 DEFAULT_CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
+DEFAULT_CURSOR_MCP_PATH = Path.home() / ".cursor" / "mcp.json"
 DEFAULT_CURSOR_EXTENSIONS = Path.home() / ".cursor" / "extensions"
 DEFAULT_ANTIGRAVITY_EXTENSIONS = Path.home() / ".antigravity" / "extensions"
 DEFAULT_ANTIGRAVITY_IDE_EXTENSIONS = Path.home() / ".antigravity-ide" / "extensions"
@@ -68,6 +63,35 @@ DEFAULT_ANTIGRAVITY_IDE_EXTENSIONS = Path.home() / ".antigravity-ide" / "extensi
 EXTENSION_ID = "advox.context-guard-statusbar"
 
 _SAFE_HOOK_PATH_RE = re.compile(r"[A-Za-z0-9_./:-]+")
+
+
+def _resolve_cursor_mcp_path(cursor_hooks_path: Path, cursor_mcp_path: Path | None) -> Path:
+    if cursor_mcp_path is not None:
+        return cursor_mcp_path
+    return DEFAULT_CURSOR_MCP_PATH if cursor_hooks_path == DEFAULT_CURSOR_HOOKS else cursor_hooks_path.parent / "mcp.json"
+
+
+def _sync_cursor_mcp(
+    cursor_hooks_path: Path, cursor_mcp_path: Path | None, plugin_root: Path,
+    *, enabled: bool, dry_run: bool, journal: RollbackJournal | None,
+) -> str:
+    try:
+        return sync_cursor_spool_mcp(
+            _resolve_cursor_mcp_path(cursor_hooks_path, cursor_mcp_path), plugin_root,
+            enabled=enabled, dry_run=dry_run, journal=journal,
+        )
+    except (OSError, ValueError) as exc:
+        warn(f"cursor spool mcp sync failed: {type(exc).__name__}: {exc}")
+        return f"error ({type(exc).__name__})"
+
+
+def _cursor_spool_mcp_installed(mcp_path: Path) -> bool:
+    try:
+        raw = json.loads(Path(mcp_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    servers = raw.get("mcpServers") if isinstance(raw, dict) else None
+    return isinstance(servers, dict) and "context-guard-spool" in servers
 
 
 def resolve_python_command(
@@ -214,7 +238,7 @@ def _update_nested_hooks_json(
     post_matcher: str | None = None,
     post_handler_extra: dict[str, Any] | None = None,
     pre_handler_extra: dict[str, Any] | None = None,
-    post_groups: Sequence[dict[str, Any]] | None = None,
+    post_groups: Sequence[dict[str, Any]] | Mapping[str, Sequence[dict[str, Any]]] | None = None,
     unmatchered_events: Sequence[tuple[str, str]] = (),
     extra_hooks: Sequence[InstallerHookSpec] = (),
     managed_cmds: frozenset[str] = frozenset(),
@@ -263,8 +287,9 @@ def _update_nested_hooks_json(
         )
     if post_groups is not None:
         for evt_key in post_events:
+            groups = post_groups.get(evt_key, ()) if isinstance(post_groups, Mapping) else post_groups
             hooks_root.setdefault(evt_key, []).extend(
-                {"matcher": g["matcher"], "hooks": [dict(h) for h in g["hooks"]]} for g in post_groups
+                {"matcher": g["matcher"], "hooks": [dict(h) for h in g["hooks"]]} for g in groups
             )
     elif post_cmd is not None:
         for evt_key in post_events:
@@ -315,6 +340,7 @@ def _update_cursor_hooks_json(
     managed_frags: tuple[tuple[str, ...], ...] = (),
     managed_events: frozenset[str] = frozenset(),
     pre_entry_extra: dict[str, Any] | None = None,
+    post_matcher: str = CURSOR_POST_MATCHER,
     journal: RollbackJournal | None = None,
 ) -> str:
     if not cfg_path.exists():
@@ -352,7 +378,7 @@ def _update_cursor_hooks_json(
     if compact_cmd is not None:
         hooks_root.setdefault("preCompact", []).append({"command": compact_cmd})
     if post_cmd is not None:
-        hooks_root.setdefault("postToolUse", []).append({"command": post_cmd, "matcher": CURSOR_POST_MATCHER})
+        hooks_root.setdefault("postToolUse", []).append({"command": post_cmd, "matcher": post_matcher})
     for spec in extra_hooks:
         entry: dict[str, Any] = {"command": spec.command}
         if spec.matcher is not None:
@@ -502,6 +528,7 @@ def install_all(
     workspace_root: Path | None = None,
     pack_source: Path | None = None,
     claude_version: tuple[int, int, int] | None = None,
+    cursor_mcp_path: Path | None = None,
 ) -> dict[str, str]:
     """Idempotently install Context-Guard hooks & status bars across Claude Code, Cursor, Antigravity, and Codex."""
     plugin_root = _active_plugin_root(plugin_root)
@@ -529,6 +556,7 @@ def install_all(
             clear_config_cache()
 
     try:
+        j_arg = journal if not dry_run else None
         py_cmd = resolve_python_command()
         pre_script = format_hook_script_path(Path(plugin_root) / "hooks" / "pre_tool_use.py")
         compact_script = format_hook_script_path(Path(plugin_root) / "hooks" / "pre_compact.py")
@@ -536,82 +564,57 @@ def install_all(
         post_script = format_hook_script_path(Path(plugin_root) / "hooks" / "post_tool_use.py")
         session_end_script = format_hook_script_path(Path(plugin_root) / "hooks" / "session_end.py")
 
-        pack_matchers, pack_hooks, managed_cmds, managed_frags, managed_events = _collect_pack_contributions(
-            py_cmd, workspace_root=workspace_root
-        )
+        pack_matchers, pack_hooks, managed_cmds, managed_frags, managed_events = _collect_pack_contributions(py_cmd, workspace_root=workspace_root)
         claude_matcher = merge_harness_matcher(CLAUDE_MATCHER, pack_matchers.get("claude", ()))
         cursor_matcher = merge_harness_matcher(CURSOR_MATCHER, pack_matchers.get("cursor", ()))
         codex_matcher = merge_harness_matcher(CODEX_MATCHER, pack_matchers.get("codex", ()), regex_anchored=True)
         claude_post_cmd = f"{py_cmd} {post_script} --harness claude"
+        runtime_cfg = load_runtime_config()
+        opt_mode = str(runtime_cfg.get("optimizers", {}).get("output_spool", "off"))
+        mcp_mode = str(runtime_cfg.get("integrations", {}).get("cursor_spool_mcp", "off"))
         claude_pre_extra, cursor_pre_extra = native_fail_closed_hook_extras(
-            load_runtime_config(),
-            claude_version=claude_version,
+            runtime_cfg, claude_version=claude_version,
             probe_claude_fn=(probe_claude_cli_version if claude_settings_path.exists() else None),
         )
-
+        claude_post_groups = {
+            evt: claude_post_hook_groups(claude_post_cmd, output_spool_mode=opt_mode, event_name=evt)
+            for evt in ("PostToolUse", "PostToolUseFailure")
+        }
         claude_status, _ = _update_nested_hooks_json(
-            claude_settings_path,
-            pre_cmd=f"{py_cmd} {pre_script} --harness claude",
-            pre_matcher=claude_matcher,
-            compact_cmd=f"{py_cmd} {compact_script} --harness claude",
-            dry_run=dry_run,
-            statusline_cmd=f"{py_cmd} {status_script} --claude-hud",
-            manage_statusline=True,
-            post_events=("PostToolUse", "PostToolUseFailure"),
-            post_groups=claude_post_hook_groups(claude_post_cmd),
+            claude_settings_path, pre_cmd=f"{py_cmd} {pre_script} --harness claude", pre_matcher=claude_matcher,
+            compact_cmd=f"{py_cmd} {compact_script} --harness claude", dry_run=dry_run,
+            statusline_cmd=f"{py_cmd} {status_script} --claude-hud", manage_statusline=True,
+            post_events=("PostToolUse", "PostToolUseFailure"), post_groups=claude_post_groups,
             unmatchered_events=(
                 ("PostToolBatch", f"{claude_post_cmd} --event PostToolBatch"),
                 ("SessionEnd", f"{py_cmd} {session_end_script} --harness claude"),
             ),
-            extra_hooks=pack_hooks.get("claude", ()),
-            managed_cmds=managed_cmds,
-            managed_frags=managed_frags,
-            managed_events=managed_events,
-            pre_handler_extra=claude_pre_extra,
-            journal=journal if not dry_run else None,
+            extra_hooks=pack_hooks.get("claude", ()), managed_cmds=managed_cmds, managed_frags=managed_frags,
+            managed_events=managed_events, pre_handler_extra=claude_pre_extra, journal=j_arg,
         )
         cursor_status = _update_cursor_hooks_json(
-            cursor_hooks_path,
-            pre_cmd=f"{py_cmd} {pre_script} --harness cursor",
-            compact_cmd=f"{py_cmd} {compact_script} --harness cursor",
-            dry_run=dry_run,
-            post_cmd=f"{py_cmd} {post_script} --harness cursor",
-            pre_matcher=cursor_matcher,
-            extra_hooks=pack_hooks.get("cursor", ()),
-            managed_cmds=managed_cmds,
-            managed_frags=managed_frags,
-            managed_events=managed_events,
-            pre_entry_extra=cursor_pre_extra,
-            journal=journal if not dry_run else None,
+            cursor_hooks_path, pre_cmd=f"{py_cmd} {pre_script} --harness cursor",
+            compact_cmd=f"{py_cmd} {compact_script} --harness cursor", dry_run=dry_run,
+            post_cmd=f"{py_cmd} {post_script} --harness cursor", pre_matcher=cursor_matcher,
+            post_matcher=cursor_post_matcher(opt_mode), extra_hooks=pack_hooks.get("cursor", ()),
+            managed_cmds=managed_cmds, managed_frags=managed_frags, managed_events=managed_events,
+            pre_entry_extra=cursor_pre_extra, journal=j_arg,
         )
         codex_status, codex_data = _update_nested_hooks_json(
-            codex_hooks_path,
-            pre_cmd=f"{py_cmd} {pre_script} --harness codex",
-            pre_matcher=codex_matcher,
-            compact_cmd=f"{py_cmd} {compact_script} --harness codex",
-            dry_run=dry_run,
-            post_cmd=f"{py_cmd} {post_script} --harness codex",
-            post_events=("PostToolUse",),
-            post_matcher=CODEX_POST_MATCHER,
-            post_handler_extra={"timeout": 5},
-            extra_hooks=pack_hooks.get("codex", ()),
-            managed_cmds=managed_cmds,
-            managed_frags=managed_frags,
-            managed_events=managed_events,
-            journal=journal if not dry_run else None,
+            codex_hooks_path, pre_cmd=f"{py_cmd} {pre_script} --harness codex", pre_matcher=codex_matcher,
+            compact_cmd=f"{py_cmd} {compact_script} --harness codex", dry_run=dry_run,
+            post_cmd=f"{py_cmd} {post_script} --harness codex", post_events=("PostToolUse",),
+            post_matcher=CODEX_POST_MATCHER, post_handler_extra={"timeout": 5},
+            extra_hooks=pack_hooks.get("codex", ()), managed_cmds=managed_cmds,
+            managed_frags=managed_frags, managed_events=managed_events, journal=j_arg,
         )
-        j_arg = journal if not dry_run else None
 
         def _toml_write(p: Path, c: str) -> None:
             _atomic_write_text(p, c, journal=j_arg)
 
         toml_status = sync_codex_config_toml(
-            codex_hooks_path=codex_hooks_path,
-            codex_config_path=codex_config_path,
-            hooks_data=codex_data,
-            ensure_compact_limit=True,
-            dry_run=dry_run,
-            atomic_writer=_toml_write,
+            codex_hooks_path=codex_hooks_path, codex_config_path=codex_config_path,
+            hooks_data=codex_data, ensure_compact_limit=True, dry_run=dry_run, atomic_writer=_toml_write,
         )
         _skip = "skipped (not requested)"
         cursor_ext_status = install_ide_extension(plugin_root, cursor_extensions_dir, dry_run=dry_run, journal=j_arg) if cursor_extensions_dir is not None else _skip
@@ -621,17 +624,18 @@ def install_all(
             eff_bin = shim_bin_dir or (DEFAULT_SHIM_BIN_DIR if use_defaults else None)
             if eff_bin is not None:
                 j_arg.record_file_backup(eff_bin / "cg-outline")
+                j_arg.record_file_backup(eff_bin / SPOOL_SHIM_NAME)
             eff_inst = instruction_files if instruction_files is not None else (DEFAULT_INSTRUCTION_FILES if use_defaults else ())
             for inst_path in eff_inst:
                 j_arg.record_file_backup(inst_path)
+        cursor_mcp_status = _sync_cursor_mcp(
+            cursor_hooks_path, cursor_mcp_path, plugin_root,
+            enabled=(opt_mode == "active" and mcp_mode == "active"), dry_run=dry_run, journal=j_arg,
+        )
         res = {
-            "claude": claude_status,
-            "cursor": cursor_status,
-            "codex_hooks": codex_status,
-            "codex_config": toml_status,
-            "cursor_extension": cursor_ext_status,
-            "antigravity_extension": agy_ext_status,
-            "antigravity_ide_extension": agy_ide_ext_status,
+            "claude": claude_status, "cursor": cursor_status, "codex_hooks": codex_status, "codex_config": toml_status,
+            "cursor_extension": cursor_ext_status, "antigravity_extension": agy_ext_status,
+            "antigravity_ide_extension": agy_ide_ext_status, "cursor_spool_mcp": cursor_mcp_status,
             **install_outline_pull(plugin_root, use_defaults, shim_bin_dir, instruction_files, dry_run),
         }
         if txn is not None and not dry_run:
@@ -657,6 +661,7 @@ def uninstall_all(
     dry_run: bool = False,
     shim_bin_dir: Path | None = None,
     instruction_files: Sequence[Path] | None = None,
+    cursor_mcp_path: Path | None = None,
 ) -> dict[str, str]:
     """Remove Context-Guard hooks & status bars from Claude Code, Cursor, Antigravity, and OpenAI Codex."""
     if cursor_extensions_dir is None and claude_settings_path == DEFAULT_CLAUDE_SETTINGS:
@@ -688,9 +693,13 @@ def uninstall_all(
     cursor_ext_status = _uninstall_ide_extension(cursor_extensions_dir, dry_run=dry_run) if cursor_extensions_dir is not None else _skip
     agy_ext_status = _uninstall_ide_extension(antigravity_extensions_dir, dry_run=dry_run) if antigravity_extensions_dir is not None else _skip
     agy_ide_ext_status = _uninstall_ide_extension(antigravity_ide_extensions_dir, dry_run=dry_run) if antigravity_ide_extensions_dir is not None else _skip
+    cursor_mcp_status = _sync_cursor_mcp(
+        cursor_hooks_path, cursor_mcp_path, _active_plugin_root(), enabled=False, dry_run=dry_run, journal=None
+    )
     return {
         "claude": claude_status, "cursor": cursor_status, "codex_hooks": codex_status, "codex_config": toml_status,
-        "cursor_extension": cursor_ext_status, "antigravity_extension": agy_ext_status, "antigravity_ide_extension": agy_ide_ext_status,
+        "cursor_extension": cursor_ext_status, "antigravity_extension": agy_ext_status,
+        "antigravity_ide_extension": agy_ide_ext_status, "cursor_spool_mcp": cursor_mcp_status,
         **uninstall_outline_pull(claude_settings_path == DEFAULT_CLAUDE_SETTINGS, shim_bin_dir, instruction_files, dry_run),
     }
 
@@ -700,14 +709,22 @@ def check_status(
     cursor_hooks_path: Path | None = None,
     codex_hooks_path: Path | None = None,
     shim_bin_dir: Path | None = None,
+    cursor_mcp_path: Path | None = None,
 ) -> dict[str, bool]:
-    """Return whether Context-Guard is installed in each harness config, and the `cg-outline` shim."""
-    status = check_harness_status(
-        claude_settings_path=claude_settings_path if claude_settings_path is not None else DEFAULT_CLAUDE_SETTINGS,
-        cursor_hooks_path=cursor_hooks_path if cursor_hooks_path is not None else DEFAULT_CURSOR_HOOKS,
-        codex_hooks_path=codex_hooks_path if codex_hooks_path is not None else DEFAULT_CODEX_HOOKS,
-    )
-    status["outline_pull"] = shim_installed(shim_bin_dir or DEFAULT_SHIM_BIN_DIR)
+    """Return whether Context-Guard is installed in each harness config, shims, and Cursor spool MCP."""
+    eff_cl = claude_settings_path if claude_settings_path is not None else DEFAULT_CLAUDE_SETTINGS
+    eff_cu = cursor_hooks_path if cursor_hooks_path is not None else DEFAULT_CURSOR_HOOKS
+    eff_cx = codex_hooks_path if codex_hooks_path is not None else DEFAULT_CODEX_HOOKS
+    eff_bin = shim_bin_dir or DEFAULT_SHIM_BIN_DIR
+    status = check_harness_status(claude_settings_path=eff_cl, cursor_hooks_path=eff_cu, codex_hooks_path=eff_cx)
+    opt_mode = str(load_runtime_config().get("optimizers", {}).get("output_spool", "off"))
+    if opt_mode in ("active", "shadow"):
+        details = verify_harness_hooks(eff_cl, eff_cu, eff_cx, output_spool_mode=opt_mode)
+        status["claude"] = status["claude"] and bool(details["claude"].get("spool_hook_ok"))
+        status["cursor"] = status["cursor"] and bool(details["cursor"].get("spool_hook_ok"))
+    status["outline_pull"] = shim_installed(eff_bin)
+    status["cg_spool_shim"] = shim_installed(eff_bin, shim_name=SPOOL_SHIM_NAME, marker=SPOOL_SHIM_MARKER)
+    status["cursor_spool_mcp"] = _cursor_spool_mcp_installed(_resolve_cursor_mcp_path(eff_cu, cursor_mcp_path))
     return status
 
 

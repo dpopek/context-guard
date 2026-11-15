@@ -19,12 +19,14 @@ from hooks import config, outcomes, policy_engine, post_tool_use, pre_tool_use, 
 from hooks.harness_adapter import normalize_pre_tool_payload
 
 ALLOWED_TEST_USERS = frozenset({"dev", "x", "u", "user", "example", "acme", "alice", "bob", "jan"})
+_SPOOL_ID_FIND_RE = re.compile(r"\bsp_[0-9a-f]{12}\b")
 _SCRUB_KEYS = frozenset({
     "config_path", "transcript_path", "shadow_path", "private_policy_stats", "private_policy_stats_path",
     "policy_packs", "pack_details", "file_hashes", "tree_sha256", "repo_map_path", "workspace_root",
     "stats_path", "outcomes_path", "usage_path", "update_path", "state_dir", "home_dir", "shadow", "cwd",
+    "spool_dir", "spool_path", "spool_index",
 })
-_SENSITIVE_FILES = ("shadow.json", "private_policy_stats.json")
+_SENSITIVE_FILES = ("shadow.json", "private_policy_stats.json", "spool_index.json")
 _SKIP_DIRS = frozenset({".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "node_modules", ".venv", "venv"})
 _POSIX_HOME_RE = re.compile(r"(?<![A-Za-z0-9_])/(?:Users|home)/([A-Za-z0-9_][A-Za-z0-9._-]*)")
 _WIN_HOME_RE = re.compile(r"[A-Za-z]:[/\\](?:Users)[/\\]([A-Za-z0-9_][A-Za-z0-9._-]*)")
@@ -43,15 +45,15 @@ _SECRET_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("slack_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
     ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
 )
-_ENV_KEYS = ("HOME", "USERPROFILE", "XDG_CONFIG_HOME", "APPDATA", "LOCALAPPDATA", "CONTEXT_GUARD_HOME", "CONTEXT_GUARD_CONFIG_PATH")
+_ENV_KEYS = ("HOME", "USERPROFILE", "XDG_CONFIG_HOME", "APPDATA", "LOCALAPPDATA", "CONTEXT_GUARD_HOME", "CONTEXT_GUARD_CONFIG_PATH", "CONTEXT_GUARD_SPOOL_DIR")
 
 
 @contextmanager
 def _isolated_runtime(root: Path, cfg_payload: Mapping[str, Any]) -> Iterator[dict[str, Path]]:
     """Redirect env vars, telemetry paths, and caches strictly into TemporaryDirectory."""
     res = root.resolve()
-    home_d, cg_d, tel_d, state_d = res / "home", res / "cg_home", res / "telemetry", res / "state"
-    for p in (home_d, res / "xdg", res / "appdata", res / "localappdata", cg_d, tel_d, state_d):
+    home_d, cg_d, tel_d, state_d, spool_d = res / "home", res / "cg_home", res / "telemetry", res / "state", res / "spool"
+    for p in (home_d, res / "xdg", res / "appdata", res / "localappdata", cg_d, tel_d, state_d, spool_d):
         p.mkdir(parents=True, exist_ok=True)
     cfg_p = res / "config.json"
     cfg_p.write_text(json.dumps(cfg_payload, indent=2), encoding="utf-8")
@@ -63,6 +65,7 @@ def _isolated_runtime(root: Path, cfg_payload: Mapping[str, Any]) -> Iterator[di
             "HOME": str(home_d), "USERPROFILE": str(home_d), "XDG_CONFIG_HOME": str(res / "xdg"),
             "APPDATA": str(res / "appdata"), "LOCALAPPDATA": str(res / "localappdata"),
             "CONTEXT_GUARD_HOME": str(cg_d), "CONTEXT_GUARD_CONFIG_PATH": str(cfg_p),
+            "CONTEXT_GUARD_SPOOL_DIR": str(spool_d),
         })
         config.DEFAULT_USER_CONFIG_PATH = home_d / ".config" / "context-guard" / "config.json"
         telemetry.DEFAULT_TELEMETRY_PATH = tel_d / "stats.json"
@@ -71,7 +74,7 @@ def _isolated_runtime(root: Path, cfg_payload: Mapping[str, Any]) -> Iterator[di
         config.clear_config_cache()
         policy_engine.clear_pack_cache()
         yield {
-            "root": res, "home_dir": home_d, "cg_home": cg_d,
+            "root": res, "home_dir": home_d, "cg_home": cg_d, "spool_dir": spool_d,
             "config_path": cfg_p, "stats_path": tel_d / "stats.json", "state_dir": state_d,
         }
     finally:
@@ -119,12 +122,16 @@ def _create_corpus(ws: Path) -> tuple[Path, Path, list[str]]:
 
 
 def _decision_kind(res: Mapping[str, Any]) -> str:
+    if "updated_mcp_tool_output" in res:
+        return "spooled"
     if res.get("overwrite") or res.get("updatedInput"):
         return "modify"
     if "permissionDecision" in res:
         return str(res["permissionDecision"])
     hso = res.get("hookSpecificOutput")
     if isinstance(hso, Mapping):
+        if "updatedToolOutput" in hso:
+            return "spooled"
         if hso.get("updatedInput"):
             return "modify"
         if "permissionDecision" in hso:
@@ -165,6 +172,27 @@ def _replay_one_mode(root: Path, mode: str) -> dict[str, Any]:
             "tool_calls": [{"tool_name": "Read", "tool_use_id": "cl-2", "tool_input": {"file_path": str(large_py), "offset": 241, "limit": 120}, "tool_response": [{"type": "text", "text": "\n".join(all_lines[240:360])}]}],
         }
         batch_res = post_tool_use.handle_post_tool_use("claude", batch_payload, stats_path=stats_p, state_dir=sdir, event_name="PostToolBatch")
+        spool_out = "\n".join(f"line-{i:04d}: " + ("x" * 70) for i in range(260))
+        spool_payload = {
+            "tool_name": "Bash",
+            "tool_input": {"command": "pytest -vv tests/"},
+            "tool_response": {"stdout": spool_out, "stderr": ""},
+            "session_id": f"cl-{mode}",
+            "tool_use_id": "cl-spool-1",
+        }
+        spool_res = post_tool_use.handle_post_tool_use("claude", spool_payload, stats_path=stats_p, state_dir=sdir)
+        decisions.append({"step": "claude:post_spool", "decision": _decision_kind(spool_res)})
+        sp_hso = spool_res.get("hookSpecificOutput") if isinstance(spool_res, Mapping) else None
+        sp_txt = str(sp_hso.get("updatedToolOutput") or "") if isinstance(sp_hso, Mapping) else ""
+        sp_match = _SPOOL_ID_FIND_RE.search(sp_txt)
+        if sp_match is not None:
+            cl_slice = {
+                "tool_name": "Bash",
+                "tool_input": {"command": f"cg-spool slice {sp_match.group(0)} --start 1 --limit 80"},
+                "session_id": f"cl-{mode}",
+                "tool_use_id": "cl-spool-slice-1",
+            }
+            decisions.append({"step": "claude:spool_slice_recovery", "decision": _decision_kind(pre_tool_use.evaluate_hook(cl_slice, state_dir=sdir, cli_harness="claude"))})
 
         cu_sh = {"tool_name": "Shell", "tool_input": {"command": "pytest tests/"}, "session_id": f"cu-{mode}", "call_id": "cu-1"}
         decisions.append({"step": "cursor:shell", "decision": _decision_kind(pre_tool_use.evaluate_hook(cu_sh, state_dir=sdir, cli_harness="cursor"))})
@@ -198,7 +226,10 @@ def run_deterministic_replay(modes: tuple[str, ...] = ("strict", "bounded")) -> 
         mode_results = [_replay_one_mode(Path(td), m) for m in modes]
     ok = all(
         r["read_ledger_schema"] == state_store.READ_LEDGER_SCHEMA and r["outcomes_schema"] == outcomes.SCHEMA_VERSION
-        and r["pass2_safe_allowed"] and r["pass2_bad_blocked"] for r in mode_results
+        and r["pass2_safe_allowed"] and r["pass2_bad_blocked"]
+        and any(d["step"] == "claude:post_spool" and d["decision"] == "spooled" for d in r["decisions"])
+        and any(d["step"] == "claude:spool_slice_recovery" and d["decision"] == "allow" for d in r["decisions"])
+        for r in mode_results
     )
     return {"ok": ok, "isolated": True, "read_ledger_schema": state_store.READ_LEDGER_SCHEMA, "outcomes_schema": outcomes.SCHEMA_VERSION, "modes": mode_results}
 
@@ -271,6 +302,7 @@ def run_deterministic_benchmark(iterations: int = 3) -> dict[str, Any]:
                 "LOCALAPPDATA": str(paths["root"] / "localappdata"),
                 "CONTEXT_GUARD_HOME": str(paths["cg_home"]),
                 "CONTEXT_GUARD_CONFIG_PATH": str(paths["config_path"]),
+                "CONTEXT_GUARD_SPOOL_DIR": str(paths["spool_dir"]),
                 "TMPDIR": str(paths["state_dir"]),
                 "TMP": str(paths["state_dir"]),
                 "TEMP": str(paths["state_dir"]),

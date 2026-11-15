@@ -1,19 +1,21 @@
 """Shared pytest fixtures."""
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 from typing import Any, Iterator
 
 import pytest
 
-from bin import cg_status, token_usage, usage_report
+from bin import cg_status, install_harnesses, token_usage, usage_report
 from hooks import config as hooks_config, model_identity, outcomes, telemetry
 
 _LIVE_OPERATOR_TARGETS = (
     Path.home() / ".config" / "context-guard" / "config.json",
     Path.home() / ".claude" / "settings.json",
     Path.home() / ".cursor" / "hooks.json",
+    Path.home() / ".cursor" / "mcp.json",
     Path.home() / ".codex" / "hooks.json",
     Path.home() / ".codex" / "config.toml",
     Path.home() / ".gemini" / "settings.json",
@@ -54,6 +56,9 @@ def isolated_user_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     cfg_path = home_dir / ".config" / "context-guard" / "config.json"
     monkeypatch.setenv("CONTEXT_GUARD_CONFIG_PATH", str(cfg_path))
     monkeypatch.setattr(hooks_config, "DEFAULT_USER_CONFIG_PATH", cfg_path)
+    monkeypatch.setattr(install_harnesses, "DEFAULT_CURSOR_MCP_PATH", home_dir / ".cursor" / "mcp.json", raising=False)
+    if "CONTEXT_GUARD_SPOOL_DIR" not in os.environ:
+        monkeypatch.setenv("CONTEXT_GUARD_SPOOL_DIR", str(tmp_path / "default-telemetry" / "spool"))
     hooks_config.clear_config_cache()
     return home_dir
 
@@ -77,7 +82,10 @@ def _isolate_telemetry_ledgers(
         "CONTEXT_GUARD_HOME",
         str(isolated_home / ".gemini" / "config" / "plugins" / "context-guard"),
     )
+    if "CONTEXT_GUARD_SPOOL_DIR" not in os.environ:
+        monkeypatch.setenv("CONTEXT_GUARD_SPOOL_DIR", str(tmp_path / "default-telemetry" / "spool"))
     monkeypatch.setattr(hooks_config, "DEFAULT_USER_CONFIG_PATH", isolated_home / ".config" / "context-guard" / "config.json")
+    monkeypatch.setattr(install_harnesses, "DEFAULT_CURSOR_MCP_PATH", isolated_home / ".cursor" / "mcp.json", raising=False)
     hooks_config.clear_config_cache()
     monkeypatch.setattr(telemetry, "DEFAULT_TELEMETRY_PATH", tmp_path / "default-telemetry" / "stats.json")
     monkeypatch.setattr(outcomes, "DEFAULT_OUTCOMES_PATH", tmp_path / "default-telemetry" / "outcomes.json")

@@ -122,7 +122,7 @@ class RuntimeCapabilities:
 
 @dataclass(frozen=True)
 class SpoolContractV1:
-    """Reserved contract slot for active reversible output spooling in the next minor release."""
+    """Active reversible output spool contract returned by ``spool.store.spool_tool_output``."""
 
     spool_id: str
     path: str

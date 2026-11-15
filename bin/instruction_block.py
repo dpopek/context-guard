@@ -24,6 +24,8 @@ _BLOCK = f"{BLOCK_START}\n{BLOCK_BODY}\n{BLOCK_END}\n"
 
 SHIM_NAME = "cg-outline"
 SHIM_MARKER = "# context-guard:cg-outline"
+SPOOL_SHIM_NAME = "cg-spool"
+SPOOL_SHIM_MARKER = "# context-guard:cg-spool"
 IS_WINDOWS: bool = os.name == "nt"
 DEFAULT_SHIM_BIN_DIR = Path.home() / ".local" / "bin"
 DEFAULT_INSTRUCTION_FILES = (
@@ -118,20 +120,22 @@ def remove_block(path: Path, dry_run: bool = False) -> bool:
     return True
 
 
-def _shim_text(plugin_root: Path) -> str:
-    script = Path(plugin_root) / "bin" / "outline.py"
+def _shim_text(plugin_root: Path, script_name: str = "outline.py", marker: str = SHIM_MARKER) -> str:
+    script = Path(plugin_root) / "bin" / script_name
     return (
         "#!/bin/sh\n"
-        f"{SHIM_MARKER} (managed by install_harnesses.py)\n"
+        f"{marker} (managed by install_harnesses.py)\n"
         f'exec {shlex.quote(sys.executable)} {shlex.quote(str(script))} "$@"\n'
     )
 
 
-def shim_installed(bin_dir: Path) -> bool:
-    """True when `bin_dir/cg-outline` exists and was written by this installer."""
-    shim = Path(bin_dir) / SHIM_NAME
+def shim_installed(bin_dir: Path, shim_name: str = SHIM_NAME, marker: str = SHIM_MARKER) -> bool:
+    """True when `bin_dir/<shim_name>` exists on POSIX and was written by this installer."""
+    if IS_WINDOWS:
+        return False
+    shim = Path(bin_dir) / shim_name
     try:
-        return shim.is_file() and SHIM_MARKER in shim.read_text(encoding="utf-8", errors="replace")
+        return shim.is_file() and marker in shim.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
 
@@ -143,15 +147,18 @@ def on_path(bin_dir: Path) -> bool:
     return any(entry and os.path.normcase(os.path.realpath(entry)) == target for entry in entries)
 
 
-def install_shim(bin_dir: Path, plugin_root: Path, dry_run: bool = False) -> str:
-    """Write the executable `cg-outline` shim: `created`, `updated`, `unchanged` or `skipped (...)`."""
+def install_shim(
+    bin_dir: Path, plugin_root: Path, dry_run: bool = False,
+    *, shim_name: str = SHIM_NAME, marker: str = SHIM_MARKER, script_name: str = "outline.py",
+) -> str:
+    """Write an executable POSIX shim: `created`, `updated`, `unchanged`, or `skipped (...)`."""
     if IS_WINDOWS:
         return "skipped (windows)"
-    shim = Path(bin_dir) / SHIM_NAME
+    shim = Path(bin_dir) / shim_name
     existed = shim.exists() or shim.is_symlink()
-    if existed and not shim_installed(bin_dir):
+    if existed and not shim_installed(bin_dir, shim_name=shim_name, marker=marker):
         return "skipped (foreign file)"
-    content = _shim_text(plugin_root)
+    content = _shim_text(plugin_root, script_name=script_name, marker=marker)
     if existed and shim.read_text(encoding="utf-8") == content and os.access(shim, os.X_OK):
         return "unchanged"
     if not dry_run:
@@ -159,12 +166,14 @@ def install_shim(bin_dir: Path, plugin_root: Path, dry_run: bool = False) -> str
     return "updated" if existed else "created"
 
 
-def remove_shim(bin_dir: Path, dry_run: bool = False) -> bool:
-    """Remove the shim if this installer wrote it; True when it did."""
-    if not shim_installed(bin_dir):
+def remove_shim(
+    bin_dir: Path, dry_run: bool = False, *, shim_name: str = SHIM_NAME, marker: str = SHIM_MARKER
+) -> bool:
+    """Remove the named shim if this installer wrote it; True when it did."""
+    if not shim_installed(bin_dir, shim_name=shim_name, marker=marker):
         return False
     if not dry_run:
-        (Path(bin_dir) / SHIM_NAME).unlink()
+        (Path(bin_dir) / shim_name).unlink()
     return True
 
 
@@ -185,6 +194,15 @@ def _upsert_status(path: Path, dry_run: bool) -> str:
     return _guarded(lambda: upsert_block(path, dry_run=dry_run))
 
 
+def _install_one_shim(
+    bin_dir: Path, plugin_root: Path, dry_run: bool, *, shim_name: str, marker: str, script_name: str
+) -> tuple[str, bool]:
+    status = _guarded(lambda: install_shim(bin_dir, plugin_root, dry_run=dry_run, shim_name=shim_name, marker=marker, script_name=script_name))
+    installed = not status.startswith(("skipped", "error"))
+    usable = installed and on_path(bin_dir)
+    return (f"{status} (not_on_path)" if installed and not usable else status), usable
+
+
 def install_outline_pull(
     plugin_root: Path,
     use_defaults: bool,
@@ -192,29 +210,22 @@ def install_outline_pull(
     instruction_files: Sequence[Path] | None,
     dry_run: bool,
 ) -> dict[str, str]:
-    """Install the shim and the rule block; real-home defaults only when `use_defaults` is set.
-
-    The rule is written only when the shim is usable (installed and on `PATH`): a rule naming a
-    command the shell cannot find would cost every session a failed call.
-    """
+    """Install the shims and the rule block; real-home defaults only when `use_defaults` is set."""
     if use_defaults:
         shim_bin_dir = shim_bin_dir or DEFAULT_SHIM_BIN_DIR
         instruction_files = DEFAULT_INSTRUCTION_FILES if instruction_files is None else instruction_files
-    shim_status, usable = _NOT_REQUESTED, False
+    shim_status, spool_status, usable = _NOT_REQUESTED, _NOT_REQUESTED, False
     if shim_bin_dir is not None:
-        bin_dir = shim_bin_dir
-        shim_status = _guarded(lambda: install_shim(bin_dir, Path(plugin_root), dry_run=dry_run))
-        installed = not shim_status.startswith(("skipped", "error"))
-        usable = installed and on_path(bin_dir)
-        if installed and not usable:
-            shim_status += " (not_on_path)"
+        bin_dir, root = shim_bin_dir, Path(plugin_root)
+        shim_status, usable = _install_one_shim(bin_dir, root, dry_run, shim_name=SHIM_NAME, marker=SHIM_MARKER, script_name="outline.py")
+        spool_status, _ = _install_one_shim(bin_dir, root, dry_run, shim_name=SPOOL_SHIM_NAME, marker=SPOOL_SHIM_MARKER, script_name="cg_spool.py")
     if not instruction_files:
         block_status = _NOT_REQUESTED
     elif not usable:
         block_status = "skipped (shim unavailable)"
     else:
         block_status = ", ".join(_upsert_status(path, dry_run) for path in instruction_files)
-    return {"cg_outline_shim": shim_status, "instruction_block": block_status}
+    return {"cg_outline_shim": shim_status, "cg_spool_shim": spool_status, "instruction_block": block_status}
 
 
 def _removal_status(removed: Callable[[], bool]) -> str:
@@ -227,16 +238,17 @@ def uninstall_outline_pull(
     instruction_files: Sequence[Path] | None,
     dry_run: bool,
 ) -> dict[str, str]:
-    """Remove the shim and the rule blocks this installer wrote."""
+    """Remove the shims and the rule blocks this installer wrote."""
     if use_defaults:
         shim_bin_dir = shim_bin_dir or DEFAULT_SHIM_BIN_DIR
         instruction_files = DEFAULT_INSTRUCTION_FILES if instruction_files is None else instruction_files
-    shim_status = _NOT_REQUESTED
+    shim_status, spool_status = _NOT_REQUESTED, _NOT_REQUESTED
     if shim_bin_dir is not None:
         bin_dir = shim_bin_dir
         shim_status = _removal_status(lambda: remove_shim(bin_dir, dry_run=dry_run))
+        spool_status = _removal_status(lambda: remove_shim(bin_dir, dry_run=dry_run, shim_name=SPOOL_SHIM_NAME, marker=SPOOL_SHIM_MARKER))
     blocks = [
         _removal_status(lambda p=path: remove_block(p, dry_run=dry_run))  # type: ignore[misc]
         for path in instruction_files or ()
     ]
-    return {"cg_outline_shim": shim_status, "instruction_block": ", ".join(blocks) or _NOT_REQUESTED}
+    return {"cg_outline_shim": shim_status, "cg_spool_shim": spool_status, "instruction_block": ", ".join(blocks) or _NOT_REQUESTED}

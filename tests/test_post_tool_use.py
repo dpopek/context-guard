@@ -386,3 +386,135 @@ def test_shadow_mode_records_only_confirmed_claude_batch_reads(
     assert stats_file.read_bytes() == s_before
     assert load_telemetry_stats(stats_file)["events"]["ranges_trimmed"] == 0
     assert not outcomes_file.exists()
+
+
+def _write_spool_cfg(home_dir: Path, **optimizers: str) -> None:
+    from hooks import config
+
+    cfg_path = home_dir / ".config" / "context-guard" / "config.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(json.dumps({"optimizers": optimizers}), encoding="utf-8")
+    config.clear_config_cache()
+
+
+def test_output_spool_off_keeps_post_tool_use_and_main_empty(
+    isolated_user_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sd = tmp_path / "sd_off"
+    sd.mkdir()
+    big_out = "\n".join(f"line {i}: {'x' * 80}" for i in range(300))
+    payload = _bash("pytest -q tests/", session_id="s-off", tool_use_id="cid-off-1", hook_event_name="PostToolUse", tool_response=big_out)
+    assert handle_post_tool_use("claude", payload, state_dir=str(sd)) == {}
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    capsys.readouterr()
+    assert main(["--harness", "claude", "--state-dir", str(sd)]) == 0
+    assert json.loads(capsys.readouterr().out) == {}
+    stats = load_telemetry_stats(sd / "telemetry_stats.json")
+    assert stats["events"]["outputs_spooled"] == 0
+    assert not (sd / "outcomes.json").exists()
+
+
+def test_active_spool_claude_bash_and_mcp_records_stats_window_and_main_stdout(
+    isolated_user_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from tests.helpers import read_outcomes_ledger, read_session_state
+
+    _write_spool_cfg(isolated_user_env, output_spool="active", range_trim="active")
+    sd = tmp_path / "sd_active"
+    big_out = "\n".join(f"FAILED tests/test_mod.py::test_case_{i} - {'payload_' * 10}" for i in range(300))
+    bash_payload = _bash(
+        "pytest tests/",
+        session_id="s-act",
+        tool_use_id="cid-bash-1",
+        hook_event_name="PostToolUse",
+        tool_response=big_out,
+    )
+    # Bash-first session (state_dir does not yet exist): main() must emit replaced output JSON and bump auto_step_seq >= 1
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(bash_payload)))
+    capsys.readouterr()
+    assert main(["--harness", "claude", "--state-dir", str(sd)]) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    updated_text = emitted["hookSpecificOutput"]["updatedToolOutput"]
+    assert "cg-spool" in updated_text and len(updated_text) < len(big_out)
+
+    stats = load_telemetry_stats(sd / "telemetry_stats.json")
+    assert stats["events"]["outputs_spooled"] == 1
+    assert stats["by_harness"]["claude"]["hits"] == 1
+    assert stats["by_harness"]["claude"]["saved_tokens"] > 0
+    assert stats["last_event"]["kind"] == "outputs_spooled"
+    assert stats["saved_bytes"] > 0
+    assert read_session_state(sd)["auto_step_seq"] >= 1
+
+    # Duplicate PostToolUse delivery with identical call_id deduplicates outputs_spooled and updates window idempotently
+    assert handle_post_tool_use("claude", bash_payload, state_dir=str(sd))["hookSpecificOutput"]["updatedToolOutput"] == updated_text
+    assert load_telemetry_stats(sd / "telemetry_stats.json")["events"]["outputs_spooled"] == 1
+    ledger = read_outcomes_ledger(sd)
+    spool_wins = [w for w in ledger["open_windows"].values() if w["key"].endswith("|output_spool")]
+    assert len(spool_wins) == 1 and spool_wins[0]["step_idx"] >= 1
+    assert spool_wins[0]["meta"]["total_lines"] == 300
+
+    # MCP PostToolUse spools list-of-text-blocks responses, while failures skip spooling
+    mcp_payload = {
+        "hook_event_name": "PostToolUse",
+        "session_id": "s-act",
+        "tool_use_id": "cid-mcp-1",
+        "tool_name": "mcp__srv__query",
+        "tool_input": {"q": "select *"},
+        "tool_response": [{"type": "text", "text": big_out}],
+    }
+    mcp_res = handle_post_tool_use("claude", mcp_payload, state_dir=str(sd))
+    assert isinstance(mcp_res["hookSpecificOutput"]["updatedToolOutput"], list)
+    assert load_telemetry_stats(sd / "telemetry_stats.json")["events"]["outputs_spooled"] == 2
+
+    fail_payload = _bash("pytest tests/", session_id="s-act", tool_use_id="cid-fail", hook_event_name="PostToolUseFailure", error=big_out)
+    assert handle_post_tool_use("claude", fail_payload, state_dir=str(sd)) == {}
+
+
+def test_shadow_spool_and_post_tool_batch_trim_window(
+    isolated_user_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+    from hooks import telemetry
+    from tests.helpers import claude_read, read_outcomes_ledger, write_python_module
+
+    spool_dir = tmp_path / "shadow_spool_check"
+    monkeypatch.setenv("CONTEXT_GUARD_SPOOL_DIR", str(spool_dir))
+    _write_spool_cfg(isolated_user_env, output_spool="shadow", range_trim="active", auto_outline="off")
+    sd = tmp_path / "sd_shadow"
+    sd.mkdir()
+    big_out = "\n".join(f"row_{i}: {'d' * 75}" for i in range(300))
+
+    res = handle_post_tool_use(
+        "claude",
+        _bash("pytest tests/", session_id="s-sh", tool_use_id="cid-sh-1", hook_event_name="PostToolUse", tool_response=big_out),
+        state_dir=str(sd),
+    )
+    assert res == {}
+    assert not any(spool_dir.glob("sp_*.txt")) if spool_dir.exists() else True
+    assert load_telemetry_stats(sd / "telemetry_stats.json")["events"]["outputs_spooled"] == 0
+    assert not (sd / "outcomes.json").exists()
+
+    sh = telemetry.load_shadow_ledger(telemetry.shadow_path_for(sd))
+    assert sh["shadow_spools"]["count"] == 1
+    assert sh["shadow_spools"]["estimated_saved_bytes"] > 0
+    assert sh["shadow_spools"]["by_harness"] == {"claude": 1}
+
+    # PostToolBatch skips spooling while still confirming reads and opening trimmed-prefix range_trim window
+    src = write_python_module(tmp_path / "trim_mod.py", funcs=25, body_lines=9)
+    canon = os.path.realpath(str(src))
+    claude_read(src, sd, offset=1, limit=100, session_id="s-sh")
+    out2 = claude_read(src, sd, offset=1, limit=150, session_id="s-sh")
+    assert out2["hookSpecificOutput"]["updatedInput"]["offset"] == 101
+
+    batch_res = handle_post_tool_use(
+        "claude",
+        {"session_id": "s-sh", "tool_calls": [{"tool_name": "Bash", "tool_use_id": "b-skip", "tool_input": {"command": "pytest"}, "tool_response": big_out}]},
+        state_dir=str(sd),
+        event_name="PostToolBatch",
+    )
+    assert batch_res == {}
+    assert telemetry.load_shadow_ledger(telemetry.shadow_path_for(sd))["shadow_spools"]["count"] == 1
+    wins = read_outcomes_ledger(sd)["open_windows"]
+    trim_key = f"s-sh|{canon}|range_trim"
+    assert [k for k, w in wins.items() if w["key"].endswith("|range_trim")] == [trim_key]
+    assert wins[trim_key]["meta"] == {"trimmed_start": 1, "trimmed_end": 100}

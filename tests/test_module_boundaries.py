@@ -1,4 +1,4 @@
-"""Modules in hooks/ and bin/ talk to each other through public names only."""
+"""Modules in hooks/, bin/, policies/, integrations/, and spool/ talk to each other through public names only."""
 from __future__ import annotations
 
 import ast
@@ -10,7 +10,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 _OPERATOR_HOME = Path.home()
-_PROD_PACKAGES = ("hooks", "bin", "policies", "integrations")
+_PROD_PACKAGES = ("hooks", "bin", "policies", "integrations", "spool")
 GENERIC_REPO_BASENAMES: frozenset[str] = frozenset({
     "project", "backend", "frontend", "production", "stage", "test", "upgradetest",
     "maintenance", "image", "docker", "native", "meta", "charts", "ci-cd",
@@ -30,7 +30,7 @@ def _private_cross_imports_in_source(
         if isinstance(node, ast.Import):
             for alias in node.names:
                 top = alias.name.split(".")[0]
-                if top in ("hooks", "bin"):
+                if top in _PROD_PACKAGES:
                     if alias.asname:
                         module_aliases.add(alias.asname)
                     elif "." not in alias.name:
@@ -46,12 +46,12 @@ def _private_cross_imports_in_source(
                 )
             else:
                 base = node.module or ""
-            if base.split(".")[0] not in ("hooks", "bin"):
+            if base.split(".")[0] not in _PROD_PACKAGES:
                 continue
             for alias in node.names:
                 if alias.name.startswith("_") or (alias.asname or "").startswith("_"):
                     offenders.append(f"{rel}:{node.lineno} {alias.name}")
-                elif base in ("hooks", "bin") and alias.name in prod_modules:
+                elif base in _PROD_PACKAGES and alias.name in prod_modules:
                     module_aliases.add(alias.asname or alias.name)
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute) and node.attr.startswith("_") and not node.attr.startswith("__"):
@@ -212,6 +212,19 @@ def test_zero_import_cycles_across_hooks_and_bin() -> None:
         "hooks.outcomes must not import hooks.harness_adapter"
     )
     assert "hooks.pre_tool_use" not in graph.get("hooks.read_planner", set())
+    forbidden_spool_deps = {
+        "hooks.post_tool_use",
+        "hooks.pre_tool_use",
+        "hooks.outcomes",
+        "hooks.telemetry",
+        "hooks.config",
+    }
+    for mod_name, deps in graph.items():
+        if mod_name == "spool" or mod_name.startswith("spool."):
+            bad = sorted(
+                d for d in deps if d in forbidden_spool_deps or d == "bin" or d.startswith("bin.")
+            )
+            assert bad == [], f"{mod_name} must not import {bad}"
 
 
 def test_hooks_total_loc_ceiling() -> None:
@@ -228,7 +241,7 @@ MAX_JS_FILE_LOC = 500
 
 
 def test_production_module_loc_ceilings() -> None:
-    """Every production Python module in hooks/, bin/, policies/, and integrations/ must stay <= 800 LOC."""
+    """Every production Python module in hooks/, bin/, policies/, integrations/, and spool/ must stay <= 800 LOC."""
     violations: list[str] = []
     for folder in _PROD_PACKAGES:
         for path in sorted((ROOT / folder).glob("*.py")):
@@ -418,7 +431,7 @@ def test_outline_loc_ceiling_and_zero_hardcoded_user_paths() -> None:
     )
 
     dynamic_terms = _load_operator_private_terms()
-    for folder in ("bin", "hooks", "policies", "integrations", "rules", "skills", "tests", "vscode-extension"):
+    for folder in ("bin", "hooks", "policies", "integrations", "spool", "rules", "skills", "tests", "vscode-extension"):
         is_tests = folder == "tests"
         for src_file in sorted((ROOT / folder).rglob("*")):
             if not src_file.is_file() or src_file.suffix not in (".py", ".md", ".json", ".js"):
@@ -574,7 +587,7 @@ def test_every_test_function_has_assertions() -> None:
 
 
 def test_every_python_module_enables_future_annotations() -> None:
-    """Every non-__init__.py module across hooks/, bin/, policies/, integrations/, and tests/ must enable PEP 563."""
+    """Every non-__init__.py module across _PROD_PACKAGES and tests/ must enable PEP 563."""
     violations: list[str] = []
     for folder in (*_PROD_PACKAGES, "tests"):
         for path in sorted((ROOT / folder).glob("*.py")):

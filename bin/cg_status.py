@@ -31,6 +31,7 @@ from bin import replay_benchmark, token_usage, usage_report  # noqa: E402
 from bin.harness_status import check_status, verify_harness_hooks  # noqa: E402
 from bin.outcomes_report import render_outcomes_report  # noqa: E402
 from bin.update_check import UPDATE_LOCK, is_update_stale  # noqa: E402
+from spool.store import inspect_spool_health  # noqa: E402
 
 ROOT = resolve_plugin_root()
 _ROOT = ROOT
@@ -228,6 +229,7 @@ def render_markdown_report(stats: dict[str, Any]) -> str:
         f"| Unmodified Allowed Reads (`allowed_reads`) | {int(events.get('allowed_reads', 0) or 0):,} |",
     ]
     for legacy_key, label in (
+        ("outputs_spooled", "Oversized Outputs Spooled (`outputs_spooled`)"),
         ("wide_followup_blocks", "Historical Wide Follow-Up Reads Blocked (`wide_followup_blocks`)"),
         ("multi_file_blocks", "Historical Multi-File Batch Reads Blocked (`multi_file_blocks`)"),
         ("rereads_blocked", "Historical Duplicate Re-Reads Blocked (`rereads_blocked`)"),
@@ -560,16 +562,19 @@ def run_doctor(
         ((root / "hooks.json").is_file() or (root / "hooks" / "hooks.json").is_file())
         and (root / "plugin.json").is_file()
     )
+    out_spool_mode = str(config.load_runtime_config().get("optimizers", {}).get("output_spool", "off"))
     ext_harnesses = check_status(
-        claude_settings_path=claude_settings_path,
-        cursor_hooks_path=cursor_hooks_path,
-        codex_hooks_path=codex_hooks_path,
+        claude_settings_path=claude_settings_path, cursor_hooks_path=cursor_hooks_path, codex_hooks_path=codex_hooks_path
     )
     harness_details = verify_harness_hooks(
-        claude_settings_path=claude_settings_path,
-        cursor_hooks_path=cursor_hooks_path,
-        codex_hooks_path=codex_hooks_path,
+        claude_settings_path=claude_settings_path, cursor_hooks_path=cursor_hooks_path,
+        codex_hooks_path=codex_hooks_path, output_spool_mode=out_spool_mode,
     )
+    eff_spool = None if (plugin_root is None or os.environ.get("CONTEXT_GUARD_SPOOL_DIR", "").strip()) else (telemetry_dir / "spool")
+    try:
+        spool_health = inspect_spool_health(eff_spool)
+    except OSError as exc:
+        spool_health = {"spool_dir_exists": False, "entry_count": 0, "total_bytes": 0, "expired_count": 0, "orphan_count": 0, "summary_line": f"unavailable ({type(exc).__name__})"}
     harnesses = {"antigravity": ag_ok, **ext_harnesses}
 
     is_repo = (root / ".git").exists()
@@ -622,6 +627,8 @@ def run_doctor(
         "git": {"is_repo": is_repo, "clean": git_clean, "ok": True},
         "skill_hygiene": skill_hygiene,
         "security_drift": security_drift,
+        "output_spool_mode": out_spool_mode,
+        "spool_health": spool_health,
     }
 
 
@@ -680,10 +687,17 @@ def render_doctor_report(report: dict[str, Any]) -> str:
         if installed and isinstance(detail_obj, dict) and detail_obj.get("target_exists") is False:
             status_lbl = "WARN"
             detail_str = f"registered, missing target ({detail_obj.get('target') or 'pre_tool_use.py'})"
+        elif installed and isinstance(detail_obj, dict) and detail_obj.get("spool_hook_ok") is False:
+            status_lbl = "WARN"
+            detail_str = "registered, spool post-hook mismatch (re-run install_harnesses.py)"
         else:
             status_lbl = "OK" if installed else "WARN"
             detail_str = "registered" if installed else "not registered"
         lines.append(f"| Harness: `{name}` | `{status_lbl}` | `{detail_str}` |")
+    raw_sp = report.get("spool_health")
+    sp_h: dict[str, Any] = raw_sp if isinstance(raw_sp, dict) else {}
+    sp_warn = int(sp_h.get("expired_count", 0) or 0) > 0 or int(sp_h.get("orphan_count", 0) or 0) > 0
+    lines.append(f"| Output spool | `{'WARN' if sp_warn else 'OK'}` | `{sp_h.get('summary_line') or 'empty (0 entries, 0 B)'}` |")
     git_detail = f"is_repo={gt.get('is_repo')}, clean={gt.get('clean')}"
     lines.append(f"| Git workspace | `OK` | `{git_detail}` |")
     dup_count = int(sh.get("duplicate_count", 0) or 0) if isinstance(sh, dict) else 0

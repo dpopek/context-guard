@@ -7,8 +7,9 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from bin import cg_status, replay_benchmark
+from bin import cg_status, outcomes_report, replay_benchmark
 from hooks import config
+from spool import store as spool_store
 
 
 def test_replay_covers_multi_harness_modes_pass2_and_outcomes_v4(capsys: Any) -> None:
@@ -31,7 +32,21 @@ def test_replay_covers_multi_harness_modes_pass2_and_outcomes_v4(capsys: Any) ->
     bounded_decs = {d["step"]: d["decision"] for d in by_mode["bounded"]["decisions"]}
     assert strict_decs["antigravity:overlap_trim"] == "allow"
     assert bounded_decs["antigravity:overlap_trim"] == "modify"
+    assert strict_decs["claude:post_spool"] == "spooled"
+    assert bounded_decs["claude:post_spool"] == "spooled"
+    assert strict_decs["claude:spool_slice_recovery"] == "allow"
+    assert bounded_decs["claude:spool_slice_recovery"] == "allow"
     assert by_mode["bounded"]["bytes_saved"] > 0
+
+    rendered_out = outcomes_report.render_outcomes_report({
+        "schema_version": 4,
+        "by_key": {"claude|opus|output_spool": {"total": 2, "recovery": {}, "regret": {}}},
+    })
+    assert "output_spool" in rendered_out and "0 (0%)" in rendered_out
+    md_stats = cg_status.render_markdown_report(
+        {"saved_bytes": 4000, "saved_tokens": 1000, "events": {"outputs_spooled": 3}, "by_harness": {}}
+    )
+    assert "outputs_spooled" in md_stats and "| 3 |" in md_stats
 
     rc = cg_status.main(["--replay"])
     out = capsys.readouterr().out
@@ -75,10 +90,14 @@ def test_public_json_scrubs_sensitive_paths_and_files(tmp_path: Path, capsys: An
     raw_stats = {
         "saved_bytes": 1200,
         "saved_tokens": 300,
+        "events": {"outputs_spooled": 3},
+        "spool_dir": str(tmp_path / "spool"),
+        "spool_path": home_posix + "/spool/sp_0123456789ab.txt",
+        "spool_index": "spool_index.json",
         "shadow_path": str(tmp_path / "shadow.json"),
         "private_policy_stats": {"hits": 9},
         "config_path": home_posix + "/config.json",
-        "notes": ["shadow.json", "private_policy_stats.json", f"read {home_posix}"],
+        "notes": ["shadow.json", "private_policy_stats.json", "spool_index.json", f"read {home_posix}"],
     }
     raw_usage = {
         "today": {"cost_usd": 1.25},
@@ -96,8 +115,9 @@ def test_public_json_scrubs_sensitive_paths_and_files(tmp_path: Path, capsys: An
     dumped = json.dumps(bundle)
     assert bundle["public"] is True
     assert bundle["stats"]["saved_tokens"] == 300
+    assert bundle["stats"]["events"]["outputs_spooled"] == 3
     assert bundle["outcomes"]["schema_version"] == 4
-    for secret_key in ("shadow.json", "private_policy_stats.json", "config_path", "transcript_path", "policy_packs", "jdoe_real", priv_dom, gcp_id, local_mail):
+    for secret_key in ("shadow.json", "private_policy_stats.json", "spool_index.json", "spool_dir", "spool_path", "spool_index", "sp_0123456789ab", "config_path", "transcript_path", "policy_packs", "jdoe_real", priv_dom, gcp_id, local_mail):
         assert secret_key not in dumped
     assert replay_benchmark.check_release_hygiene(tmp_path, public_bundle=bundle) == []
 
@@ -208,3 +228,55 @@ def test_doctor_security_drift_rendering_and_resilience(monkeypatch: Any, tmp_pa
     resilient = cg_status.run_doctor(plugin_root=tmp_path)
     assert "security_drift" in resilient
     assert "error" in resilient["security_drift"]
+
+
+def test_doctor_reports_spool_health_and_hook_mismatch(monkeypatch: Any, tmp_path: Path) -> None:
+    from bin.harness_status import CLAUDE_POST_SPOOL_MATCHER, CLAUDE_POST_SYNC_MATCHER
+
+    plugin_root = tmp_path / "plugin"
+    (plugin_root / "hooks").mkdir(parents=True)
+    (plugin_root / "plugin.json").write_text("{}", encoding="utf-8")
+    (plugin_root / "hooks.json").write_text("{}", encoding="utf-8")
+    pre_hook = plugin_root / "hooks" / "pre_tool_use.py"
+    post_hook = plugin_root / "hooks" / "post_tool_use.py"
+    pre_hook.write_text("", encoding="utf-8")
+    post_hook.write_text("", encoding="utf-8")
+
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({"optimizers": {"output_spool": "active"}}), encoding="utf-8")
+    monkeypatch.setenv("CONTEXT_GUARD_CONFIG_PATH", str(cfg_path))
+    config.clear_config_cache()
+
+    spool_dir = tmp_path / "spool"
+    spool_store.build_post_tool_spool_response(
+        "claude", {"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": {"stdout": "\n".join(f"line {i}: " + ("x" * 70) for i in range(240))}},
+        mode="active", session_id="s-doc", call_id="c-1", spool_dir=spool_dir,
+    )
+    (spool_dir / "sp_deadbeefcafe.txt").write_text("orphan\n", encoding="utf-8")
+    monkeypatch.setenv("CONTEXT_GUARD_SPOOL_DIR", str(spool_dir))
+
+    claude_cfg = tmp_path / "claude.json"
+    claude_cfg.write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "Read", "hooks": [{"type": "command", "command": f"python3 {pre_hook}"}]}]}}), encoding="utf-8")
+    report = cg_status.run_doctor(
+        plugin_root=plugin_root, claude_settings_path=claude_cfg,
+        cursor_hooks_path=tmp_path / "cu.json", codex_hooks_path=tmp_path / "cx.json",
+    )
+    assert report["output_spool_mode"] == "active"
+    assert report["harness_details"]["claude"]["spool_hook_ok"] is False
+    assert report["spool_health"]["entry_count"] == 1
+    assert report["spool_health"]["orphan_count"] == 1
+    md = cg_status.render_doctor_report(report)
+    assert "spool post-hook mismatch" in md and "Output spool" in md and "WARN" in md
+
+    claude_cfg.write_text(json.dumps({"hooks": {
+        "PreToolUse": [{"matcher": "Read", "hooks": [{"type": "command", "command": f"python3 {pre_hook}"}]}],
+        "PostToolUse": [
+            {"matcher": CLAUDE_POST_SYNC_MATCHER, "hooks": [{"type": "command", "command": f"python3 {post_hook}"}]},
+            {"matcher": CLAUDE_POST_SPOOL_MATCHER, "hooks": [{"type": "command", "command": f"python3 {post_hook}", "timeout": 10}]},
+        ],
+    }}), encoding="utf-8")
+    ok_report = cg_status.run_doctor(
+        plugin_root=plugin_root, claude_settings_path=claude_cfg,
+        cursor_hooks_path=tmp_path / "cu.json", codex_hooks_path=tmp_path / "cx.json",
+    )
+    assert ok_report["harness_details"]["claude"]["spool_hook_ok"] is True

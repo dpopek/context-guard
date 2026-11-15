@@ -66,6 +66,7 @@ def test_ast_no_python310_only_runtime_constructs() -> None:
         *ROOT.glob("bin/*.py"),
         *ROOT.glob("policies/*.py"),
         *ROOT.glob("integrations/*.py"),
+        *ROOT.glob("spool/*.py"),
         *ROOT.glob("tests/*.py"),
     ]):
         rel = path.relative_to(ROOT)
@@ -126,7 +127,13 @@ def test_system_python3_imports_all_hooks_and_bin_modules(tmp_path: Path) -> Non
     py = _runtime_python()
     modules = sorted(
         f"{p.parent.name}.{p.stem}"
-        for p in [*ROOT.glob("hooks/*.py"), *ROOT.glob("bin/*.py"), *ROOT.glob("policies/*.py"), *ROOT.glob("integrations/*.py")]
+        for p in [
+            *ROOT.glob("hooks/*.py"),
+            *ROOT.glob("bin/*.py"),
+            *ROOT.glob("policies/*.py"),
+            *ROOT.glob("integrations/*.py"),
+            *ROOT.glob("spool/*.py"),
+        ]
         if p.stem != "__init__"
     )
     script = (
@@ -193,6 +200,7 @@ def test_system_python3_imports_all_hooks_and_bin_modules(tmp_path: Path) -> Non
         ("bin/cg_status.py", ["--benchmark"], None, False),
         ("bin/cg_status.py", ["--public-json"], None, False),
         ("bin/install_harnesses.py", ["--status"], None, False),
+        ("bin/cg_spool.py", ["list", "--json"], None, True),
     ],
 )
 def test_system_python3_executes_hook_and_cli_entrypoints(
@@ -225,6 +233,7 @@ def test_system_python3_executes_hook_and_cli_entrypoints(
         "HOME": str(tmp_path),
         "CONTEXT_GUARD_HOME": str(cg_home),
         "CONTEXT_GUARD_STATE_DIR": str(state_dir),
+        "CONTEXT_GUARD_SPOOL_DIR": str(telemetry_dir / "spool"),
         "CONTEXT_GUARD_CONFIG_PATH": str(tmp_path / "missing_config.json"),
     }
     stdin_text = json.dumps(stdin_obj) if stdin_obj is not None else ""
@@ -242,6 +251,8 @@ def test_system_python3_executes_hook_and_cli_entrypoints(
     if expect_json:
         parsed = json.loads(proc.stdout)
         assert isinstance(parsed, dict)
+        if rel_script == "bin/cg_spool.py":
+            assert parsed.get("ok") is True
 
 
 def test_system_python3_executes_mcp_auto_outline_and_silent_range_trim(tmp_path: Path) -> None:
