@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import sys
@@ -12,7 +13,9 @@ _PLUGIN_ROOT = str(Path(__file__).resolve().parent.parent)
 if _PLUGIN_ROOT not in sys.path:
     sys.path.insert(0, _PLUGIN_ROOT)
 
+from hooks.config import load_runtime_config
 from hooks.json_outliners import ANTIGRAVITY_FULL_TRANSCRIPT_NAME
+from hooks.policy_engine import notify_session_transition
 from hooks.session_lifecycle import apply_compaction_boundary, prune_state_on_rewind
 from hooks.state_store import (
     emit_json_and_sanitize_stdio,
@@ -189,11 +192,18 @@ def handle_pre_invocation(
             state = txn.state
             mutated = False
             max_seen_inv = int(state.get("max_inv_steps") or state.get("max_step_idx") or 0)
+            runtime_cfg: dict[str, Any] | None = None
             is_rewind = initial_steps < max_seen_inv or (
                 initial_steps == 0 and bool(state.get("files"))
             )
-            if is_rewind and prune_state_on_rewind(state, initial_steps, inclusive=True):
-                mutated = True
+            if is_rewind:
+                if prune_state_on_rewind(state, initial_steps, inclusive=True):
+                    mutated = True
+                runtime_cfg = load_runtime_config()
+                before_rewind = copy.deepcopy(state)
+                notify_session_transition("rewind", state, runtime_cfg)
+                if state != before_rewind:
+                    mutated = True
             # The prune leaves the invocation high-water mark alone: it counts invocations,
             # not tool steps, and only this hook moves it (down on a rewind, up otherwise).
             prev_inv = int(state.get("max_inv_steps") or 0)
@@ -216,6 +226,9 @@ def handle_pre_invocation(
             prev_cp_step = int(state.get("last_checkpoint_step") or 0)
             if last_cp_step > prev_cp_step:
                 apply_compaction_boundary(state, checkpoint_step=last_cp_step)
+                if runtime_cfg is None:
+                    runtime_cfg = load_runtime_config()
+                notify_session_transition("compact", state, runtime_cfg)
                 mutated = True
 
             is_hard_stop = (

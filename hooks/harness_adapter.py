@@ -37,6 +37,7 @@ class NormalizedToolCall:
     artifact_dir: str | None
     mutated_paths: tuple[str, ...] = ()
     permission_mode: str | None = None
+    call_id: str = ""
 
 
 def detect_harness(payload: dict[str, Any], cli_harness: str | None = None, env: dict[str, str] | None = None) -> HarnessName:
@@ -160,6 +161,7 @@ def normalize_pre_tool_payload(
             harness="antigravity", canonical_tool=ag_canonical, canonical_args=ag_args,
             original_tool_name=raw_tool, original_tool_input=orig_args, session_id=session_id,
             step_idx=step_idx, cwd=cwd, artifact_dir=artifact_dir, mutated_paths=mutated,
+            call_id=str(tool_call.get("id") or tool_call.get("callId") or payload.get("call_id") or ""),
         )
 
     raw_tool = str(payload.get("tool_name") or "")
@@ -172,12 +174,14 @@ def normalize_pre_tool_payload(
     raw_pm = payload.get("permission_mode")
     perm_raw = raw_pm if raw_pm not in (None, "") else payload.get("permissionMode")
     permission_mode = perm_raw.strip() if isinstance(perm_raw, str) and perm_raw.strip() else None
+    call_id = str(payload.get("tool_use_id") or payload.get("call_id") or payload.get("tool_call_id") or "")
 
     def _build(canonical_tool: str, canonical_args: dict[str, Any], mutated_paths: tuple[str, ...] = ()) -> NormalizedToolCall:
         return NormalizedToolCall(
             harness=harness, canonical_tool=canonical_tool, canonical_args=canonical_args,
             original_tool_name=raw_tool, original_tool_input=orig_input, session_id=session_id,
             step_idx=step_idx, cwd=cwd, artifact_dir=None, mutated_paths=mutated_paths, permission_mode=permission_mode,
+            call_id=call_id,
         )
 
     if raw_tool in ("Read", "NotebookRead", "read_file", "view_file"):

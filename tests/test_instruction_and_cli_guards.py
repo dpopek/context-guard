@@ -1,7 +1,8 @@
-"""Tests for EOF canonicalization, instruction-file bypass, Antigravity mutations, Phase B GitLab gate, and CLI rewrites."""
+"""Tests for EOF canonicalization, instruction-file bypass, Antigravity mutations, Policy API v1 fail-closed gate, and CLI rewrites."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,10 +10,10 @@ from typing import Any
 
 import pytest
 
-from hooks.local_repo_guard import load_guard_config
+from hooks.config import clear_config_cache, load_runtime_config
 from hooks.markup_outliners import outline_css, outline_shell, outline_toml
 from hooks.outline import OUTLINE_EXTENSIONS, extract_outline_symbols
-from hooks.pre_tool_use import evaluate_hook, handle_gitlab_mandatory_gate
+from hooks.pre_tool_use import evaluate_hook
 from hooks.read_planner import (
     covering_read_step,
     normalize_effective_bounds,
@@ -189,46 +190,69 @@ def test_cli_grep_single_quoted_exclusions_and_double_dash_runner_guard() -> Non
     assert rewrite_quiet_cli_flags("pnpm test -- --bail") is None
 
 
-def test_phase_b_gitlab_gate_and_legacy_config_tolerance(
+def test_policy_api_v1_gate_and_legacy_config_tolerance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # 1. Legacy optimizer keys in config.json keep config_error=None
     cfg_path = tmp_path / "legacy_opt.json"
     cfg_path.write_text(json.dumps({"instruction_file_bypass_lines": "bad", "enforcement": {"outline": "block"}}), encoding="utf-8")
-    cfg = load_guard_config(cfg_path)
+    cfg = load_runtime_config(cfg_path)
     assert cfg["config_error"] is None
 
-    # 2. Malformed JSON sets config_error -> Phase B GitLab fails CLOSED (deny)
+    # 2. Malformed JSON sets config_error -> scoped tool call fails CLOSED (deny)
     broken_cfg = tmp_path / "broken.json"
     broken_cfg.write_text("{not valid json", encoding="utf-8")
     monkeypatch.setenv("CONTEXT_GUARD_CONFIG_PATH", str(broken_cfg))
+    clear_config_cache()
     sd = str(tmp_path / "state")
-    gl_payload = {
-        "conversationId": "gl1",
+    mcp_payload = {
+        "conversationId": "pol1",
         "stepIdx": 1,
         "toolCall": {
             "name": "call_mcp_tool",
-            "args": {"ServerName": "gitlab", "ToolName": "get_project", "Arguments": {"project_id": "x"}},
+            "args": {"ServerName": "example-mcp", "ToolName": "get_item", "Arguments": {"id": "x"}},
         },
     }
-    res_closed = evaluate_hook(gl_payload, state_dir=sd)
+    res_closed = evaluate_hook(mcp_payload, state_dir=sd)
     assert res_closed["decision"] == "deny"
-    assert "GITLAB CONFIG ERROR (fail-closed)" in res_closed["reason"]
+    assert "CONFIG ERROR (fail-closed)" in res_closed["reason"]
 
-    # 3. Valid config (config_error=None) + unexpected runtime exception in Phase B fails OPEN with stderr warning
+    # 3. Valid config + optimization pack exception fails OPEN with stderr warning; security pack exception fails CLOSED
+    pack_dir = tmp_path / "policies" / "crashing-opt"
+    pack_dir.mkdir(parents=True)
+    pack_src = (
+        "from __future__ import annotations\n"
+        "from policies.api import POLICY_API_VERSION, PolicyPackManifest\n"
+        "def _boom(ctx):\n"
+        "    raise RuntimeError('simulated opt crash')\n"
+        "PACK_MANIFEST = PolicyPackManifest(\n"
+        "    pack_id='crashing-opt', api_version=POLICY_API_VERSION,\n"
+        "    kind='optimization', covered_domains=('synthetic-opt',), evaluate=_boom,\n"
+        ")\n"
+    ).encode("utf-8")
+    pack_file = pack_dir / "pack.py"
+    pack_file.write_bytes(pack_src)
+    file_sha = hashlib.sha256(pack_src).hexdigest()
+    tree_sha = hashlib.sha256(f"pack.py:{file_sha}\n".encode("utf-8")).hexdigest()
     valid_cfg = tmp_path / "valid.json"
-    valid_cfg.write_text("{}", encoding="utf-8")
+    valid_cfg.write_text(
+        json.dumps({
+            "policy_packs": [{
+                "id": "crashing-opt",
+                "path": str(pack_file),
+                "enabled": True,
+                "kind": "optimization",
+                "file_hashes": {"pack.py": file_sha},
+                "tree_sha256": tree_sha,
+            }]
+        }),
+        encoding="utf-8",
+    )
     monkeypatch.setenv("CONTEXT_GUARD_CONFIG_PATH", str(valid_cfg))
-    from hooks import pre_tool_use as ptu
-
-    def _boom(*_a: Any, **_kw: Any) -> dict[str, Any]:
-        raise RuntimeError("simulated disk error")
-
-    monkeypatch.setattr(ptu, "gate_gitlab_local_first", _boom)
-    res_open = evaluate_hook(gl_payload, state_dir=sd)
+    clear_config_cache()
+    res_open = evaluate_hook(mcp_payload, state_dir=sd)
     assert res_open == {"decision": "allow"}
-    assert "simulated disk error" in capsys.readouterr().err
-    assert callable(handle_gitlab_mandatory_gate)
+    assert "crashing-opt" in capsys.readouterr().err
 
 
 def test_python_markdown_and_new_format_outliners() -> None:

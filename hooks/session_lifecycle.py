@@ -58,6 +58,9 @@ def prune_state_on_rewind(
             if state.pop(list_key, None) is not None:
                 mutated = True
 
+    if state.pop("policy_state", None) is not None:
+        mutated = True
+
     return mutated
 
 
@@ -70,6 +73,7 @@ def apply_compaction_boundary(
         state["files"] = {}
         state.pop("gitlab_fallback_allowed", None)
         state.pop("bq_raw_fallback_allowed", None)
+        state.pop("policy_state", None)
         state["last_compact_warn_step"] = 0
         return
 
@@ -81,5 +85,6 @@ def apply_compaction_boundary(
     filter_reads(state, keep_after_checkpoint)
     state.pop("gitlab_fallback_allowed", None)
     state.pop("bq_raw_fallback_allowed", None)
+    state.pop("policy_state", None)
     if _int_or_zero(state.get("last_compact_warn_step")) <= checkpoint_step:
         state["last_compact_warn_step"] = 0

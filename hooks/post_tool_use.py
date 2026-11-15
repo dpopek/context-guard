@@ -16,9 +16,13 @@ _PLUGIN_ROOT = str(Path(__file__).resolve().parent.parent)
 if _PLUGIN_ROOT not in sys.path:
     sys.path.insert(0, _PLUGIN_ROOT)
 
+from hooks.config import load_runtime_config
+from hooks.harness_adapter import normalize_pre_tool_payload
+from hooks.policy_engine import run_post_tool_hooks
 from hooks.shell_output import classify_family, measure
-from hooks.state_store import emit_json_and_sanitize_stdio, run_telemetry_safely, warn
-from hooks.telemetry import record_shell_output
+from hooks.state_store import emit_json_and_sanitize_stdio, resolve_state_dir, run_telemetry_safely
+from hooks.telemetry import record_shell_output, warn
+from policies.api import PolicyPostContext
 
 # Tool names each harness uses for a shell command (Codex names mirror the installer's PreToolUse matcher).
 _SHELL_TOOLS = {
@@ -122,12 +126,34 @@ def normalise_payload(harness: str, payload: dict[str, Any]) -> ShellCall | None
 def handle_post_tool_use(
     harness: str, payload: dict[str, Any], stats_path: Path | None = None
 ) -> dict[str, Any]:
-    """Record the size of a shell call's output; the returned output never changes what the agent sees."""
+    """Record shell output telemetry and invoke policy pack PostToolUse hooks cleanly."""
     try:
         call = normalise_payload(harness, payload)
         if call is not None:
             measurement = measure(call.output, harness) if call.output is not None else None
             record_shell_output(harness, classify_family(call.command), measurement, call.outcome, stats_path)
+        runtime_cfg = load_runtime_config()
+        packs = runtime_cfg.get("policy_packs") or ()
+        if any(isinstance(p, dict) and p.get("enabled", True) for p in packs):
+            norm = normalize_pre_tool_payload(payload, cli_harness=harness)
+            state_dir_path = resolve_state_dir(payload, None)
+            tool_resp = payload.get("tool_response") or payload.get("toolResponse") or payload.get("result")
+            err_val = payload.get("error") or (tool_resp.get("error") if isinstance(tool_resp, dict) else None)
+            succeeded = not bool(err_val) and payload.get("is_error") is not True
+            post_ctx = PolicyPostContext(
+                harness=norm.harness,
+                call_id=norm.call_id,
+                canonical_tool=norm.canonical_tool,
+                canonical_args=norm.canonical_args,
+                mutated_paths=norm.mutated_paths,
+                original_tool_name=norm.original_tool_name,
+                tool_input=norm.original_tool_input,
+                succeeded=succeeded,
+                error=str(err_val) if err_val else None,
+                cwd=norm.cwd,
+                state_dir=str(state_dir_path),
+            )
+            run_post_tool_hooks(post_ctx, runtime_cfg)
     except Exception as exc:  # noqa: BLE001 - measurement must never fail; log class name only (never output text)
         err = exc
         run_telemetry_safely(

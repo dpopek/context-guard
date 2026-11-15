@@ -170,7 +170,7 @@ function runUpdateStep([command, args]) {
         return;
       }
       const [cmdBin, cmdArgs] = attempts[idx];
-      childProcess.execFile(cmdBin, cmdArgs, options, (err, _stdout, stderr) => {
+      childProcess.execFile(cmdBin, cmdArgs, options, (err, stdout, stderr) => {
         if (err) {
           const msg = `${cmdBin} ${cmdArgs.join(" ")}: ${tailText(stderr || err.message, STDERR_TAIL_CHARS)}`;
           if (idx + 1 < attempts.length && (err.code === "ENOENT" || err.code === 9009)) {
@@ -179,12 +179,63 @@ function runUpdateStep([command, args]) {
             reject(new Error(msg));
           }
         } else {
-          resolve();
+          resolve(String(stdout || ""));
         }
       });
     };
     tryExec(0, `${command} ${args.join(" ")}: failed`);
   });
+}
+
+const GIT_PORCELAIN_RE = /^[ MADRCUT?!]{2} .+/;
+
+function isDirtyGitStatus(stdout) {
+  return String(stdout || "")
+    .split(/\r?\n/)
+    .some((line) => line.length >= 4 && line.slice(0, 2) !== "  " && GIT_PORCELAIN_RE.test(line));
+}
+
+async function executeManagedUpdate({ state, pluginRoot, latest, runCmd = runUpdateStep } = {}) {
+  if (typeof pluginRoot !== "string" || !pluginRoot.trim()) {
+    throw new Error("Invalid plugin root path.");
+  }
+  const rawScript = path.join(pluginRoot, "bin", "install_harnesses.py");
+  const scriptPath = pluginRoot.startsWith("/") ? rawScript.replace(/\\/g, "/") : rawScript;
+  const installerStep = ["python3", [scriptPath, "--install"]];
+  if (state === "install_pending") {
+    await runCmd(installerStep);
+    return true;
+  }
+  if (state !== "update_available") {
+    return false;
+  }
+  if (!isValidSemver(latest)) {
+    throw new Error(`Invalid update version: ${String(latest)}`);
+  }
+  const tag = `v${latest}`;
+  const statusOut = await runCmd(["git", ["-C", pluginRoot, "status", "--porcelain", "--untracked-files=no"]]);
+  if (isDirtyGitStatus(statusOut)) {
+    throw new Error(`Working tree in ${pluginRoot} has uncommitted changes; stash or commit before updating.`);
+  }
+  const prevHead = String((await runCmd(["git", ["-C", pluginRoot, "rev-parse", "HEAD"]])) || "").trim();
+  if (!prevHead) {
+    throw new Error(`Unable to determine current HEAD in ${pluginRoot}.`);
+  }
+  try {
+    await runCmd(["git", ["-C", pluginRoot, "fetch", "origin", "tag", tag, "--no-tags"]]);
+    await runCmd(["git", ["-C", pluginRoot, "merge", "--ff-only", tag]]);
+    await runCmd(installerStep);
+    return true;
+  } catch (err) {
+    const errMsg = err && err.message ? err.message : String(err);
+    try {
+      await runCmd(["git", ["-C", pluginRoot, "reset", "--keep", prevHead]]);
+    } catch (rollbackErr) {
+      const rbMsg = rollbackErr && rollbackErr.message ? rollbackErr.message : String(rollbackErr);
+      throw new Error(`${errMsg} (rollback via reset --keep failed: ${rbMsg})`);
+    }
+    throw err;
+  }
 }
 
 function spawnUpdateCheckIfStale(update, pluginRoot, lockPath) {
@@ -290,6 +341,7 @@ module.exports = {
   tailText,
   updateStepEnv,
   runUpdateStep,
+  executeManagedUpdate,
   spawnUpdateCheckIfStale,
   probeDoctor,
 };

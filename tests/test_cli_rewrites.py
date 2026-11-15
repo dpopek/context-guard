@@ -19,6 +19,7 @@ from hooks.harness_adapter import (
 from hooks.pre_tool_use import evaluate_hook, main as pre_tool_use_main
 from hooks.shell_parser import rewrite_quiet_cli_flags
 from hooks.telemetry import load_telemetry_stats
+from integrations.atlassian_twg import rewrite_twg_cli_command
 from tests.helpers import read_outcomes_ledger
 
 
@@ -37,8 +38,13 @@ def test_package_manager_test_commands_pass_through_without_silent_flag() -> Non
     assert rewrite_quiet_cli_flags("yarn test") is None
 
 
-def test_twg_keeps_cd_when_an_argument_is_a_relative_file() -> None:
-    assert rewrite_quiet_cli_flags("cd /repo && twg jira workitem get PROJ-1 --output json") == (
+def test_twg_keeps_cd_when_an_argument_is_a_relative_file(tmp_path: Path, isolated_user_env: Path) -> None:
+    _ = isolated_user_env
+    assert rewrite_quiet_cli_flags("cd /repo && twg jira workitem get PROJ-1 --output json") is None
+    assert rewrite_quiet_cli_flags("cd /repo && twg jira workitem get PROJ-1 --output json", enable_atlassian_twg=True) == (
+        "twg jira workitem get PROJ-1 --output json"
+    )
+    assert rewrite_twg_cli_command("cd /repo && twg jira workitem get PROJ-1 --output json") == (
         "twg jira workitem get PROJ-1 --output json"
     )
     for cmd in (
@@ -47,9 +53,20 @@ def test_twg_keeps_cd_when_an_argument_is_a_relative_file() -> None:
         "cd /repo && twg artifacts share out/report.csv",
     ):
         assert rewrite_quiet_cli_flags(cmd) is None
-    assert rewrite_quiet_cli_flags("cd /repo && twg artifacts share /abs/report.html") == (
+        assert rewrite_quiet_cli_flags(cmd, enable_atlassian_twg=True) is None
+        assert rewrite_twg_cli_command(cmd) is None
+    assert rewrite_quiet_cli_flags("cd /repo && twg artifacts share /abs/report.html", enable_atlassian_twg=True) == (
         "twg artifacts share /abs/report.html"
     )
+    res_off = evaluate_hook(
+        {
+            "conversationId": "c-twg-off",
+            "stepIdx": 1,
+            "toolCall": {"name": "run_command", "args": {"CommandLine": "TWG_AGENT_DEFAULTS=1 ~/.local/bin/twg jira status"}},
+        },
+        state_dir=str(tmp_path / "state"),
+    )
+    assert res_off == {"decision": "allow"}
 
 
 def test_can_rewrite_shell_command_enforces_harness_and_permission_mode() -> None:
@@ -522,12 +539,17 @@ def test_pre_tool_use_main_cli_and_telemetry_resilience(
 
 
 def test_twg_noncanonical_re_does_not_mangle_similar_prefixes_or_home_paths() -> None:
-    assert rewrite_quiet_cli_flags("~twg status") is None
-    assert rewrite_quiet_cli_flags("/Users/dev" + "twg status") is None
-    assert rewrite_quiet_cli_flags("/home/alice" + "twg status") is None
-    assert rewrite_quiet_cli_flags("/home/alice/.local/bin/twg status") == "twg status"
-    assert rewrite_quiet_cli_flags("~/.local/bin/twg jira --help") == "twg jira --help"
-    assert rewrite_quiet_cli_flags("TWG_AGENT_DEFAULTS=1 /Users/dev/.local/bin/twg jira status") == "twg jira status"
+    assert rewrite_quiet_cli_flags("~twg status", enable_atlassian_twg=True) is None
+    assert rewrite_quiet_cli_flags("/Users/dev" + "twg status", enable_atlassian_twg=True) is None
+    assert rewrite_quiet_cli_flags("/home/alice" + "twg status", enable_atlassian_twg=True) is None
+    assert rewrite_quiet_cli_flags("/home/alice/.local/bin/twg status") is None
+    assert rewrite_quiet_cli_flags("/home/alice/.local/bin/twg status", enable_atlassian_twg=True) == "twg status"
+    assert rewrite_quiet_cli_flags("~/.local/bin/twg jira --help", enable_atlassian_twg=True) == "twg jira --help"
+    assert (
+        rewrite_quiet_cli_flags("TWG_AGENT_DEFAULTS=1 /Users/dev/.local/bin/twg jira status", enable_atlassian_twg=True)
+        == "twg jira status"
+    )
+    assert rewrite_twg_cli_command("TWG_AGENT_DEFAULTS=1 /Users/dev/.local/bin/twg jira status") == "twg jira status"
 
 
 def test_unquoted_text_handles_escaped_quotes_in_outline_and_cli_rewrites() -> None:

@@ -22,6 +22,7 @@ from hooks.shell_parser import (
     split_leading_cd_prefix,
 )
 from hooks.telemetry import load_telemetry_stats
+from integrations.atlassian_twg import rewrite_twg_cli_command
 from tests.helpers import read_outcomes_ledger, write_python_module
 
 
@@ -213,27 +214,44 @@ def test_rewrite_quiet_cli_flags_for_cargo_jest_and_vitest() -> None:
     assert rewrite_quiet_cli_flags("npx vitest run --reporter=dot") is None
 
 
-def test_twg_canonicalization_and_redirection_guard_in_rewrite_cli() -> None:
+def test_twg_canonicalization_and_redirection_guard_in_rewrite_cli(tmp_path: Path, isolated_user_env: Path) -> None:
+    _ = isolated_user_env
     assert (
         rewrite_quiet_cli_flags(
             'TWG_AGENT_DEFAULTS=1 ~/.local/bin/twg jira workitem search --jql "project = CORE"'
         )
-        == 'twg jira workitem search --jql "project = CORE"'
+        is None
     )
     assert (
         rewrite_quiet_cli_flags(
+            'TWG_AGENT_DEFAULTS=1 ~/.local/bin/twg jira workitem search --jql "project = CORE"',
+            enable_atlassian_twg=True,
+        )
+        == 'twg jira workitem search --jql "project = CORE"'
+    )
+    assert (
+        rewrite_twg_cli_command(
             "/Users/dev/.local/bin/twg jira workitem get PROJ-2780 --output json"
         )
         == "twg jira workitem get PROJ-2780 --output json"
     )
-    assert rewrite_quiet_cli_flags("~/.local/bin/twg jira --help") == "twg jira --help"
+    assert rewrite_quiet_cli_flags("~/.local/bin/twg jira --help", enable_atlassian_twg=True) == "twg jira --help"
     assert (
         rewrite_quiet_cli_flags(
-            "cd /Users/dev/workspace && twg jira workitem get PROJ-2780 --output json"
+            "cd /Users/dev/workspace && twg jira workitem get PROJ-2780 --output json",
+            enable_atlassian_twg=True,
         )
         == "twg jira workitem get PROJ-2780 --output json"
     )
-    assert rewrite_quiet_cli_flags("twg jira workitem get PROJ-2780 --output json") is None
+    assert rewrite_quiet_cli_flags("twg jira workitem get PROJ-2780 --output json", enable_atlassian_twg=True) is None
+    assert ptu.evaluate_hook(
+        {
+            "conversationId": "c-twg-off",
+            "stepIdx": 1,
+            "toolCall": {"name": "run_command", "args": {"CommandLine": "~/.local/bin/twg jira --help"}},
+        },
+        state_dir=str(tmp_path / "state"),
+    ) == {"decision": "allow"}
     assert rewrite_quiet_cli_flags("venv/bin/pytest tests/unit > /tmp/pytest.log") is None
     assert rewrite_quiet_cli_flags("npx jest test/a.test.js > /tmp/jest.log") is None
 

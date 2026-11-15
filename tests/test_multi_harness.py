@@ -2,22 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from hooks import config as guard_config
 from hooks.harness_adapter import (
     NormalizedToolCall,
     detect_harness,
     extract_apply_patch_paths,
     format_pre_tool_output,
     normalize_pre_tool_payload,
-)
-from hooks.local_repo_guard import (
-    extract_bigquery_sql_target,
-    extract_gitlab_lookup_target,
 )
 
 
@@ -92,25 +91,72 @@ def test_extract_apply_patch_paths(tmp_path: Path) -> None:
     assert paths == [str(tmp_path / "src/a.py"), str(tmp_path / "src/b.py")]
 
 
-def test_double_underscore_mcp_guards() -> None:
-    assert extract_gitlab_lookup_target(
-        "mcp__gitlab__get_file_contents", {"project_id": "acme-corp/payments-service"}
-    ) == ("get_file_contents", {"project_id": "acme-corp/payments-service"})
-    assert extract_gitlab_lookup_target(
-        "MCP:gitlab:get_file_contents", {"project_id": "acme-corp/payments-service"}
-    ) == ("get_file_contents", {"project_id": "acme-corp/payments-service"})
-    assert extract_bigquery_sql_target(
-        "mcp__bigquery__execute_sql_readonly",
-        {"query": "SELECT * FROM raw_warehouse.orders"},
-    ) == ("execute_sql_readonly", "SELECT * FROM raw_warehouse.orders")
-    assert extract_bigquery_sql_target(
-        "MCP:bigquery:execute_sql_readonly",
-        {"query": "SELECT * FROM raw_warehouse.orders"},
-    ) == ("execute_sql_readonly", "SELECT * FROM raw_warehouse.orders")
-
-
 from hooks.pre_compact import handle_pre_compact
 from hooks.pre_tool_use import evaluate_hook
+
+
+def _configure_synthetic_mcp_pack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    guard_config.clear_config_cache()
+    pack_dir = tmp_path / "policies" / "acme_mcp"
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(pack_dir.parent, 0o700)
+    os.chmod(pack_dir, 0o700)
+    pack_src = (
+        "from policies.api import POLICY_API_VERSION, PolicyDecision, PolicyPackManifest\n\n"
+        "def evaluate(ctx):\n"
+        "    if ctx.canonical_tool == 'call_mcp_tool' or ctx.original_tool_name.lower().startswith(('mcp_', 'mcp:')):\n"
+        "        sql = str(ctx.canonical_args.get('query') or ctx.canonical_args.get('Arguments', {}).get('query') or '')\n"
+        "        if 'raw_warehouse' in sql or not sql:\n"
+        "            return PolicyDecision(decision='deny', reason='Blocked by acme-mcp-sec: use safe views')\n"
+        "    return None\n\n"
+        "PACK_MANIFEST = PolicyPackManifest(\n"
+        "    pack_id='acme-mcp-sec', api_version=POLICY_API_VERSION,\n"
+        "    kind='security', covered_domains=('synthetic-mcp',), evaluate=evaluate,\n"
+        ")\n"
+    ).encode("utf-8")
+    pack_file = pack_dir / "pack.py"
+    pack_file.write_bytes(pack_src)
+    os.chmod(pack_file, 0o600)
+    fsha = hashlib.sha256(pack_src).hexdigest()
+    tsha = hashlib.sha256(f"pack.py:{fsha}\n".encode("utf-8")).hexdigest()
+    entry = {
+        "id": "acme-mcp-sec",
+        "path": str(pack_file),
+        "enabled": True,
+        "kind": "security",
+        "scopes": ["mcp_call"],
+        "fallback_matchers": {"mcp_tool_regex": r"^mcp__?acme_db(?:__|$)"},
+        "file_hashes": {"pack.py": fsha},
+        "tree_sha256": tsha,
+        "settings": {},
+    }
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"policy_packs": [entry]}), encoding="utf-8")
+    monkeypatch.setenv("CONTEXT_GUARD_CONFIG_PATH", str(cfg))
+    guard_config.clear_config_cache()
+
+
+def test_double_underscore_and_colon_mcp_routing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    norm_u = normalize_pre_tool_payload(
+        {"tool_name": "mcp__acme_db__execute_sql_readonly", "tool_input": {"query": "SELECT 1"}},
+        cli_harness="claude",
+    )
+    assert norm_u.original_tool_name == "mcp__acme_db__execute_sql_readonly"
+    norm_c = normalize_pre_tool_payload(
+        {"tool_name": "MCP:acme_db:execute_sql_readonly", "tool_input": {"query": "SELECT 1"}},
+        cli_harness="cursor",
+    )
+    assert norm_c.original_tool_name == "MCP:acme_db:execute_sql_readonly"
+
+    _configure_synthetic_mcp_pack(tmp_path, monkeypatch)
+    state_dir = str(tmp_path / "mcp_state")
+    for tname in ("mcp__acme_db__execute_sql_readonly", "MCP:acme_db:execute_sql_readonly"):
+        res = evaluate_hook(
+            {"session_id": "s-mcp", "tool_name": tname, "tool_input": {"query": "SELECT * FROM raw_warehouse.orders"}},
+            state_dir=state_dir,
+            cli_harness="claude",
+        )
+        assert res["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
 def test_claude_read_allows_normal_file_trims_overlap_and_outlines_mcp_output(tmp_path: Path) -> None:
@@ -351,21 +397,23 @@ def test_installer_registers_shell_output_hooks(tmp_path: Path) -> None:
         assert "post_tool_use" not in cfg.read_text(encoding="utf-8")
 
 
-def test_evaluate_hook_env_detection_and_bq_matchers(monkeypatch, tmp_path: Path) -> None:
-    from bin.install_harnesses import CLAUDE_MATCHER, CODEX_MATCHER, CURSOR_MATCHER
+def test_evaluate_hook_env_detection_and_pack_matchers(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     import re
+    from bin.harness_status import merge_harness_matcher
+    from bin.install_harnesses import CLAUDE_MATCHER, CODEX_MATCHER, CURSOR_MATCHER
 
-    # Verify CODEX_MATCHER, CLAUDE_MATCHER, CURSOR_MATCHER match all 3 BigQuery MCP servers
-    for matcher in (CLAUDE_MATCHER, CURSOR_MATCHER, CODEX_MATCHER):
-        assert re.search(matcher, "mcp__data-agent-kit-plugin_dak-bigquery__execute_sql_readonly")
-        assert re.search(matcher, "mcp__datacloud_bigquery_remote__execute_sql_readonly")
+    assert re.search(CLAUDE_MATCHER, "Bash") and re.search(CURSOR_MATCHER, "Shell")
+    assert re.search(CODEX_MATCHER, "mcp__acme_db__execute_sql_readonly")
+    for base, anchored in ((CLAUDE_MATCHER, False), (CURSOR_MATCHER, False), (CODEX_MATCHER, True)):
+        merged = merge_harness_matcher(base, ("mcp__acme_db__.*",), regex_anchored=anchored)
+        assert re.search(merged, "mcp__acme_db__execute_sql_readonly")
 
-    # Verify evaluate_hook detects codex from os.environ when cli_harness is omitted
+    _configure_synthetic_mcp_pack(tmp_path, monkeypatch)
     monkeypatch.setenv("CODEX_SANDBOX", "seatbelt")
     res1 = evaluate_hook(
         {
             "session_id": "cx-env",
-            "tool_name": "mcp__bigquery__execute_sql_readonly",
+            "tool_name": "mcp__acme_db__execute_sql_readonly",
             "tool_input": {},
         },
         state_dir=str(tmp_path / "env_state"),

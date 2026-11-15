@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from hooks import model_identity as mi, pre_tool_use
-from hooks.local_repo_guard import load_guard_config
+from hooks.config import load_runtime_config
 from tests.helpers import read_outcomes_ledger, read_session_state
 
 
@@ -93,16 +93,16 @@ def test_memoize_model_retries_unknown_on_next_step(tmp_path: Path) -> None:
     assert mi.memoize_model("claude", "s1", str(transcript), state, 2) == "claude-fable-5-1"
 
 
-def test_load_guard_config_keeps_only_known_harness_labels(tmp_path: Path) -> None:
+def test_load_runtime_config_keeps_only_known_harness_labels(tmp_path: Path) -> None:
     cfg = tmp_path / "config.json"
     cfg.write_text(
         json.dumps({"model_labels": {"claude": " x ", "codex": "", "bogus": "y", "cursor": 3}}),
         encoding="utf-8",
     )
-    assert load_guard_config(cfg)["model_labels"] == {"claude": "x"}
-    assert load_guard_config(tmp_path / "missing.json")["model_labels"] == {}
+    assert load_runtime_config(cfg)["model_labels"] == {"claude": "x"}
+    assert load_runtime_config(tmp_path / "missing.json")["model_labels"] == {}
     cfg.write_text(json.dumps({"model_labels": ["a"]}), encoding="utf-8")
-    assert load_guard_config(cfg)["model_labels"] == {}
+    assert load_runtime_config(cfg)["model_labels"] == {}
 
 
 def test_extract_antigravity_model_change() -> None:

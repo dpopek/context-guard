@@ -6,10 +6,16 @@ import json
 import os
 import re
 from pathlib import Path
-
-from hooks.local_repo_guard import GENERIC_REPO_BASENAMES
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
+_OPERATOR_HOME = Path.home()
+_PROD_PACKAGES = ("hooks", "bin", "policies", "integrations")
+GENERIC_REPO_BASENAMES: frozenset[str] = frozenset({
+    "project", "backend", "frontend", "production", "stage", "test", "upgradetest",
+    "maintenance", "image", "docker", "native", "meta", "charts", "ci-cd",
+    "ci-cd.yml", "traefik", "docker-swarm", "kubernetes",
+})
 
 
 def _private_cross_imports_in_source(
@@ -63,12 +69,9 @@ def _private_cross_imports_in_source(
 
 
 def _private_cross_imports() -> list[str]:
-    prod_modules = {p.stem for folder in ("hooks", "bin") for p in (ROOT / folder).glob("*.py")} | {
-        "hooks",
-        "bin",
-    }
+    prod_modules = {p.stem for folder in _PROD_PACKAGES for p in (ROOT / folder).glob("*.py")} | set(_PROD_PACKAGES)
     offenders: list[str] = []
-    for path in sorted([*ROOT.glob("hooks/*.py"), *ROOT.glob("bin/*.py")]):
+    for path in sorted(p for folder in _PROD_PACKAGES for p in (ROOT / folder).glob("*.py")):
         rel = path.relative_to(ROOT).as_posix()
         offenders.extend(_private_cross_imports_in_source(rel, path.read_text(encoding="utf-8"), prod_modules))
     return offenders
@@ -84,11 +87,13 @@ def test_no_private_names_cross_module_boundaries() -> None:
 
 
 def test_one_operator_diagnostic() -> None:
-    from hooks import outcomes, pre_compact, pre_invocation, pre_tool_use, state_store, telemetry
+    from hooks import outcomes, policy_engine, post_tool_use, pre_compact, pre_invocation, pre_tool_use, state_store, telemetry
 
     assert (
         telemetry.warn
         is outcomes.warn
+        is policy_engine.warn
+        is post_tool_use.warn
         is pre_tool_use.warn
         is pre_compact.warn
         is pre_invocation.warn
@@ -114,7 +119,7 @@ def test_pre_invocation_does_not_import_pre_tool_use() -> None:
 
 def _build_package_import_graph() -> dict[str, set[str]]:
     mod_paths: dict[str, Path] = {}
-    for path in sorted([*ROOT.glob("hooks/*.py"), *ROOT.glob("bin/*.py")]):
+    for path in sorted(p for folder in _PROD_PACKAGES for p in (ROOT / folder).glob("*.py")):
         pkg = path.parent.name
         mod_name = pkg if path.stem == "__init__" else f"{pkg}.{path.stem}"
         mod_paths[mod_name] = path
@@ -129,7 +134,7 @@ def _build_package_import_graph() -> dict[str, set[str]]:
                     raw = alias.name
                     if raw in mod_paths:
                         graph[mod_name].add(raw)
-                    elif raw.split(".")[0] in ("hooks", "bin"):
+                    elif raw.split(".")[0] in _PROD_PACKAGES:
                         cand = ".".join(raw.split(".")[:2])
                         if cand in mod_paths:
                             graph[mod_name].add(cand)
@@ -142,14 +147,14 @@ def _build_package_import_graph() -> dict[str, set[str]]:
                 else:
                     base = node.module or ""
 
-                if base in ("hooks", "bin"):
+                if base in _PROD_PACKAGES:
                     for alias in node.names:
                         cand = f"{base}.{alias.name}"
                         if cand in mod_paths:
                             graph[mod_name].add(cand)
                         elif base in mod_paths:
                             graph[mod_name].add(base)
-                elif base.startswith(("hooks.", "bin.")):
+                elif any(base.startswith(f"{p}.") for p in _PROD_PACKAGES):
                     cand = ".".join(base.split(".")[:2])
                     if cand in mod_paths:
                         graph[mod_name].add(cand)
@@ -222,9 +227,9 @@ MAX_JS_FILE_LOC = 500
 
 
 def test_production_module_loc_ceilings() -> None:
-    """Every production Python module in hooks/*.py and bin/*.py must stay <= 800 LOC."""
+    """Every production Python module in hooks/, bin/, policies/, and integrations/ must stay <= 800 LOC."""
     violations: list[str] = []
-    for folder in ("hooks", "bin"):
+    for folder in _PROD_PACKAGES:
         for path in sorted((ROOT / folder).glob("*.py")):
             loc = len(path.read_text(encoding="utf-8").splitlines())
             if loc > MAX_PROD_FILE_LOC:
@@ -247,7 +252,7 @@ def test_vscode_extension_js_loc_ceilings() -> None:
     assert violations == [], f"VS Code extension JS LOC violations: {violations}"
 
 
-_ALLOWED_TEST_USERS = frozenset({"dev", "x", "u", "user", "example", "alice", "bob", "jan"})
+_ALLOWED_TEST_USERS = frozenset({"dev", "x", "u", "user", "example", "acme", "alice", "bob", "jan"})
 _GENERIC_CI_USERS = frozenset(
     {"runner", "ubuntu", "root", "vscode", "codespace", "docker", "builder", "dev", "user", "test", "admin"}
 )
@@ -264,7 +269,7 @@ _GCP_PROJECT_TEST_RE = re.compile(
     re.IGNORECASE,
 )
 _LOCAL_EMAIL_RE = re.compile(r"@[A-Za-z0-9._-]+\.local\b", re.IGNORECASE)
-_ATLASSIAN_RE = re.compile(r"\b(?!example\.)[a-z0-9-]+\.atlassian\.net\b", re.IGNORECASE)
+_ATLASSIAN_RE = re.compile(r"\b(?!(?:example|acme)\.)[a-z0-9-]+\.atlassian\.net\b", re.IGNORECASE)
 _TOKEN_RE = re.compile(r"[a-z0-9_]+(?:-[a-z0-9_]+)*")
 _SKIP_DYNAMIC_TERMS = GENERIC_REPO_BASENAMES | {
     "magento",
@@ -281,12 +286,15 @@ _SKIP_DYNAMIC_TERMS = GENERIC_REPO_BASENAMES | {
     "modules",
     "services",
     "mobile",
+    "example",
+    "acme",
+    "sample",
 }
 
 
 def _load_operator_private_terms() -> frozenset[str]:
     terms: set[str] = set()
-    home = Path.home()
+    home = _OPERATOR_HOME
     me = home.name.lower()
     if len(me) >= 3 and me not in _GENERIC_CI_USERS:
         terms.add(me)
@@ -297,30 +305,37 @@ def _load_operator_private_terms() -> frozenset[str]:
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return frozenset(terms)
-    for ds in cfg.get("restricted_bq_datasets") or []:
-        if isinstance(ds, str) and len(ds) >= 4:
-            terms.add(ds.lower())
-    hint = str(cfg.get("allowed_bq_views_hint") or "")
-    for m in re.finditer(r"[a-z][a-z0-9]+-[a-z][a-z0-9]+(?:-\d{4,})?", hint.lower()):
-        proj = m.group(0)
-        terms.add(proj)
-        parts = proj.split("-")
-        if len(parts) >= 2:
-            terms.add(f"{parts[0]}-{parts[1]}")
-    rm_raw = cfg.get("repo_map_path")
-    if isinstance(rm_raw, str) and Path(rm_raw).is_file():
-        try:
-            rm = json.loads(Path(rm_raw).read_text(encoding="utf-8"))
-            for entry in rm.get("repositories") or []:
-                name = str(entry.get("name") or "").lower()
-                if len(name) >= 4 and name not in _SKIP_DYNAMIC_TERMS:
-                    terms.add(name)
-                slug = str(entry.get("remote_slug") or entry.get("gitlab_path") or "").lower()
-                for part in slug.split("/"):
-                    if len(part) >= 4 and part not in _SKIP_DYNAMIC_TERMS:
-                        terms.add(part)
-        except (OSError, ValueError):
-            pass
+    if not isinstance(cfg, dict):
+        return frozenset(terms)
+    settings_sources: list[dict[str, Any]] = [cfg]
+    for pack in cfg.get("policy_packs") or []:
+        if isinstance(pack, dict) and isinstance(pack.get("settings"), dict):
+            settings_sources.append(pack["settings"])
+    for src in settings_sources:
+        for ds in src.get("restricted_bq_datasets") or []:
+            if isinstance(ds, str) and len(ds) >= 4:
+                terms.add(ds.lower())
+        hint = str(src.get("allowed_bq_views_hint") or "")
+        for m in re.finditer(r"[a-z][a-z0-9]+-[a-z][a-z0-9]+(?:-\d{4,})?", hint.lower()):
+            proj = m.group(0)
+            terms.add(proj)
+            parts = proj.split("-")
+            if len(parts) >= 2:
+                terms.add(f"{parts[0]}-{parts[1]}")
+        rm_raw = src.get("repo_map_path")
+        if isinstance(rm_raw, str) and Path(rm_raw).is_file():
+            try:
+                rm = json.loads(Path(rm_raw).read_text(encoding="utf-8"))
+                for entry in rm.get("repositories") or []:
+                    name = str(entry.get("name") or "").lower()
+                    if len(name) >= 4 and name not in _SKIP_DYNAMIC_TERMS:
+                        terms.add(name)
+                    slug = str(entry.get("remote_slug") or entry.get("gitlab_path") or "").lower()
+                    for part in slug.split("/"):
+                        if len(part) >= 4 and part not in _SKIP_DYNAMIC_TERMS:
+                            terms.add(part)
+            except (OSError, ValueError):
+                pass
     return frozenset(terms)
 
 
@@ -402,7 +417,7 @@ def test_outline_loc_ceiling_and_zero_hardcoded_user_paths() -> None:
     )
 
     dynamic_terms = _load_operator_private_terms()
-    for folder in ("bin", "hooks", "rules", "skills", "tests", "vscode-extension"):
+    for folder in ("bin", "hooks", "policies", "integrations", "rules", "skills", "tests", "vscode-extension"):
         is_tests = folder == "tests"
         for src_file in sorted((ROOT / folder).rglob("*")):
             if not src_file.is_file() or src_file.suffix not in (".py", ".md", ".json", ".js"):
@@ -474,11 +489,8 @@ def test_no_unittest_testcase_in_test_suite() -> None:
 
 
 def test_tests_do_not_access_private_production_symbols() -> None:
-    """Tests must only import, call, or monkeypatch public symbols on hooks.* and bin.* modules."""
-    prod_modules = {p.stem for folder in ("hooks", "bin") for p in (ROOT / folder).glob("*.py")} | {
-        "hooks",
-        "bin",
-    }
+    """Tests must only import, call, or monkeypatch public symbols on production modules."""
+    prod_modules = {p.stem for folder in _PROD_PACKAGES for p in (ROOT / folder).glob("*.py")} | set(_PROD_PACKAGES)
     violations: list[str] = []
     for path in sorted((ROOT / "tests").glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -487,12 +499,12 @@ def test_tests_do_not_access_private_production_symbols() -> None:
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     top = alias.name.split(".")[0]
-                    if top in ("hooks", "bin"):
+                    if top in _PROD_PACKAGES:
                         module_aliases.add(alias.asname or alias.name.split(".")[-1])
             elif isinstance(node, ast.ImportFrom):
                 mod = node.module or ""
                 top = mod.split(".")[0]
-                if top in ("hooks", "bin"):
+                if top in _PROD_PACKAGES:
                     for alias in node.names:
                         if alias.name.startswith("_") and not alias.name.startswith("__"):
                             violations.append(
@@ -561,9 +573,9 @@ def test_every_test_function_has_assertions() -> None:
 
 
 def test_every_python_module_enables_future_annotations() -> None:
-    """Every non-__init__.py module in hooks/, bin/, and tests/ must enable PEP 563 future annotations for Python 3.9+ cross-OS compatibility."""
+    """Every non-__init__.py module across hooks/, bin/, policies/, integrations/, and tests/ must enable PEP 563."""
     violations: list[str] = []
-    for folder in ("hooks", "bin", "tests"):
+    for folder in (*_PROD_PACKAGES, "tests"):
         for path in sorted((ROOT / folder).glob("*.py")):
             if path.name == "__init__.py":
                 continue
@@ -585,7 +597,7 @@ UNIX_ONLY_STDLIB_MODULES = frozenset({"fcntl", "pwd", "grp", "termios", "resourc
 def test_no_unguarded_unix_only_imports() -> None:
     """Top-level imports of Unix-only stdlib modules must be guarded by try/except ImportError so Windows works."""
     violations: list[str] = []
-    for folder in ("hooks", "bin", "tests"):
+    for folder in (*_PROD_PACKAGES, "tests"):
         for path in sorted((ROOT / folder).glob("*.py")):
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             for stmt in tree.body:
@@ -608,7 +620,7 @@ def test_python39_runtime_ast_compatibility_and_no_bare_except() -> None:
     """Enforce Python 3.9 runtime compatibility (no match/case, no isinstance(x, A | B)) and no bare except:."""
     violations: list[str] = []
     match_cls = getattr(ast, "Match", None)
-    for folder in ("hooks", "bin", "tests"):
+    for folder in (*_PROD_PACKAGES, "tests"):
         for path in sorted((ROOT / folder).glob("*.py")):
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             rel = path.relative_to(ROOT)

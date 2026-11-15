@@ -33,10 +33,10 @@ fi
 
 # 3. Always run mechanical documentation sync, conciseness, module boundary & static type checks.
 if echo "$STAGED" | grep -Eq '^vscode-extension/.*\.js$' && command -v node >/dev/null 2>&1; then
-  node --check vscode-extension/extension.js vscode-extension/view_model.js vscode-extension/updater.js vscode-extension/renderers.js
+  for f in vscode-extension/*.js; do node --check "$f" || exit 1; done
 fi
 if command -v mypy >/dev/null 2>&1; then
-  mypy hooks bin tests
+  mypy hooks bin policies integrations tests
 fi
 if command -v pytest >/dev/null 2>&1; then
   pytest -q tests/test_version_source.py tests/test_module_boundaries.py

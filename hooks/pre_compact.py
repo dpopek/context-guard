@@ -12,6 +12,8 @@ _PLUGIN_ROOT = str(Path(__file__).resolve().parent.parent)
 if _PLUGIN_ROOT not in sys.path:
     sys.path.insert(0, _PLUGIN_ROOT)
 
+from hooks.config import load_runtime_config  # noqa: E402
+from hooks.policy_engine import notify_session_transition  # noqa: E402
 from hooks.session_lifecycle import apply_compaction_boundary  # noqa: E402
 from hooks.state_store import (  # noqa: E402
     emit_json_and_sanitize_stdio,
@@ -31,8 +33,10 @@ def handle_pre_compact(
         state_dir_path = resolve_state_dir(payload, state_dir)
         if not state_file_in(state_dir_path).exists():
             return {}
+        runtime_cfg = load_runtime_config()
         with locked_state(state_dir_path) as txn:
             apply_compaction_boundary(txn.state, checkpoint_step=None)
+            notify_session_transition("compact", txn.state, runtime_cfg)
             txn.dirty = True
     except OSError as exc:
         warn(f"pre_compact skipped: {type(exc).__name__}: {exc}")

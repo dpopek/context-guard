@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 from hooks import outcomes, pre_tool_use as ptu
 from tests.helpers import read_outcomes_ledger, read_session_state
 
@@ -212,7 +214,15 @@ def test_e2e_unwrapped_sibling_read_clears_pending_on_both_files(tmp_path: Path)
         assert "pending_followup_kind" not in entry
 
 
-def test_e2e_small_twg_inline_read_does_not_set_pending_followup(tmp_path: Path) -> None:
+def test_e2e_small_twg_inline_read_does_not_set_pending_followup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hooks.config import clear_config_cache
+
+    cfg_path = tmp_path / "cg_config.json"
+    cfg_path.write_text(json.dumps({"integrations": {"atlassian_twg": "active"}}), encoding="utf-8")
+    monkeypatch.setenv("CONTEXT_GUARD_CONFIG_PATH", str(cfg_path))
+    clear_config_cache()
     twg_file = tmp_path / "twg" / "run1" / "stdout.json"
     twg_file.parent.mkdir(parents=True)
     twg_file.write_text(
@@ -392,7 +402,15 @@ def test_e2e_antigravity_run_command_uses_cwd_for_outline_pull_and_shell_bypass(
     assert row["total"] == 1 and row["applied"] == 1 and row["shell_bypass"] == 1
 
 
-def test_e2e_small_twg_inline_read_clears_prior_outline_pull_pending_flag(tmp_path: Path) -> None:
+def test_e2e_small_twg_inline_read_clears_prior_outline_pull_pending_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hooks.config import clear_config_cache
+
+    cfg_path = tmp_path / "cg_config.json"
+    cfg_path.write_text(json.dumps({"integrations": {"atlassian_twg": "active"}}), encoding="utf-8")
+    monkeypatch.setenv("CONTEXT_GUARD_CONFIG_PATH", str(cfg_path))
+    clear_config_cache()
     twg_file = tmp_path / "twg" / "run2" / "stdout.json"
     twg_file.parent.mkdir(parents=True)
     twg_file.write_text(

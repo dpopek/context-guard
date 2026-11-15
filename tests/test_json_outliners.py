@@ -8,19 +8,29 @@ import shlex
 from pathlib import Path
 from typing import Any
 
-from hooks.json_outliners import (
-    TWG_STDOUT_OUTLINE_MIN_BYTES,
-    prepare_twg_stdout_outline,
-    unwrap_and_outline_twg_stdout,
-)
+from hooks import config as guard_config, json_outliners
 from hooks.pre_tool_use import evaluate_hook
 from hooks.read_planner import handle_file_read_verdict
 from hooks.state_store import state_file_in
+from integrations.atlassian_twg import (
+    TWG_STDOUT_OUTLINE_MIN_BYTES,
+    extract_adf_plain_text,
+    prepare_twg_stdout_outline,
+    unwrap_and_outline_twg_stdout,
+)
+
+
+def _enable_twg_integration(home_dir: Path) -> None:
+    cfg_path = home_dir / ".config" / "context-guard" / "config.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(json.dumps({"integrations": {"atlassian_twg": "active"}}), encoding="utf-8")
+    guard_config.clear_config_cache()
 
 
 def test_small_twg_stdout_under_6kb_writes_no_files_to_cache_or_sibling(
-    tmp_path: Path,
+    tmp_path: Path, isolated_user_env: Path
 ) -> None:
+    _enable_twg_integration(isolated_user_env)
     twg_dir = tmp_path / "twg" / "run1"
     twg_dir.mkdir(parents=True)
     twg_file = twg_dir / "stdout.compact.json"
@@ -96,8 +106,9 @@ def test_small_twg_stdout_under_6kb_writes_no_files_to_cache_or_sibling(
 
 
 def test_unredirected_twg_and_mcp_envelopes_preserve_physical_line_count(
-    tmp_path: Path,
+    tmp_path: Path, isolated_user_env: Path
 ) -> None:
+    _enable_twg_integration(isolated_user_env)
     state_twg = tmp_path / "state_twg_phys"
     twg_dir = tmp_path / "twg" / "run_phys"
     twg_dir.mkdir(parents=True)
@@ -449,8 +460,9 @@ def test_mcp_output_txt_handles_non_code_content_and_json_list(tmp_path: Path) -
 
 
 def test_twg_stdout_json_auto_outline_workitem_get_query_and_escape_hatch(
-    tmp_path: Path,
+    tmp_path: Path, isolated_user_env: Path
 ) -> None:
+    _enable_twg_integration(isolated_user_env)
     state_dir = str(tmp_path / "state")
     twg_dir = tmp_path / "T" / "twg" / "1793212572" / "run.dYIO2K"
     twg_dir.mkdir(parents=True, exist_ok=True)
@@ -749,3 +761,37 @@ def test_mcp_step_outline_splits_windows_path_and_unwraps_results_and_values(
         assert res_coll is not None
         _, outline_txt, _ = res_coll
         assert "MCP JSON collection (25 items" in outline_txt
+
+
+def test_twg_stdout_default_off_leaves_twg_files_untouched(tmp_path: Path, isolated_user_env: Path) -> None:
+    state_dir = tmp_path / "state_off"
+    twg_dir = tmp_path / "twg" / "run_off"
+    twg_dir.mkdir(parents=True)
+    small_f = twg_dir / "stdout.compact.json"
+    small_f.write_text(json.dumps({"command": "twg jira workitem get PROJ-1", "data": {"key": "PROJ-1"}}), encoding="utf-8")
+    large_f = twg_dir / "stdout.json"
+    large_f.write_text(json.dumps({"command": "twg jira workitem get PROJ-2", "data": {"key": "PROJ-2", "pad": ["x" * 60 for _ in range(200)]}}), encoding="utf-8")
+    assert large_f.stat().st_size > TWG_STDOUT_OUTLINE_MIN_BYTES
+
+    cfg_path = isolated_user_env / ".config" / "context-guard" / "config.json"
+    for cfg_obj in (None, {"integrations": {"atlassian_twg": "off"}}):
+        if cfg_obj is not None:
+            cfg_path.parent.mkdir(parents=True, exist_ok=True)
+            cfg_path.write_text(json.dumps(cfg_obj), encoding="utf-8")
+            guard_config.clear_config_cache()
+        for fpath in (small_f, large_f):
+            assert evaluate_hook({"conversationId": "c-off", "stepIdx": 1, "toolCall": {"name": "read_file", "args": {"Path": str(fpath)}}}, state_dir=str(state_dir)) == {"decision": "allow"}
+            assert handle_file_read_verdict(state_dir, str(fpath), 1, 5, 0, 2).decision == {"decision": "allow"}
+    assert not (state_dir / "twg_cache").exists()
+    assert not (twg_dir / "stdout_formatted.json").exists()
+
+
+def test_extract_adf_plain_text_and_json_outliners_decoupled() -> None:
+    assert extract_adf_plain_text(None) == ""
+    assert extract_adf_plain_text("  hello  ") == "hello"
+    doc = {"type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "A"}, {"type": "hardBreak"}, {"type": "text", "text": "B"}]}]}
+    assert extract_adf_plain_text(doc).strip() == "A\nB"
+    assert not hasattr(json_outliners, "prepare_twg_stdout_outline")
+    assert not hasattr(json_outliners, "unwrap_and_outline_twg_stdout")
+    assert not hasattr(json_outliners, "TWG_STDOUT_OUTLINE_MIN_BYTES")
+    assert not any("adf" in name.lower() for name in dir(json_outliners))

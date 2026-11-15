@@ -6,13 +6,9 @@ import json
 import os
 from pathlib import Path
 
-from hooks.local_repo_guard import load_guard_config
+from hooks.config import REQUIRED_CONFIG_KEYS
 
 ROOT = Path(__file__).resolve().parent.parent
-
-REQUIRED_CONFIG_KEYS = tuple(
-    k for k in load_guard_config(Path("/nonexistent_cfg.json")) if k != "config_error"
-)
 
 
 def _manifest_version(path: Path) -> str:
@@ -49,6 +45,8 @@ def test_no_version_literal_outside_the_manifests() -> None:
     sources = [
         *ROOT.glob("hooks/*.py"),
         *ROOT.glob("bin/*.py"),
+        *ROOT.glob("policies/*.py"),
+        *ROOT.glob("integrations/*.py"),
         *ROOT.glob("tests/*.py"),
         *ROOT.glob("vscode-extension/*.js"),
     ]
@@ -72,7 +70,7 @@ def test_readme_version_modules_flags_and_config_stay_in_sync() -> None:
 
     production_modules = sorted(
         path.name
-        for pattern in ("hooks/*.py", "bin/*.py", "vscode-extension/*.js")
+        for pattern in ("hooks/*.py", "bin/*.py", "policies/*.py", "integrations/*.py", "vscode-extension/*.js")
         for path in ROOT.glob(pattern)
         if path.name != "__init__.py"
     )

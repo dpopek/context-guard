@@ -40,6 +40,7 @@ const {
   tailText,
   updateStepEnv,
   runUpdateStep,
+  executeManagedUpdate,
   spawnUpdateCheckIfStale,
   probeDoctor,
 } = updater;
@@ -161,9 +162,12 @@ async function runUpdate() {
     await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: "Updating Context-Guard…" },
       async () => {
-        for (const step of steps) {
-          await runUpdateStep(step);
-        }
+        await executeManagedUpdate({
+          state: update && update.state,
+          pluginRoot: PLUGIN_ROOT,
+          latest: update && update.latest,
+          runCmd: runUpdateStep,
+        });
       }
     );
   } catch (err) {
@@ -465,6 +469,7 @@ module.exports = {
   updateNotice,
   updateSteps,
   updateStepEnv,
+  executeManagedUpdate,
   TOOLTIP_COMMANDS,
   isUpdateStale,
   isUpdateAttemptRecent,

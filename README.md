@@ -1,8 +1,8 @@
 # Context-Guard (v4.3.0)
 
-Zero-prompt security guard, silent range-trim, machine-artifact unwrapper, and multi-harness telemetry plugin for **Google Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex CLI/App** across **macOS, Linux, and Windows**.
+Zero-prompt policy host, silent range-trim, machine-artifact unwrapper, and multi-harness telemetry plugin for **Google Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex CLI/App** across **macOS, Linux, and Windows**.
 
-Combines voluntary `cg-outline <path>` structural AST outlining (`Python 3.9+` stdlib + optional `tree-sitter-language-pack`), silent `range_trim` overlap trimming, machine-artifact unwrapping, fail-closed BigQuery/GitLab/Governance guards, and cross-harness preamble attribution.
+Combines voluntary `cg-outline <path>` structural AST outlining (`Python 3.9+` stdlib + optional `tree-sitter-language-pack`), silent `range_trim` overlap trimming, machine-artifact unwrapping, verified Policy API v1 packs, and cross-harness preamble attribution.
 
 ---
 
@@ -10,7 +10,7 @@ Combines voluntary `cg-outline <path>` structural AST outlining (`Python 3.9+` s
 
 | Harness | Config File | Registered Hooks | Read Caps | Compaction Integration | Live Status UI |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Google Antigravity** | `hooks.json` | `PreInvocation`, `PreToolUse` | `800` lines (`45 KB`) | `O(delta)` `PreInvocation` (`80`/`200` steps) | IDE Status Bar & Side Panel |
+| **Google Antigravity** | `hooks.json` | `PreInvocation`, `PreToolUse`, `PostToolUse` | `800` lines (`45 KB`) | `O(delta)` `PreInvocation` (`80`/`200` steps) | IDE Status Bar & Side Panel |
 | **Claude Code** | `~/.claude/settings.json` | `SessionStart`, `PreToolUse`, `PostToolUse`, `PreCompact`, `Stop` | `2,000` lines (`80 KB`) | Native `autoCompactWindow` + `PreCompact` | `statusLine` ANSI HUD |
 | **Cursor IDE** | `~/.cursor/hooks.json` | `sessionStart`, `preToolUse`, `postToolUse`, `preCompact`, `stop` | `2,000` lines (`80 KB`) | Native compaction + `preCompact` | IDE Status Bar & Side Panel |
 | **OpenAI Codex** | `~/.codex/hooks.json` & `config.toml` | `SessionStart`, `PreToolUse`, `PostToolUse`, `PreCompact`, `Stop` | `Bash` / `exec_command` | `model_auto_compact_token_limit` + `PreCompact` | CLI `cg_status.py` |
@@ -19,14 +19,14 @@ Combines voluntary `cg-outline <path>` structural AST outlining (`Python 3.9+` s
 
 ## Machine-Artifact `AUTO-OUTLINE` & Unwrap (`PreToolUse`)
 
-Source code and Markdown reads never block; `cg-outline <path>` handles on-demand structural outlining across 21 extensions. `AUTO-OUTLINE` intercepts only bloated machine artifacts:
+Source code and Markdown reads never block; `cg-outline <path>` handles on-demand structural outlining across 21 extensions. `AUTO-OUTLINE` intercepts bloated machine artifacts and transcripts:
 
 | Target Type | Trigger Threshold | Action & Output |
 | :--- | :--- | :--- |
-| **GitLab `get_file_contents` MCP** (`.system_generated/steps/<N>/output.txt`) | `>= 16 KB` 1-line JSON envelope | Unwraps `"content"` to sibling `<safe_name>` (`output_formatted.json` for tabular/list JSON); redirects follow-ups automatically. |
-| **BigQuery Tabular MCP** (`execute_sql*`, `get_query_results`) | `>= 16 KB` JSON with `rows[]` | Unwraps to `output_formatted.json`; returns row count, schema, and 3-row preview. |
+| **Wrapped JSON-String MCP Envelope** (`.system_generated/steps/<N>/output.txt`) | `>= 16 KB` 1-line JSON with `"content"` | Unwraps `"content"` to sibling `<safe_name>` (`output_formatted.json` for tabular JSON); redirects follow-ups automatically. |
+| **Tabular Rows MCP** (`rows[]` JSON) | `>= 16 KB` JSON with `rows[]` | Unwraps to `output_formatted.json`; returns row count, schema, and 3-row preview. |
 | **Generic JSON List/Items MCP** | `>= 16 KB` JSON array or `items`/`results`/`values` | Unwraps to `output_formatted.json`; returns item count, keys, and sample preview. |
-| **TWG Jira & Confluence** (`/twg/*/stdout.json`, `stdout.compact.json`) | `>= 6 KB` (`6,144` B; inline `< 6 KB`) | Summarizes issues/fields (`required=True` first) and extracts ADF plain text to sibling file. |
+| **Opt-In Integrations** (`integrations/atlassian_twg.py`) | `>= 6 KB` (`6,144` B; inline `< 6 KB`) when `"atlassian_twg": "active"` | Summarizes structured issue/doc JSON stdout and extracts plain-text content to sibling files. |
 | **Conversation Transcripts** (`.system_generated/logs/transcript*.jsonl`) | `>= 16 KB` unbounded or span `> 8` lines | Streams step index (`step_index`, `type`, `tools=[...]`, byte sizes) with span markers. |
 
 ---
@@ -37,21 +37,21 @@ Source code and Markdown reads never block; `cg-outline <path>` handles on-deman
 - Tracks streaming 64 KB `SHA-256` hashes (`10 MB` stat fallback) and `[StartLine, EndLine]` spans in `.context_guard_state.json`.
 - Silently trims partially overlapping bounded reads via `overwrite` / `updatedInput` (`range_trim`) to uncovered lines; invalidates on edits (`edit_file`, `Edit`, `StrReplace`, `apply_patch`).
 
-### 2. Fail-Closed Local-First GitLab, BigQuery & Governance Guards
-- Normalizes MCP calls across Antigravity (`mcp_<server>_<tool>`), Claude/Codex (`mcp__<server>__<tool>`), Cursor (`MCP:<tool>`), and `call_mcp_tool`.
-- Blocks remote GitLab lookups on first attempt when `repo_map_path` resolves locally; hard-blocks `restricted_bq_datasets` across MCP, `bq`, and Python SDK in favor of `allowed_bq_views_dataset`.
-- Opt-in `enforce_governance_policy` blocks governance tampering, git hook/env bypasses (`--no-verify`, `HUSKY=0`, `core.hooksPath`), and mass staging, while recording `mutated_repos` for file writes.
+### 2. Verified Policy API v1 & Two-Pass Execution (`policies/api.py`, `policies/loader.py`)
+- Normalizes tool and MCP calls across Antigravity (`mcp_<server>_<tool>`), Claude/Codex (`mcp__<server>__<tool>`), Cursor (`MCP:<tool>`), and `call_mcp_tool`.
+- Loads external security and optimization packs strictly from verified in-memory bytes (`file_hashes` + `tree_sha256` under trusted roots), enforcing Stage-2 scoped fail-closed fallbacks on config or pack errors.
+- Pass-2 security verification (`verify_security_policies_post_transform`) re-checks pack or optimizer rewrites before allowing execution.
 
 ### 3. Lossless Quiet CLI Rewrites (`PreToolUse`)
 
 | CLI Command | Injected Flags (Antigravity `run_command`; auto-approved Claude/Cursor `Bash`/`Shell`: `bypassPermissions`/`dontAsk`/`auto`) | Guardrails |
 | :--- | :--- | :--- |
 | `grep -r` / `grep -rn` | `-I --exclude-dir={...}` + minified/lock exclusions | Skipped if explicit `--include`/`--exclude` or lock/minified target is passed. |
-| `twg <subcommand>` | Strips `TWG_AGENT_DEFAULTS=1` / `~/.local/bin/twg` -> `twg` | Preserves single-quoted `'...'` args. |
 | `pytest`, `poetry`/`uv run pytest` | `-q --tb=short --no-header` (supports `cd <dir> &&`) | Skipped if `-v`, `-q`, `--tb`, `--no-header`, `--`, or pipes are present. |
 | `git status` | `-sb` (supports `cd <dir> &&`) | Skipped if flags or args are already supplied. |
 | `cargo test` | `-q` (supports `cd <dir> &&`) | Skipped if verbosity flags, `--`, or pipes are present. |
 | `vitest` | `--reporter=dot` | Skipped if output flags, `--`, or pipes exist. |
+| Optional integrations | Registered opt-in rewriters via `integrations.*` | Disabled by default (`"integrations": {"atlassian_twg": "off"}`). |
 
 ### 4. Two-Stage Auto-Compact Sensor & Multi-Harness Preamble Attribution
 - Incrementally scans `transcript.jsonl` / `transcript_full.jsonl` (`O(delta)`), injecting `AUTO-COMPACT SENSOR` (`>= 80` steps or `512 KB`) and `AUTO-COMPACT HARD STOP` (`>= 200` steps or `1024 KB`).
@@ -67,30 +67,33 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 
 | Module | Layer | Responsibility |
 | :--- | :--- | :--- |
-| `hooks/pre_tool_use.py` | Hook Entry | Orchestrates fail-closed guards, silent `range_trim`, CLI rewrites, and telemetry. |
-| `hooks/pre_invocation.py` | Hook Entry | Antigravity incremental `O(delta)` transcript scanner and two-stage auto-compact sensor. |
-| `hooks/pre_compact.py` | Hook Entry | Claude Code, Cursor, and Codex `PreCompact` / `preCompact` read-cache reset hook. |
-| `hooks/post_tool_use.py` | Hook Entry | `PostToolUse` / `postToolUse` hook measuring shell output bytes. |
+| `policies/api.py` | Policy API | Public `POLICY_API_VERSION = 1` dataclasses (`PolicyPackManifest`, `PolicyContext`, `PolicyDecision`, `InstallerHookSpec`). |
+| `policies/loader.py` | Policy API | Zero-TOCTOU whole-pack directory, hash, and `tree_sha256` verifier + in-memory byte loader. |
+| `integrations/atlassian_twg.py` | Integration | Optional opt-in CLI rewriter and JSON stdout summarizer (`"integrations": {"atlassian_twg": "active"}`). |
+| `hooks/policy_engine.py` | Hook Core | Evaluates verified packs with two-pass verification, scoped fail-closed fallbacks, and lifecycle dispatch. |
+| `hooks/pre_tool_use.py` | Hook Entry | Orchestrates Policy API v1 passes, silent `range_trim`, CLI rewrites, and telemetry. |
+| `hooks/pre_invocation.py` | Hook Entry | Antigravity incremental `O(delta)` transcript scanner, session transition hooks, and auto-compact sensor. |
+| `hooks/pre_compact.py` | Hook Entry | Claude Code, Cursor, and Codex `PreCompact` / `preCompact` read-cache and `policy_state` reset hook. |
+| `hooks/post_tool_use.py` | Hook Entry | `PostToolUse` / `postToolUse` hook measuring shell output bytes and dispatching `on_tool_completed`. |
 | `hooks/harness_adapter.py` | Normalization | Normalizes tool payloads (`Read`, `Bash`, `exec_command`, `apply_patch`), permission modes, and verdicts. |
 | `hooks/read_planner.py` | Core Engine | Silent `range_trim` overlap trimmer, slice caps, and machine-artifact outline planner. |
 | `hooks/shell_parser.py` | Core Engine | Lossless quiet CLI flag rewriter, voluntary `cg-outline` detector, and bounded shell-read analyzer. |
-| `hooks/local_repo_guard.py` | Core Engine | Local-First GitLab lookup guard and hard BigQuery `ai_views` dataset enforcement. |
-| `hooks/governance_guard.py` | Core Engine | Governance path guard, git/env bypass blocker, shell/SDK BigQuery gate, and `mutated_repos`. |
 | `hooks/session_lifecycle.py` | State & Cache | Checkpoint compaction (`apply_compaction_boundary`) and rewind (`prune_state_on_rewind`) pruning. |
 | `hooks/state_store.py` | State & Cache | State dir resolution (`resolve_state_dir`), subagent isolation, and locked JSON persistence. |
 | `hooks/file_io.py` | State & Cache | Streaming 64 KB `SHA-256` hashing (`10 MB` stat fallback), line counter, and `tail -n` reader. |
-| `hooks/config.py` | State & Cache | Stat-keyed `(realpath, st_mtime_ns, st_size)` loader for `~/.config/context-guard/config.json`. |
+| `hooks/config.py` | State & Cache | Stat-keyed `(realpath, st_mtime_ns, st_size)` universal loader for `~/.config/context-guard/config.json`. |
 | `hooks/outline.py` | Outliners | Structural AST/regex/tree-sitter code outliner across 21 file extensions (`<= 2 MB`). |
 | `hooks/markup_outliners.py` | Outliners | Outliners for `.phtml`, `.vue`, `.xml`, `.md`/`.mdx` headings, `.diff`/`.patch`, `.json`, `.yaml`. |
-| `hooks/json_outliners.py` | Outliners | Unwrappers/summarizers for MCP `output.txt`, TWG `stdout*.json`, and `transcript*.jsonl`. |
+| `hooks/json_outliners.py` | Outliners | Unwrappers/summarizers for wrapped MCP JSON envelopes, tabular rows, and `transcript*.jsonl`. |
 | `hooks/telemetry.py` | Telemetry | Atomic cumulative token savings ledger (`telemetry/stats.json`), slice-byte estimator, and daily rollup. |
 | `hooks/outcomes.py` | Telemetry | `O(1)` intervention outcome ledger (`outcomes.json` v3: follow-ups and bypasses) and delivered-line estimation. |
 | `hooks/shell_output.py` | Telemetry | Extracts shell stdout/stderr, classifies command families, and updates `stats.json`. |
 | `hooks/model_identity.py` | Telemetry | Resolves canonical model slugs (Antigravity transcript/sibling fallback, Claude, Codex) and harness `model_labels` overrides. |
 | `bin/cg_status.py` | CLI & UI | Status CLI (`--short`, `--claude-hud`, `--markdown`, `--json`, `--outcomes`, `--usage`, `--doctor`). |
-| `bin/install_harnesses.py` | CLI & UI | Multi-harness hook & IDE extension installer (`--install`, `--uninstall`, `--status`, `--dry-run`). |
+| `bin/install_harnesses.py` | CLI & UI | Multi-harness hook & IDE extension installer (`--install`, `--uninstall`, `--status`, `--dry-run`, `--pack-source`). |
+| `bin/migration_guard.py` | CLI & UI | Staged pack transaction, rollback journal, and migration preflight safety checks (`--pack-source`). |
 | `bin/codex_toml.py` | CLI & UI | Lexical TOML scanner for non-destructive `~/.codex/config.toml` sync. |
-| `bin/harness_status.py` | CLI & UI | Cycle-free status verifier across Claude Code, Cursor, and OpenAI Codex configs. |
+| `bin/harness_status.py` | CLI & UI | Cycle-free status verifier and dynamic matcher merger across Claude Code, Cursor, and OpenAI Codex configs. |
 | `bin/outline.py` | CLI & UI | CLI wrapper around `hooks/outline.py` (`cg-outline`). |
 | `bin/instruction_block.py` | CLI & UI | `cg-outline` shim and instruction-file rule block. |
 | `bin/update_check.py` | CLI & UI | Non-blocking `origin` release tag checker (`update.json` / `install.json`, `--force`). |
@@ -117,9 +120,10 @@ git clone https://github.com/dpopek/context-guard.git "$CG_DIR"
 # 2. Install hooks (Claude Code, Codex, Cursor, Antigravity) & advox.context-guard-statusbar-4.3.0 extension
 python3 "$CG_DIR/bin/install_harnesses.py" --install
 
-# Check status, preview dry-run, or uninstall cleanly
+# Check status, preview dry-run, stage verified policy packs, or uninstall cleanly
 python3 "$CG_DIR/bin/install_harnesses.py" --status
 python3 "$CG_DIR/bin/install_harnesses.py" --install --dry-run
+python3 "$CG_DIR/bin/install_harnesses.py" --install --pack-source /path/to/policy-packs
 python3 "$CG_DIR/bin/install_harnesses.py" --uninstall
 ```
 
@@ -149,28 +153,25 @@ cg-outline path/to/file.py  # or python3 "$CG_DIR/bin/outline.py"
 
 ## Configuration Reference (`~/.config/context-guard/config.json`)
 
-Optional per-user config (override via `CONTEXT_GUARD_CONFIG_PATH`). Absent = MCP guards disabled; malformed = fail closed.
+Optional per-user config (override via `CONTEXT_GUARD_CONFIG_PATH`). Absent = default universal optimizers only; malformed = fail closed on scoped tool calls.
 
 | Key | Default | Description |
 | :--- | :--- | :--- |
-| `"workspace_root"` | `null` | Root workspace path for `repo_map_path`, `mutated_repos`, and `SessionStart`/`Stop` guard wiring. |
-| `"repo_map_path"` | `null` | Path to `local_repository_map.json` for Local-First GitLab MCP interception. |
-| `"repo_map_doc"` | `"docs/local_repository_map.md"` | Repository map path cited in GitLab block messages. |
-| `"restricted_bq_datasets"` | `[]` | Raw BigQuery datasets hard-blocked across MCP, `bq` CLI, and Python SDK. |
-| `"allowed_bq_views_dataset"` | `""` | Authorized BigQuery dataset permitted without restriction. |
-| `"allowed_bq_views_hint"` | `"authorized views"` | Dataset pattern shown in BigQuery block messages. |
-| `"bq_schema_doc"` | `""` | Schema doc path cited in BigQuery block messages. |
-| `"allow_bq_raw_ddl_maintenance"` | `false` | Operator boolean allowing raw BigQuery DDL/queries when `true` (non-bool fails closed). |
-| `"enforce_governance_policy"` | `false` | Opt-in boolean enabling governance path, git hook/env bypass, and mass-staging blocks. |
-| `"allow_governance_mutations"` | `false` | Operator boolean allowing edits/writes to governance, hook, and baseline paths. |
+| `"read_confirm_policy"` | `"strict"` | Read confirmation mode (`"strict"` or `"bounded"`). |
+| `"optimizers"` | `{"range_trim": "active", "auto_outline": "active", "cli_rewrites": "auto", "output_spool": "off"}` | Optimizer modes (`active`/`shadow`/`off`; `cli_rewrites`: `auto`/`force`/`off`). |
+| `"integrations"` | `{"atlassian_twg": "off"}` | Opt-in external CLI/artifact integration adapters (`active` or `off`). |
+| `"regret_window_steps"` | `2` | Positive integer tracking follow-up regret attribution horizon across steps. |
+| `"policy_packs"` | `[]` | Verified Policy API v1 packs pinned by `file_hashes` + `tree_sha256` and declared `scopes`. |
 | `"model_labels"` | `{}` | Mapping of harness keys (`antigravity`, `claude`, `cursor`, `codex`) to pinned model labels for `outcomes.json` reports. |
+| `"workspace_root"` | `null` | Optional workspace root passed to `InstallerHookSpec` command templates and verified packs. |
+| `"repo_map_path"` | `null` | Optional repository map path surfaced to external verified policy packs. |
 
 ---
 
 ## Running Tests
 
 ```bash
-mypy hooks bin tests
+mypy hooks bin policies integrations tests
 pytest tests/ -q
 ```
 

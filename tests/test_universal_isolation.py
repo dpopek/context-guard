@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import ntpath
 import os
@@ -12,12 +13,41 @@ from typing import Any
 import pytest
 
 from hooks import config as guard_config
-from hooks.governance_guard import is_protected_governance_path
-from hooks.local_repo_guard import load_guard_config
 from hooks.pre_tool_use import evaluate_hook
 from hooks.shell_parser import rewrite_quiet_cli_flags
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def _write_verified_pack(
+    pack_dir: Path,
+    pack_id: str,
+    pack_src: str,
+    *,
+    scopes: list[str],
+    fallback_matchers: dict[str, Any] | None = None,
+    settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(pack_dir.parent, 0o700)
+    os.chmod(pack_dir, 0o700)
+    pack_file = pack_dir / "pack.py"
+    raw = pack_src.encode("utf-8")
+    pack_file.write_bytes(raw)
+    os.chmod(pack_file, 0o600)
+    file_sha = hashlib.sha256(raw).hexdigest()
+    tree_sha = hashlib.sha256(f"pack.py:{file_sha}\n".encode("utf-8")).hexdigest()
+    return {
+        "id": pack_id,
+        "path": str(pack_file),
+        "enabled": True,
+        "kind": "security",
+        "scopes": scopes,
+        "fallback_matchers": dict(fallback_matchers or {}),
+        "file_hashes": {"pack.py": file_sha},
+        "tree_sha256": tree_sha,
+        "settings": dict(settings or {}),
+    }
 
 
 def assert_allowed(res: dict[str, Any], harness: str) -> None:
@@ -99,8 +129,9 @@ def test_default_install_without_config_never_blocks_project_files_or_git_workfl
 ) -> None:
     guard_config.clear_config_cache()
     monkeypatch.setenv("CONTEXT_GUARD_CONFIG_PATH", str(tmp_path / "absent_config.json"))
-    cfg = load_guard_config()
-    assert cfg["enforce_governance_policy"] is False
+    cfg = guard_config.load_runtime_config()
+    assert cfg["policy_packs"] == []
+    assert cfg["config_error"] is None
 
     project = tmp_path / "external-webapp"
     project.mkdir()
@@ -141,27 +172,40 @@ def test_default_install_without_config_never_blocks_project_files_or_git_workfl
             assert_allowed(res_sh, harness)
 
 
-def test_bigquery_isolation_works_independently_when_governance_policy_is_disabled(
+def test_scoped_security_pack_enforces_only_declared_scopes_and_rejects_malformed_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     guard_config.clear_config_cache()
-    cfg_path = tmp_path / "bq_only_config.json"
-    cfg_path.write_text(
-        json.dumps(
-            {
-                "restricted_bq_datasets": ["raw_orders_private"],
-                "allowed_bq_views_dataset": "ai_views",
-                "allowed_bq_views_hint": "ai_views.*",
-            }
-        ),
-        encoding="utf-8",
+    pack_src = (
+        "from policies.api import POLICY_API_VERSION, PolicyDecision, PolicyPackManifest\n\n"
+        "def evaluate(ctx):\n"
+        "    if ctx.canonical_tool == 'call_mcp_tool' or ctx.original_tool_name.startswith(('mcp_', 'mcp__')):\n"
+        "        sql = str(ctx.canonical_args.get('Arguments', {}).get('query', '') or ctx.canonical_args.get('query', ''))\n"
+        "        restricted = ctx.settings.get('restricted_datasets', [])\n"
+        "        if any(f'{ds}.' in sql for ds in restricted):\n"
+        "            return PolicyDecision(decision='deny', reason='Blocked by acme-mcp-sec: use safe views')\n"
+        "    return None\n\n"
+        "PACK_MANIFEST = PolicyPackManifest(\n"
+        "    pack_id='acme-mcp-sec', api_version=POLICY_API_VERSION,\n"
+        "    kind='security', covered_domains=('synthetic-mcp',), evaluate=evaluate,\n"
+        ")\n"
     )
+    entry = _write_verified_pack(
+        tmp_path / "policies" / "acme_mcp",
+        "acme-mcp-sec",
+        pack_src,
+        scopes=["mcp_call"],
+        fallback_matchers={"mcp_tool_regex": r"^mcp__?acme(?:__|$)"},
+        settings={"restricted_datasets": ["acme_private_ds"]},
+    )
+    cfg_path = tmp_path / "mcp_only_config.json"
+    cfg_path.write_text(json.dumps({"policy_packs": [entry]}), encoding="utf-8")
     monkeypatch.setenv("CONTEXT_GUARD_CONFIG_PATH", str(cfg_path))
     state_dir = str(tmp_path / "state")
     project = tmp_path / "analytics-proj"
     project.mkdir()
 
-    # Git add . and .husky edits remain allowed because enforce_governance_policy is False
+    # Git add . and .husky edits remain allowed because only mcp_call scope is enforced
     assert_allowed(
         evaluate_hook(_shell_call("claude", "git add .", project), state_dir=state_dir, cli_harness="claude"),
         "claude",
@@ -175,44 +219,102 @@ def test_bigquery_isolation_works_independently_when_governance_policy_is_disabl
         "claude",
     )
 
-    # BigQuery raw dataset queries are still hard-blocked
+    # Scoped synthetic MCP query is hard-blocked
+    mcp_payload = {
+        "session_id": "s-claude",
+        "tool_name": "mcp__acme__execute_sql",
+        "tool_input": {"query": "SELECT * FROM acme_private_ds.orders"},
+        "cwd": str(project),
+    }
     assert_denied(
-        evaluate_hook(
-            _shell_call("claude", 'bq query "SELECT * FROM raw_orders_private.orders"', project),
-            state_dir=state_dir,
-            cli_harness="claude",
-        ),
+        evaluate_hook(mcp_payload, state_dir=state_dir, cli_harness="claude"),
         "claude",
-        "ai-views",
+        "safe views",
     )
 
-    # Non-boolean enforce_governance_policy fails closed
-    cfg_path.write_text(json.dumps({"enforce_governance_policy": "yes"}), encoding="utf-8")
+    # Non-int regret_window_steps fails closed on scoped calls
+    cfg_path.write_text(json.dumps({"regret_window_steps": "yes"}), encoding="utf-8")
     guard_config.clear_config_cache()
-    assert load_guard_config()["config_error"] == "invalid 'enforce_governance_policy': expected boolean"
+    assert guard_config.load_runtime_config()["config_error"] == "invalid 'regret_window_steps'"
+    assert_denied(
+        evaluate_hook(_shell_call("claude", "git status", project), state_dir=state_dir, cli_harness="claude"),
+        "claude",
+        "config error",
+    )
 
 
-def test_enforce_governance_policy_allows_generic_dirs_in_unguarded_git_repos_while_protecting_guarded_repos(
+def test_security_pack_respects_workspace_boundaries_and_windows_normcase(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     guard_config.clear_config_cache()
     ws_root = tmp_path / "workspace"
     ws_root.mkdir()
     cfg_path = tmp_path / "gov_config.json"
-    cfg_path.write_text(
-        json.dumps({"workspace_root": str(ws_root), "enforce_governance_policy": True}),
-        encoding="utf-8",
+
+    pack_src = (
+        "import os\n"
+        "from pathlib import Path\n"
+        "from policies.api import POLICY_API_VERSION, PolicyDecision, PolicyPackManifest\n\n"
+        "def _norm(p):\n"
+        "    return os.path.normcase(os.path.abspath(str(p))).replace('\\\\', '/')\n\n"
+        "def _is_guarded_repo_file(target_norm, guarded_roots):\n"
+        "    for root in guarded_roots:\n"
+        "        rn = _norm(root).rstrip('/') + '/'\n"
+        "        if target_norm.startswith(rn):\n"
+        "            rel = target_norm[len(rn):]\n"
+        "            if any(rel.startswith(p) for p in ('tests/baselines/', 'scripts/audit/', 'scripts/hooks/', 'scripts/ci/')):\n"
+        "                return True\n"
+        "    return False\n\n"
+        "def evaluate(ctx):\n"
+        "    if ctx.canonical_tool not in ('edit_file', 'write_file'):\n"
+        "        return None\n"
+        "    raw = str(ctx.canonical_args.get('Path') or ctx.canonical_args.get('TargetFile') or '')\n"
+        "    if not raw:\n"
+        "        return None\n"
+        "    tn = _norm(raw)\n"
+        "    cfg_norm = _norm(ctx.settings.get('config_path', ''))\n"
+        "    ws_norm = _norm(ctx.settings.get('workspace_root', ''))\n"
+        "    if cfg_norm and tn == cfg_norm:\n"
+        "        return PolicyDecision(decision='deny', reason='Blocked by synthetic governance: context_guard_config')\n"
+        "    if '/.githooks/' in tn or '/.husky/' in tn or '/.claude/' in tn or tn.endswith('/guard_manifest.json'):\n"
+        "        return PolicyDecision(decision='deny', reason='Blocked by synthetic governance: hook/manifest')\n"
+        "    if ws_norm and tn.startswith(ws_norm.rstrip('/') + '/scripts/hooks/'):\n"
+        "        return PolicyDecision(decision='deny', reason='Blocked by synthetic governance: workspace hook')\n"
+        "    if _is_guarded_repo_file(tn, ctx.settings.get('guarded_repos', [])):\n"
+        "        return PolicyDecision(decision='deny', reason='Blocked by synthetic governance: guarded repo')\n"
+        "    return None\n\n"
+        "PACK_MANIFEST = PolicyPackManifest(\n"
+        "    pack_id='acme-ws-gov', api_version=POLICY_API_VERSION,\n"
+        "    kind='security', covered_domains=('synthetic-gov',), evaluate=evaluate,\n"
+        ")\n"
     )
+    guarded_repo = ws_root / "core-platform"
+    (guarded_repo / ".git").mkdir(parents=True)
+    (guarded_repo / "scripts" / "audit").mkdir(parents=True)
+    (guarded_repo / "scripts" / "audit" / "guard_manifest.json").write_text("{}", encoding="utf-8")
+
+    entry = _write_verified_pack(
+        tmp_path / "policies" / "acme_gov",
+        "acme-ws-gov",
+        pack_src,
+        scopes=["file_mutation"],
+        fallback_matchers={"protected_path_prefixes": [".githooks/", ".husky/", ".claude/", "guard_manifest.json"]},
+        settings={
+            "workspace_root": str(ws_root),
+            "config_path": str(cfg_path),
+            "guarded_repos": [str(guarded_repo)],
+        },
+    )
+    cfg_path.write_text(json.dumps({"workspace_root": str(ws_root), "policy_packs": [entry]}), encoding="utf-8")
     monkeypatch.setenv("CONTEXT_GUARD_CONFIG_PATH", str(cfg_path))
-    assert load_guard_config()["enforce_governance_policy"] is True
     state_dir = str(tmp_path / "state")
 
-    # 1. Unguarded client git repository (e.g. Magento / React storefront without Guard Core)
+    # 1. Unguarded client git repository generic dirs remain allowed
     client_repo = ws_root / "client-storefront"
     (client_repo / ".git").mkdir(parents=True)
     for generic_rel in (
         "tests/baselines/checkout.json",
-        "scripts/audit/hyva_templates.php",
+        "scripts/audit/store_templates.php",
         "scripts/hooks/cache_warm.sh",
         "scripts/ci/run-quality-suite.sh",
     ):
@@ -224,7 +326,7 @@ def test_enforce_governance_policy_allows_generic_dirs_in_unguarded_git_repos_wh
             ),
             "claude",
         )
-    # Actual git/harness hooks and guard manifests in client_repo remain protected under policy
+    # Real git/harness hooks and guard manifests in client_repo remain protected
     for real_gov_rel in (".githooks/pre-commit", ".husky/pre-commit", ".claude/settings.json", "guard_manifest.json"):
         assert_denied(
             evaluate_hook(
@@ -236,15 +338,11 @@ def test_enforce_governance_policy_allows_generic_dirs_in_unguarded_git_repos_wh
             "governance",
         )
 
-    # 2. Guarded repository (has .git + scripts/audit/guard_manifest.json)
-    guarded_repo = ws_root / "core-platform"
-    (guarded_repo / ".git").mkdir(parents=True)
-    (guarded_repo / "scripts" / "audit").mkdir(parents=True)
-    (guarded_repo / "scripts" / "audit" / "guard_manifest.json").write_text("{}", encoding="utf-8")
+    # 2. Guarded repository files are denied
     for guarded_rel in (
         "tests/baselines/refactoring_slop.json",
-        "scripts/audit/ai_slop_scanner.py",
-        "scripts/hooks/antigravity_stop_guard.py",
+        "scripts/audit/slop_scanner.py",
+        "scripts/hooks/session_stop_guard.py",
         "scripts/ci/run-quality-suite.sh",
     ):
         assert_denied(
@@ -260,7 +358,7 @@ def test_enforce_governance_policy_allows_generic_dirs_in_unguarded_git_repos_wh
     # 3. Workspace-level scripts/hooks/ and operator config.json remain protected
     assert_denied(
         evaluate_hook(
-            _write_call("claude", ws_root / "scripts" / "hooks" / "claude_stop_guard.py", ws_root),
+            _write_call("claude", ws_root / "scripts" / "hooks" / "custom_stop_guard.py", ws_root),
             state_dir=state_dir,
             cli_harness="claude",
         ),
@@ -268,41 +366,61 @@ def test_enforce_governance_policy_allows_generic_dirs_in_unguarded_git_repos_wh
         "governance",
     )
     assert_denied(
-        evaluate_hook(
-            _write_call("claude", cfg_path, ws_root),
-            state_dir=state_dir,
-            cli_harness="claude",
-        ),
+        evaluate_hook(_write_call("claude", cfg_path, ws_root), state_dir=state_dir, cli_harness="claude"),
         "claude",
         "governance",
     )
 
-    # 4. Windows drive-letter paths & ntpath.normcase (which flips "/" -> "\\") preserve symmetric governance checks
-    if os.name == "nt":
-        win_raw = str(client_repo / "tests" / "baselines" / "checkout.json")
-    else:
-        monkeypatch.chdir(tmp_path)
-        (tmp_path / "C:" / "Users" / "dev" / "client-storefront" / ".git").mkdir(parents=True)
-        win_raw = r"C:\Users\dev\client-storefront\tests\baselines\checkout.json"
-    assert is_protected_governance_path(win_raw, cwd=None, workspace_root=None) is None
+    # 4. Windows drive-letter paths & ntpath.normcase preserve symmetric Policy API checks
+    win_raw = r"C:\Users\dev\client-storefront\tests\baselines\checkout.json"
+    win_payload = {
+        "session_id": "s-win",
+        "tool_name": "Write",
+        "tool_input": {"file_path": win_raw},
+        "cwd": str(ws_root),
+    }
+    assert_allowed(evaluate_hook(win_payload, state_dir=state_dir, cli_harness="claude"), "claude")
     with monkeypatch.context() as mp_nt:
         mp_nt.setattr(os.path, "normcase", ntpath.normcase)
-        assert is_protected_governance_path(str(cfg_path), cwd=str(ws_root), workspace_root=ws_root) == "context_guard_config"
+        assert_denied(
+            evaluate_hook(_write_call("claude", cfg_path, ws_root), state_dir=state_dir, cli_harness="claude"),
+            "claude",
+            "context_guard_config",
+        )
 
 
-def test_inline_scripts_with_type_arrows_comparisons_and_str_replace_do_not_false_positive(
+def test_inline_scripts_with_type_arrows_comparisons_and_str_replace_pass_cli_and_pack_hooks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     guard_config.clear_config_cache()
     ws_root = tmp_path / "workspace"
     ws_root.mkdir()
-    cfg_path = tmp_path / "gov_config.json"
-    cfg_path.write_text(
-        json.dumps({"workspace_root": str(ws_root), "enforce_governance_policy": True}),
-        encoding="utf-8",
+    pack_src = (
+        "import re\n"
+        "from policies.api import POLICY_API_VERSION, PolicyDecision, PolicyPackManifest\n\n"
+        "_WRITE_RE = re.compile(r\"(os\\.replace|open\\([^)]*['\\\"][wa]\\+?['\\\"]|>\\s*\\.husky/)\")\n\n"
+        "def evaluate(ctx):\n"
+        "    if ctx.canonical_tool != 'run_command':\n"
+        "        return None\n"
+        "    cmd = str(ctx.canonical_args.get('CommandLine') or '')\n"
+        "    if '.husky/pre-commit' in cmd and _WRITE_RE.search(cmd):\n"
+        "        return PolicyDecision(decision='deny', reason='Blocked by synthetic governance: shell mutation')\n"
+        "    return None\n\n"
+        "PACK_MANIFEST = PolicyPackManifest(\n"
+        "    pack_id='acme-shell-gov', api_version=POLICY_API_VERSION,\n"
+        "    kind='security', covered_domains=('synthetic-gov',), evaluate=evaluate,\n"
+        ")\n"
     )
+    entry = _write_verified_pack(
+        tmp_path / "policies" / "acme_shell",
+        "acme-shell-gov",
+        pack_src,
+        scopes=["shell_command"],
+        fallback_matchers={"protected_path_prefixes": [".husky/"]},
+    )
+    cfg_path = tmp_path / "gov_config.json"
+    cfg_path.write_text(json.dumps({"workspace_root": str(ws_root), "policy_packs": [entry]}), encoding="utf-8")
     monkeypatch.setenv("CONTEXT_GUARD_CONFIG_PATH", str(cfg_path))
-    assert load_guard_config()["enforce_governance_policy"] is True
     state_dir = str(tmp_path / "state")
 
     benign_inline_cmds = (
@@ -314,6 +432,7 @@ def test_inline_scripts_with_type_arrows_comparisons_and_str_replace_do_not_fals
         'python3 -c "open(\'.husky/pre-commit\', mode=\'rb\').read()"',
     )
     for cmd in benign_inline_cmds:
+        assert rewrite_quiet_cli_flags(cmd) is None
         assert_allowed(
             evaluate_hook(_shell_call("claude", cmd, ws_root), state_dir=state_dir, cli_harness="claude"),
             "claude",
@@ -357,7 +476,7 @@ def test_exported_rules_agents_md_and_root_agents_md_enforce_universal_isolation
         )
 
     antigravity_home_re = re.compile(r'Path\.home\(\)\s*/\s*["\']Antigravity["\']')
-    for folder in ("hooks", "bin"):
+    for folder in ("hooks", "bin", "policies", "integrations"):
         for py_path in sorted((ROOT / folder).glob("*.py")):
             src = py_path.read_text(encoding="utf-8")
             assert antigravity_home_re.search(src) is None, (

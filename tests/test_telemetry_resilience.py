@@ -1,7 +1,8 @@
-"""Regression and subprocess tests for telemetry/stderr isolation, read-only resilience, and BigQuery fail-closed."""
+"""Regression and subprocess tests for telemetry/stderr isolation, read-only resilience, and Policy API v1 fail-closed."""
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -14,7 +15,9 @@ from typing import Any
 import pytest
 
 from bin import token_usage, update_check
-from hooks import local_repo_guard, post_tool_use, pre_compact, pre_invocation, pre_tool_use, state_store
+from hooks import config as guard_config
+from hooks import policy_engine, post_tool_use, pre_compact, pre_invocation, pre_tool_use, state_store
+from hooks.harness_adapter import NormalizedToolCall
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -62,23 +65,95 @@ def _build_read_payload(harness: str, file_path: Path, step_idx: int) -> dict[st
     }
 
 
-def _build_bq_payload(harness: str, sql: str | None, malformed_args: bool = False) -> dict[str, Any]:
+def _write_verified_pack(
+    pack_dir: Path,
+    pack_id: str,
+    pack_src: str,
+    *,
+    scopes: list[str],
+    fallback_matchers: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(pack_dir.parent, 0o700)
+    os.chmod(pack_dir, 0o700)
+    pack_file = pack_dir / "pack.py"
+    raw = pack_src.encode("utf-8")
+    pack_file.write_bytes(raw)
+    os.chmod(pack_file, 0o600)
+    file_sha = hashlib.sha256(raw).hexdigest()
+    tree_sha = hashlib.sha256(f"pack.py:{file_sha}\n".encode("utf-8")).hexdigest()
+    return {
+        "id": pack_id,
+        "path": str(pack_file),
+        "enabled": True,
+        "kind": "security",
+        "scopes": scopes,
+        "fallback_matchers": dict(fallback_matchers or {}),
+        "file_hashes": {"pack.py": file_sha},
+        "tree_sha256": tree_sha,
+        "settings": {},
+    }
+
+
+def _configure_acme_mcp_pack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, raise_pre_oserror: bool = False) -> Path:
+    guard_config.clear_config_cache()
+    hook_block = (
+        "def on_pre(ctx, dec):\n"
+        "    raise OSError('disk full on retry ledger')\n\n"
+        if raise_pre_oserror
+        else ""
+    )
+    hook_kw = ", on_pre_decision=on_pre" if raise_pre_oserror else ""
+    pack_src = (
+        "from policies.api import POLICY_API_VERSION, PolicyDecision, PolicyPackManifest\n\n"
+        + hook_block
+        + "def evaluate(ctx):\n"
+        "    args = ctx.canonical_args\n"
+        "    nested = args.get('Arguments') if isinstance(args.get('Arguments'), dict) else args\n"
+        "    if not isinstance(nested, dict):\n"
+        "        return PolicyDecision(decision='deny', reason='Blocked: malformed MCP payload')\n"
+        "    sql = nested.get('query')\n"
+        "    if not isinstance(sql, str) or 'acme_private_ds' in sql:\n"
+        "        return PolicyDecision(decision='deny', reason='Blocked: query restricted')\n"
+        "    if 'retryable_gate' in sql:\n"
+        "        return PolicyDecision(decision='deny', reason='Retryable lookup denied', metadata={'fail_open_if_retry_unsaved': True})\n"
+        "    return None\n\n"
+        "PACK_MANIFEST = PolicyPackManifest(\n"
+        "    pack_id='acme-mcp-sec', api_version=POLICY_API_VERSION,\n"
+        f"    kind='security', covered_domains=('synthetic-mcp',), evaluate=evaluate{hook_kw},\n"
+        ")\n"
+    )
+    entry = _write_verified_pack(
+        tmp_path / "policies" / f"acme_{'oserr' if raise_pre_oserror else 'std'}",
+        "acme-mcp-sec",
+        pack_src,
+        scopes=["mcp_call"],
+        fallback_matchers={"mcp_tool_regex": r"^mcp__?acme_db(?:__|$)"},
+    )
+    cfg_path = tmp_path / f"cfg_{'oserr' if raise_pre_oserror else 'std'}.json"
+    cfg_path.write_text(json.dumps({"policy_packs": [entry]}), encoding="utf-8")
+    monkeypatch.setenv("CONTEXT_GUARD_CONFIG_PATH", str(cfg_path))
+    guard_config.clear_config_cache()
+    return cfg_path
+
+
+def _build_mcp_payload(harness: str, sql: str | None, malformed_args: bool = False) -> dict[str, Any]:
     if harness == "antigravity":
         arguments: dict[str, Any] = {
-            "ServerName": "bigquery",
+            "ServerName": "acme_db",
             "ToolName": "execute_sql_readonly",
             "Arguments": "not-a-dict" if malformed_args else ({"query": sql} if sql is not None else {}),
         }
         return {
-            "conversationId": "conv-bq",
+            "conversationId": "conv-mcp",
             "stepIdx": 1,
             "toolCall": {"name": "call_mcp_tool", "args": arguments},
         }
     tool_input: Any = {} if malformed_args or sql is None else {"query": sql}
     return {
-        "session_id": "sess-bq",
+        "session_id": "sess-mcp",
         "transcript_path": f"/tmp/.{harness}/session.jsonl",
-        "tool_name": "mcp__bigquery__execute_sql_readonly",
+        "tool_name": "mcp__acme_db__execute_sql_readonly",
         "tool_input": tool_input,
     }
 
@@ -191,7 +266,7 @@ def test_telemetry_failure_preserves_deny_allow_and_overwrite_across_all_harness
 
 
 @pytest.mark.parametrize("harness", ["antigravity", "claude", "cursor", "codex"])
-def test_bigquery_mandatory_gate_never_falls_through_to_optimizer_allow_even_on_bad_str(
+def test_security_pack_mandatory_gate_never_falls_through_on_bad_str_or_hook_errors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     harness: str,
@@ -199,16 +274,17 @@ def test_bigquery_mandatory_gate_never_falls_through_to_optimizer_allow_even_on_
     closed_stderr = io.StringIO()
     closed_stderr.close()
     monkeypatch.setattr(sys, "stderr", closed_stderr)
+    _configure_acme_mcp_pack(tmp_path, monkeypatch, raise_pre_oserror=False)
 
-    malformed_payload = _build_bq_payload(harness, sql=None, malformed_args=True)
+    malformed_payload = _build_mcp_payload(harness, sql=None, malformed_args=True)
     res_malformed = pre_tool_use.evaluate_hook(malformed_payload, state_dir=str(tmp_path), cli_harness=harness)
     _assert_is_deny_output(res_malformed, harness)
     if harness != "antigravity":
         for bad_tool_input in ("not-a-dict", None, [1, 2]):
             non_dict_payload = {
-                "session_id": "sess-bq",
+                "session_id": "sess-mcp",
                 "transcript_path": f"/tmp/.{harness}/session.jsonl",
-                "tool_name": "mcp__bigquery__execute_sql_readonly",
+                "tool_name": "mcp__acme_db__execute_sql_readonly",
                 "tool_input": bad_tool_input,
             }
             res_non_dict = pre_tool_use.evaluate_hook(
@@ -216,66 +292,75 @@ def test_bigquery_mandatory_gate_never_falls_through_to_optimizer_allow_even_on_
             )
             _assert_is_deny_output(res_non_dict, harness)
 
-    inf_payload = {**_build_bq_payload(harness, sql="SELECT * FROM raw_restricted_ds.orders"), "stepIdx": float("inf")}
-    cfg_file = tmp_path / "bq_cfg.json"
-    cfg_file.write_text('{"restricted_bq_datasets": ["raw_restricted_ds"]}', encoding="utf-8")
-    monkeypatch.setattr(local_repo_guard, "DEFAULT_USER_CONFIG_PATH", cfg_file)
+    inf_payload = {**_build_mcp_payload(harness, sql="SELECT * FROM acme_private_ds.orders"), "stepIdx": float("inf")}
     res_inf = pre_tool_use.evaluate_hook(inf_payload, state_dir=str(tmp_path), cli_harness=harness)
     _assert_is_deny_output(res_inf, harness)
 
-    sql_payload = _build_bq_payload(harness, sql="SELECT * FROM raw_restricted_ds.orders")
-    with monkeypatch.context() as mp_extract:
-        mp_extract.setattr(pre_tool_use, "extract_bigquery_sql_target", _raise_exploding)
-        res_extract_exc = pre_tool_use.evaluate_hook(sql_payload, state_dir=str(tmp_path), cli_harness=harness)
-        _assert_is_deny_output(res_extract_exc, harness)
-
+    sql_payload = _build_mcp_payload(harness, sql="SELECT * FROM acme_private_ds.orders")
     with monkeypatch.context() as mp_norm:
         mp_norm.setattr(pre_tool_use, "normalize_pre_tool_payload", _raise_exploding)
-        res_norm_bq = pre_tool_use.evaluate_hook(sql_payload, state_dir=str(tmp_path), cli_harness=harness)
-        _assert_is_deny_output(res_norm_bq, harness)
+        res_norm_sec = pre_tool_use.evaluate_hook(sql_payload, state_dir=str(tmp_path), cli_harness=harness)
+        _assert_is_deny_output(res_norm_sec, harness)
+
+        empty_cfg = tmp_path / "empty_allow.json"
+        empty_cfg.write_text("{}", encoding="utf-8")
+        mp_norm.setenv("CONTEXT_GUARD_CONFIG_PATH", str(empty_cfg))
+        guard_config.clear_config_cache()
         safe_read = _build_read_payload(harness, tmp_path / "any.py", step_idx=1)
         res_norm_read = pre_tool_use.evaluate_hook(safe_read, state_dir=str(tmp_path), cli_harness=harness)
         assert res_norm_read == ({"decision": "allow"} if harness == "antigravity" else {})
 
-    monkeypatch.setattr(pre_tool_use, "gate_bigquery_ai_views", _raise_exploding)
-    res_exc = pre_tool_use.evaluate_hook(sql_payload, state_dir=str(tmp_path), cli_harness=harness)
-    _assert_is_deny_output(res_exc, harness)
+    _configure_acme_mcp_pack(tmp_path, monkeypatch, raise_pre_oserror=False)
+    with monkeypatch.context() as mp_apply:
+        mp_apply.setattr(pre_tool_use, "apply_policy_packs_with_records", _raise_exploding)
+        res_exc = pre_tool_use.evaluate_hook(sql_payload, state_dir=str(tmp_path), cli_harness=harness)
+        _assert_is_deny_output(res_exc, harness)
 
-    monkeypatch.setattr(pre_tool_use, "format_pre_tool_output", _raise_exploding)
-    res_fmt_exc = pre_tool_use.evaluate_hook(sql_payload, state_dir=str(tmp_path), cli_harness=harness)
-    _assert_is_deny_output(res_fmt_exc, harness)
+    with monkeypatch.context() as mp_fmt:
+        mp_fmt.setattr(pre_tool_use, "format_pre_tool_output", _raise_exploding)
+        res_fmt_exc = pre_tool_use.evaluate_hook(sql_payload, state_dir=str(tmp_path), cli_harness=harness)
+        _assert_is_deny_output(res_fmt_exc, harness)
+
+    # Disk OSError in on_pre_decision downgrades fail_open_if_retry_unsaved denies while non-retryable stays blocked
+    _configure_acme_mcp_pack(tmp_path, monkeypatch, raise_pre_oserror=True)
+    retry_payload = _build_mcp_payload(harness, sql="retryable_gate")
+    res_retry = pre_tool_use.evaluate_hook(retry_payload, state_dir=str(tmp_path), cli_harness=harness)
+    assert res_retry == ({"decision": "allow"} if harness == "antigravity" else {})
+    res_hard = pre_tool_use.evaluate_hook(sql_payload, state_dir=str(tmp_path), cli_harness=harness)
+    _assert_is_deny_output(res_hard, harness)
 
 
-def test_load_guard_config_distinguishes_filenotfound_from_permission_directory_and_schema_errors(
+def test_load_runtime_config_distinguishes_filenotfound_from_permission_directory_and_schema_errors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    state_dir = tmp_path / "state"
-    state_dir.mkdir()
-    sql = "SELECT * FROM raw_restricted_ds.orders"
+    guard_config.clear_config_cache()
+    scoped_call = NormalizedToolCall(
+        harness="claude",
+        canonical_tool="call_mcp_tool",
+        canonical_args={"ServerName": "acme_db", "ToolName": "execute_sql_readonly"},
+        original_tool_name="mcp__acme_db__execute_sql_readonly",
+        original_tool_input={},
+        session_id="sess-cfg",
+        step_idx=1,
+        cwd="/tmp",
+        artifact_dir=None,
+        mutated_paths=(),
+    )
 
     missing_cfg = tmp_path / "absent_dir" / "config.json"
-    cfg_missing = local_repo_guard.load_guard_config(missing_cfg)
+    cfg_missing = guard_config.load_runtime_config(missing_cfg)
     assert cfg_missing.get("config_error") is None
-    assert (
-        local_repo_guard.gate_bigquery_ai_views(state_dir, "execute_sql_readonly", sql, config_path=missing_cfg)[
-            "decision"
-        ]
-        == "allow"
-    )
+    assert policy_engine.apply_policy_packs(scoped_call, cfg_missing) is None
 
     empty_cfg = tmp_path / "empty_config.json"
     empty_cfg.write_text("{}", encoding="utf-8")
-    assert local_repo_guard.load_guard_config(empty_cfg).get("config_error") is None
-    assert (
-        local_repo_guard.gate_bigquery_ai_views(state_dir, "execute_sql_readonly", sql, config_path=empty_cfg)[
-            "decision"
-        ]
-        == "allow"
-    )
+    cfg_empty = guard_config.load_runtime_config(empty_cfg)
+    assert cfg_empty.get("config_error") is None
+    assert policy_engine.apply_policy_packs(scoped_call, cfg_empty) is None
 
     perm_cfg = tmp_path / "perm_config.json"
-    perm_cfg.write_text('{"restricted_bq_datasets": ["raw_restricted_ds"]}', encoding="utf-8")
+    perm_cfg.write_text("{}", encoding="utf-8")
     orig_read_text = Path.read_text
 
     def _deny_perm(self: Path, *args: Any, **kwargs: Any) -> str:
@@ -283,47 +368,50 @@ def test_load_guard_config_distinguishes_filenotfound_from_permission_directory_
             raise PermissionError(13, "Permission denied", str(self))
         return orig_read_text(self, *args, **kwargs)
 
+    guard_config.clear_config_cache()
     monkeypatch.setattr(Path, "read_text", _deny_perm)
-    cfg_perm = local_repo_guard.load_guard_config(perm_cfg)
+    cfg_perm = guard_config.load_runtime_config(perm_cfg)
     assert cfg_perm.get("config_error")
-    res_perm = local_repo_guard.gate_bigquery_ai_views(state_dir, "execute_sql_readonly", sql, config_path=perm_cfg)
-    assert res_perm["decision"] == "deny"
+    res_perm = policy_engine.apply_policy_packs(scoped_call, cfg_perm)
+    assert res_perm is not None and res_perm["decision"] == "deny"
     assert "CONFIG ERROR" in res_perm["reason"]
     monkeypatch.undo()
 
+    guard_config.clear_config_cache()
     dir_cfg = tmp_path / "dir_as_config.json"
     dir_cfg.mkdir()
-    res_dir = local_repo_guard.gate_bigquery_ai_views(state_dir, "execute_sql_readonly", sql, config_path=dir_cfg)
-    assert res_dir["decision"] == "deny"
+    res_dir = policy_engine.apply_policy_packs(scoped_call, guard_config.load_runtime_config(dir_cfg))
+    assert res_dir is not None and res_dir["decision"] == "deny"
 
+    guard_config.clear_config_cache()
     bad_utf8_cfg = tmp_path / "bad_utf8.json"
     bad_utf8_cfg.write_bytes(b"\xff\xfe\x00\x00")
-    res_utf8 = local_repo_guard.gate_bigquery_ai_views(state_dir, "execute_sql_readonly", sql, config_path=bad_utf8_cfg)
-    assert res_utf8["decision"] == "deny"
+    res_utf8 = policy_engine.apply_policy_packs(scoped_call, guard_config.load_runtime_config(bad_utf8_cfg))
+    assert res_utf8 is not None and res_utf8["decision"] == "deny"
 
     for idx, content in enumerate(["{corrupt", '["list_not_dict"]']):
+        guard_config.clear_config_cache()
         bad_json_cfg = tmp_path / f"bad_json_{idx}.json"
         bad_json_cfg.write_text(content, encoding="utf-8")
-        res_bad = local_repo_guard.gate_bigquery_ai_views(
-            state_dir, "execute_sql_readonly", sql, config_path=bad_json_cfg
-        )
-        assert res_bad["decision"] == "deny"
+        res_bad = policy_engine.apply_policy_packs(scoped_call, guard_config.load_runtime_config(bad_json_cfg))
+        assert res_bad is not None and res_bad["decision"] == "deny"
 
-    mistyped_payloads = [
-        {"restricted_bq_datasets": "raw_restricted_ds"},
-        {"restricted_bq_datasets": [""]},
-        {"restricted_bq_datasets": [123]},
-        {"allowed_bq_views_dataset": ["not-a-str"]},
-        {"allowed_bq_views_hint": 99},
-        {"bq_schema_doc": False},
+    mistyped_payloads: list[dict[str, Any]] = [
+        {"read_confirm_policy": "invalid"},
+        {"optimizers": "not-dict"},
+        {"optimizers": {"range_trim": "nope"}},
+        {"optimizers": {"cli_rewrites": 123}},
+        {"integrations": {"atlassian_twg": "yes"}},
+        {"regret_window_steps": False},
+        {"policy_packs": "not-list"},
+        {"model_labels": []},
     ]
     for idx, doc in enumerate(mistyped_payloads):
+        guard_config.clear_config_cache()
         schema_cfg = tmp_path / f"schema_{idx}.json"
         schema_cfg.write_text(json.dumps(doc), encoding="utf-8")
-        res_schema = local_repo_guard.gate_bigquery_ai_views(
-            state_dir, "execute_sql_readonly", sql, config_path=schema_cfg
-        )
-        assert res_schema["decision"] == "deny", f"expected deny for mistyped doc {doc}"
+        res_schema = policy_engine.apply_policy_packs(scoped_call, guard_config.load_runtime_config(schema_cfg))
+        assert res_schema is not None and res_schema["decision"] == "deny", f"expected deny for mistyped doc {doc}"
 
 
 def _run_with_closed_stderr_pipe(
@@ -382,10 +470,8 @@ def test_post_tool_use_and_single_stdout_json_invariants(
         def flush(self) -> None:
             raise BrokenPipeError("stdout pipe broken during flush")
 
-    cfg_file = tmp_path / "bq_cfg.json"
-    cfg_file.write_text('{"restricted_bq_datasets": ["raw_restricted_ds"]}', encoding="utf-8")
-    monkeypatch.setattr(local_repo_guard, "DEFAULT_USER_CONFIG_PATH", cfg_file)
-    bq_stdin = json.dumps(
+    _configure_acme_mcp_pack(tmp_path, monkeypatch, raise_pre_oserror=False)
+    mcp_stdin = json.dumps(
         {
             "conversationId": "c-stdout",
             "artifactDirectoryPath": str(tmp_path),
@@ -393,15 +479,15 @@ def test_post_tool_use_and_single_stdout_json_invariants(
             "toolCall": {
                 "name": "call_mcp_tool",
                 "args": {
-                    "ServerName": "bigquery",
+                    "ServerName": "acme_db",
                     "ToolName": "execute_sql_readonly",
-                    "Arguments": {"query": "SELECT * FROM raw_restricted_ds.orders"},
+                    "Arguments": {"query": "SELECT * FROM acme_private_ds.orders"},
                 },
             },
         }
     )
     for hook_fn, raw_in in (
-        (lambda: pre_tool_use.main([]), bq_stdin),
+        (lambda: pre_tool_use.main([]), mcp_stdin),
         (pre_compact.main, "{}"),
         (pre_invocation.main, "{}"),
     ):

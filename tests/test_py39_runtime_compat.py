@@ -61,7 +61,13 @@ def test_ast_no_python310_only_runtime_constructs() -> None:
     offenders: list[str] = []
     match_cls = getattr(ast, "Match", None)
 
-    for path in sorted([*ROOT.glob("hooks/*.py"), *ROOT.glob("bin/*.py"), *ROOT.glob("tests/*.py")]):
+    for path in sorted([
+        *ROOT.glob("hooks/*.py"),
+        *ROOT.glob("bin/*.py"),
+        *ROOT.glob("policies/*.py"),
+        *ROOT.glob("integrations/*.py"),
+        *ROOT.glob("tests/*.py"),
+    ]):
         rel = path.relative_to(ROOT)
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         has_future = _has_future_annotations(tree)
@@ -120,7 +126,7 @@ def test_system_python3_imports_all_hooks_and_bin_modules(tmp_path: Path) -> Non
     py = _runtime_python()
     modules = sorted(
         f"{p.parent.name}.{p.stem}"
-        for p in [*ROOT.glob("hooks/*.py"), *ROOT.glob("bin/*.py")]
+        for p in [*ROOT.glob("hooks/*.py"), *ROOT.glob("bin/*.py"), *ROOT.glob("policies/*.py"), *ROOT.glob("integrations/*.py")]
         if p.stem != "__init__"
     )
     script = (

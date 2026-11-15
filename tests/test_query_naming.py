@@ -6,7 +6,7 @@ import textwrap
 from pathlib import Path
 from typing import Iterator
 
-from hooks import local_repo_guard, model_identity, pre_tool_use
+from hooks import model_identity, pre_tool_use
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -113,21 +113,18 @@ def test_state_writing_functions_carry_command_names() -> None:
     from hooks import outcomes, read_planner
 
     renamed = {
-        local_repo_guard: ("evaluate_gitlab_local_first", "gate_gitlab_local_first"),
         model_identity: ("resolve_model", "memoize_model"),
     }
     for module, (old, new) in renamed.items():
         assert callable(getattr(module, new)), f"{module.__name__}.{new} missing"
         assert not hasattr(module, old), f"{module.__name__}.{old} still present"
-    assert callable(local_repo_guard.gate_bigquery_ai_views)
-    assert not hasattr(local_repo_guard, "evaluate_bigquery_ai_views_guard")
     assert callable(read_planner.handle_file_read_verdict)
     assert callable(outcomes.record_direct_outcome)
 
 
 def test_query_named_functions_do_not_write_state() -> None:
     found: dict[str, list[str]] = {}
-    for label, source in _sources("hooks/*.py", "bin/*.py"):
+    for label, source in _sources("hooks/*.py", "bin/*.py", "policies/*.py", "integrations/*.py"):
         found.update(query_violations(source, label))
     unexpected, stale = allow_list_problems(found, ALLOWED_QUERY_MUTATORS)
     assert unexpected == [], "query-named functions that write state (rename them):\n" + "\n".join(unexpected)
@@ -135,8 +132,12 @@ def test_query_named_functions_do_not_write_state() -> None:
 
 
 def test_hooks_never_import_bin() -> None:
-    offenders = [entry for label, source in _sources("hooks/*.py") for entry in bin_imports(source, label)]
-    assert offenders == [], "hooks/ must not import bin/:\n" + "\n".join(offenders)
+    offenders = [
+        entry
+        for label, source in _sources("hooks/*.py", "policies/*.py", "integrations/*.py")
+        for entry in bin_imports(source, label)
+    ]
+    assert offenders == [], "hooks/, policies/, integrations/ must not import bin/:\n" + "\n".join(offenders)
 
 
 def _violations_of(source: str) -> dict[str, list[str]]:

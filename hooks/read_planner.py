@@ -6,15 +6,17 @@ import os
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
+from hooks.config import load_runtime_config
 from hooks.file_io import SHA256_MAX_HASH_BYTES, compute_file_sha256, count_file_lines_streaming
 from hooks.json_outliners import (
     PreparedOutline, build_transcript_jsonl_outline, classify_special_read_target,
-    finalize_outline_text, materialize_unwrap_write, prepare_mcp_step_outline, prepare_twg_stdout_outline,
+    finalize_outline_text, materialize_unwrap_write, prepare_mcp_step_outline,
 )
 from hooks.outcomes import estimate_delivered_end_line
 from hooks.session_lifecycle import prune_state_on_rewind
 from hooks.state_store import locked_state, merge_intervals, warn
 from hooks.telemetry import BINARY_MEDIA_EXTENSIONS, HARNESS_READ_CAPS, cap_end_line_for_harness, measure_slice_bytes
+from integrations.atlassian_twg import prepare_twg_stdout_outline
 
 TRANSCRIPT_OUTLINE_LINE_THRESHOLD = 8
 FOLLOWUP_TARGETED_MAX_LINES = 250
@@ -94,14 +96,29 @@ def trim_partially_covered_range(
     return (new_start, new_end) if (new_start, new_end) != (eff_start, eff_end) and new_start <= new_end else None
 
 
+def _is_atlassian_twg_active() -> bool:
+    runtime_cfg = load_runtime_config()
+    integrations_cfg = runtime_cfg.get("integrations")
+    return isinstance(integrations_cfg, dict) and integrations_cfg.get("atlassian_twg") == "active"
+
+
 def _prepare_special_outline(
-    canon: str, st_size: int, start_line: int, end_line: int, state_dir_path: Path
+    canon: str,
+    st_size: int,
+    start_line: int,
+    end_line: int,
+    state_dir_path: Path,
+    *,
+    twg_active: bool | None = None,
 ) -> PreparedOutline | None:
     special = classify_special_read_target(canon)
     file_path = Path(canon)
     if special.is_mcp_step_output:
         return prepare_mcp_step_outline(file_path, st_size)
     if special.is_twg_stdout:
+        is_active = _is_atlassian_twg_active() if twg_active is None else twg_active
+        if not is_active:
+            return None
         return prepare_twg_stdout_outline(file_path, st_size, cache_dir=(state_dir_path / "twg_cache"))
     if special.is_transcript_log:
         tr = build_transcript_jsonl_outline(file_path, st_size, SHA256_MAX_HASH_BYTES, start_line=start_line, end_line=end_line)
@@ -171,9 +188,10 @@ def handle_file_read_verdict(
         return FileReadOutcome({"decision": "allow"})
     st_size = os.path.getsize(canon)
     special = classify_special_read_target(canon)
-    is_special = special.is_mcp_step_output or special.is_twg_stdout or special.is_transcript_log
+    twg_active = special.is_twg_stdout and _is_atlassian_twg_active()
+    is_special = special.is_mcp_step_output or twg_active or special.is_transcript_log
     prepared = (
-        _prepare_special_outline(canon, st_size, start_line, end_line, state_dir_path)
+        _prepare_special_outline(canon, st_size, start_line, end_line, state_dir_path, twg_active=twg_active)
         if is_special and byte_offset == 0
         else None
     )
@@ -204,7 +222,7 @@ def handle_file_read_verdict(
             is_special
             and prepared is not None
             and byte_offset == 0
-            and (allow_auto_outline or special.is_twg_stdout)
+            and (allow_auto_outline or twg_active)
             and not entry.get("outlined")
             and (not has_prior_step_reads or special.is_transcript_log)
             and (
@@ -225,7 +243,7 @@ def handle_file_read_verdict(
             entry["outlined_step"] = eff_step
             entry["outlined_total_lines"] = out_lines
             outline_text = finalize_outline_text(prepared, actual_unwrapped)
-            is_inline_twg = bool(special.is_twg_stdout and "— full payload inline)" in outline_text)
+            is_inline_twg = bool(twg_active and "— full payload inline)" in outline_text)
             if not is_inline_twg:
                 entry["pending_followup_kind"] = "outline"
             else:
@@ -256,8 +274,8 @@ def handle_file_read_verdict(
             return FileReadOutcome({"decision": "deny", "reason": reason}, intervention="outline", effective_step_idx=eff_step)
 
         redirect_path: str | None = None
-        wants_redirect_shape = start_line > 1 or end_line != -1 or not allow_auto_outline or special.is_twg_stdout
-        if can_redirect_path and (special.is_mcp_step_output or special.is_twg_stdout) and wants_redirect_shape:
+        wants_redirect_shape = start_line > 1 or end_line != -1 or not allow_auto_outline or twg_active
+        if can_redirect_path and (special.is_mcp_step_output or twg_active) and wants_redirect_shape:
             prev_unwrapped = entry.get("unwrapped_path")
             if isinstance(prev_unwrapped, str) and os.path.isfile(prev_unwrapped):
                 redirect_path = prev_unwrapped

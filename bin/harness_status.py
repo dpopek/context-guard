@@ -4,33 +4,44 @@ from __future__ import annotations
 
 import json
 import re
-import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
-
-_PACKAGE_ROOT = Path(__file__).resolve().parent.parent
-if str(_PACKAGE_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PACKAGE_ROOT))
-
-from hooks.local_repo_guard import BIGQUERY_MCP_SERVERS  # noqa: E402
 
 DEFAULT_CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
 DEFAULT_CURSOR_HOOKS = Path.home() / ".cursor" / "hooks.json"
 DEFAULT_CODEX_HOOKS = Path.home() / ".codex" / "hooks.json"
 
-_BQ_SERVERS_SORTED = tuple(sorted(BIGQUERY_MCP_SERVERS))
-_BQ_MCP_PATTERNS = "|".join(f"mcp__{srv}__.*" for srv in _BQ_SERVERS_SORTED)
-_BQ_CURSOR_COLON_PATTERNS = "|".join(f"MCP:{srv}:.*" for srv in _BQ_SERVERS_SORTED)
-
-CLAUDE_MATCHER = (
-    f"Read|NotebookRead|Edit|MultiEdit|Write|NotebookEdit|Bash|mcp__gitlab__.*|{_BQ_MCP_PATTERNS}"
-)
+CLAUDE_MATCHER = "Read|NotebookRead|Edit|MultiEdit|Write|NotebookEdit|Bash"
 CURSOR_MATCHER = (
-    f"Shell|Read|Edit|Write|StrReplace|MultiStrReplace|EditFile|WriteFile|DeleteFile|"
-    f"read_file|edit_file|write_file|run_terminal_cmd|"
-    f"MCP:gitlab:.*|{_BQ_CURSOR_COLON_PATTERNS}|mcp__gitlab__.*|{_BQ_MCP_PATTERNS}"
+    "Shell|Read|Edit|Write|StrReplace|MultiStrReplace|EditFile|WriteFile|DeleteFile|"
+    "read_file|edit_file|write_file|run_terminal_cmd"
 )
-CODEX_MATCHER = f"^(Bash|shell|exec_command|exec|apply_patch|mcp__gitlab__.*|{_BQ_MCP_PATTERNS})$"
+CODEX_MATCHER = "^(Bash|shell|exec_command|exec|apply_patch|Edit|Write|mcp__.*)$"
+
+
+def merge_harness_matcher(
+    base_matcher: str, extras: Sequence[str], *, regex_anchored: bool = False
+) -> str:
+    """Merge non-empty pipe-delimited policy pack matcher patterns onto a base harness matcher."""
+
+    def _split_parts(pattern: str) -> list[str]:
+        inner = pattern.strip()
+        if regex_anchored and inner.startswith("^(") and inner.endswith(")$"):
+            inner = inner[2:-2]
+        return [part.strip() for part in inner.split("|") if part.strip()]
+
+    seen: set[str] = set()
+    merged: list[str] = []
+    for raw in (base_matcher, *extras):
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        for part in _split_parts(raw):
+            if part not in seen:
+                seen.add(part)
+                merged.append(part)
+    joined = "|".join(merged)
+    return f"^({joined})$" if regex_anchored and joined else joined
 
 
 _PRE_TOOL_USE_TARGET_RE = re.compile(

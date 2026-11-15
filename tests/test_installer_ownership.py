@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from bin.install_harnesses import install_all, uninstall_all
 
 FOREIGN = "python3 /opt/other-tool/hooks/pre_tool_use.py --mode strict"
@@ -57,15 +59,64 @@ def test_install_and_uninstall_keep_foreign_handlers(tmp_path: Path) -> None:
 
 
 def test_workspace_session_start_and_stop_hooks_installed_idempotently_keeping_superset(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    import hashlib
+    import os
     from bin.install_harnesses import compute_codex_trusted_hash
+    from hooks import config as guard_config
 
     ws = tmp_path / "workspace"
     hooks_dir = ws / "scripts" / "hooks"
     hooks_dir.mkdir(parents=True)
-    (hooks_dir / "antigravity_stop_guard.py").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
-    (hooks_dir / "claude_stop_guard.py").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    (hooks_dir / "session_baseline_guard.py").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    (hooks_dir / "session_stop_guard.py").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+
+    pack_dir = tmp_path / "policies" / "acme_lifecycle"
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(pack_dir.parent, 0o700)
+    os.chmod(pack_dir, 0o700)
+    pack_src = (
+        "from policies.api import POLICY_API_VERSION, InstallerHookSpec, PolicyPackManifest\n\n"
+        "def evaluate(ctx):\n"
+        "    return None\n\n"
+        "PACK_MANIFEST = PolicyPackManifest(\n"
+        "    pack_id='acme-ws-lifecycle', api_version=POLICY_API_VERSION,\n"
+        "    kind='security', covered_domains=('synthetic-ws',), evaluate=evaluate,\n"
+        "    harness_matchers={\n"
+        "        'claude': 'mcp__acme__.*',\n"
+        "        'cursor': 'mcp__acme__.*',\n"
+        "        'codex': 'mcp__acme__.*',\n"
+        "    },\n"
+        "    installer_hooks=(\n"
+        "        InstallerHookSpec('claude', 'SessionStart', '{python} {workspace_root}/scripts/hooks/session_baseline_guard.py --capture-baseline', timeout=10),\n"
+        "        InstallerHookSpec('claude', 'Stop', '{python} {workspace_root}/scripts/hooks/session_stop_guard.py --claude-hook', timeout=30),\n"
+        "        InstallerHookSpec('cursor', 'sessionStart', '{python} {workspace_root}/scripts/hooks/session_baseline_guard.py --capture-baseline', timeout=10),\n"
+        "        InstallerHookSpec('cursor', 'stop', '{python} {workspace_root}/scripts/hooks/session_stop_guard.py --cursor-hook', timeout=30),\n"
+        "        InstallerHookSpec('codex', 'SessionStart', '{python} {workspace_root}/scripts/hooks/session_baseline_guard.py --capture-baseline', timeout=10),\n"
+        "        InstallerHookSpec('codex', 'Stop', '{python} {workspace_root}/scripts/hooks/session_stop_guard.py --claude-hook', timeout=30),\n"
+        "    ),\n"
+        ")\n"
+    ).encode("utf-8")
+    pack_file = pack_dir / "pack.py"
+    pack_file.write_bytes(pack_src)
+    os.chmod(pack_file, 0o600)
+    fsha = hashlib.sha256(pack_src).hexdigest()
+    tsha = hashlib.sha256(f"pack.py:{fsha}\n".encode("utf-8")).hexdigest()
+    entry = {
+        "id": "acme-ws-lifecycle",
+        "path": str(pack_file),
+        "enabled": True,
+        "kind": "security",
+        "scopes": ["file_mutation"],
+        "file_hashes": {"pack.py": fsha},
+        "tree_sha256": tsha,
+        "settings": {},
+    }
+    cfg_file = tmp_path / "cg_config.json"
+    cfg_file.write_text(json.dumps({"workspace_root": str(ws), "policy_packs": [entry]}), encoding="utf-8")
+    monkeypatch.setenv("CONTEXT_GUARD_CONFIG_PATH", str(cfg_file))
+    guard_config.clear_config_cache()
 
     superset_claude = '[ -n "$SUPERSET_HOME_DIR" ] && "$SUPERSET_HOME_DIR/hooks/notify.sh" || true'
     superset_cursor_start = "/Users/example/.superset/hooks/cursor-hook.sh SessionStart"
@@ -117,6 +168,8 @@ def test_workspace_session_start_and_stop_hooks_installed_idempotently_keeping_s
     first_cursor = cursor.read_text(encoding="utf-8")
     first_codex = codex.read_text(encoding="utf-8")
     first_toml = toml.read_text(encoding="utf-8")
+    assert "mcp__acme__.*" in first_claude
+    assert "mcp__acme__.*" in first_codex
 
     # Re-running install_all deduplicates and produces byte-identical configs
     install_all(plugin_root, claude, cursor, codex, toml, workspace_root=ws)
@@ -130,15 +183,15 @@ def test_workspace_session_start_and_stop_hooks_installed_idempotently_keeping_s
         stop_cmds = _commands(cfg, "Stop")
         assert superset_claude in start_cmds
         assert superset_claude in stop_cmds
-        assert sum("antigravity_stop_guard.py --capture-baseline" in c for c in start_cmds) == 1
-        assert sum("claude_stop_guard.py --claude-hook" in c for c in stop_cmds) == 1
+        assert sum("session_baseline_guard.py --capture-baseline" in c for c in start_cmds) == 1
+        assert sum("session_stop_guard.py --claude-hook" in c for c in stop_cmds) == 1
 
     codex_stop_groups = json.loads(first_codex)["hooks"]["Stop"]
     stop_handler = [
         h
         for grp in codex_stop_groups
         for h in grp.get("hooks", [])
-        if "claude_stop_guard.py --claude-hook" in h.get("command", "")
+        if "session_stop_guard.py --claude-hook" in h.get("command", "")
     ][0]
     assert stop_handler["timeout"] == 30
     expected_stop_hash = compute_codex_trusted_hash("stop", None, stop_handler["command"], timeout=30)
@@ -148,10 +201,10 @@ def test_workspace_session_start_and_stop_hooks_installed_idempotently_keeping_s
     cursor_stop_cmds = _commands(cursor, "stop")
     assert superset_cursor_start in cursor_start_cmds
     assert superset_cursor_stop in cursor_stop_cmds
-    assert sum("antigravity_stop_guard.py --capture-baseline" in c for c in cursor_start_cmds) == 1
-    assert sum("claude_stop_guard.py --cursor-hook" in c for c in cursor_stop_cmds) == 1
+    assert sum("session_baseline_guard.py --capture-baseline" in c for c in cursor_start_cmds) == 1
+    assert sum("session_stop_guard.py --cursor-hook" in c for c in cursor_stop_cmds) == 1
 
-    # Uninstall removes managed stop/baseline hooks while preserving Superset hooks
+    # Uninstall removes managed pack hooks while preserving Superset hooks
     uninstall_all(claude, cursor, codex, toml)
     assert _commands(claude, "SessionStart") == [superset_claude]
     assert _commands(claude, "Stop") == [superset_claude]
@@ -161,17 +214,9 @@ def test_workspace_session_start_and_stop_hooks_installed_idempotently_keeping_s
     assert _commands(cursor, "stop") == [superset_cursor_stop]
 
     # Also resolves workspace_root automatically from CONTEXT_GUARD_CONFIG_PATH when omitted
-    cfg_file = tmp_path / "cg_config.json"
-    cfg_file.write_text(json.dumps({"workspace_root": str(ws)}), encoding="utf-8")
-    import os
-
-    os.environ["CONTEXT_GUARD_CONFIG_PATH"] = str(cfg_file)
-    try:
-        install_all(plugin_root, claude, cursor, codex, toml)
-    finally:
-        os.environ.pop("CONTEXT_GUARD_CONFIG_PATH", None)
-    assert sum("claude_stop_guard.py --claude-hook" in c for c in _commands(claude, "Stop")) == 1
-    assert sum("claude_stop_guard.py --cursor-hook" in c for c in _commands(cursor, "stop")) == 1
+    install_all(plugin_root, claude, cursor, codex, toml)
+    assert sum("session_stop_guard.py --claude-hook" in c for c in _commands(claude, "Stop")) == 1
+    assert sum("session_stop_guard.py --cursor-hook" in c for c in _commands(cursor, "stop")) == 1
 
 
 def test_codex_toml_lexical_scanner_preserves_comments_strings_arrays_and_indented_tables(

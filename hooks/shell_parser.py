@@ -31,7 +31,6 @@ _CARGO_TEST_EXISTING_FLAGS_RE = re.compile(r"(?:^|\s)(?:-q|--quiet|--nocapture)(
 _VITEST_SINGLE_CMD_RE = re.compile(r"^\s*(?:(?:npx|pnpm|yarn)\s+)?(?:[\w./-]+/)?vitest(?:\s+run)?(?:\s+.*)?$")
 _VITEST_EXISTING_FLAGS_RE = re.compile(r"(?:^|\s)(?:--silent|--reporter)(?:\s|$|=)")
 _GREP_EXCLUDED_DIRS = frozenset({".git", ".mypy_cache", ".pytest_cache", "__pycache__", "node_modules", "venv", ".venv", ".ruff_cache"})
-_RELATIVE_FILE_ARG_RE = re.compile(r"^@?(?!/)(?:[\w.-]+/)*[\w.-]+\.[A-Za-z0-9]{1,5}$")
 _GIT_STATUS_BARE_RE = re.compile(r"^\s*git\s+status\s*$")
 _GREP_CACHE_EXCLUDE_FLAGS = (
     "-I --exclude-dir=.git --exclude-dir=.mypy_cache --exclude-dir=.pytest_cache "
@@ -45,10 +44,6 @@ _GREP_EXCLUDED_BASENAMES = frozenset({"package-lock.json", "pnpm-lock.yaml", "ya
 _GREP_EXCLUDED_SUFFIXES = (".min.js", ".min.css", ".map")
 _GREP_BIN_RE = re.compile(r"^((?:[\w./-]+/)?grep)\s+(.+)$", re.DOTALL)
 _GREP_RECURSIVE_FLAG_RE = re.compile(r"(?:^|\s)(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)(?:\s|$)")
-_TWG_NONCANONICAL_RE = re.compile(
-    r"^\s*(?:TWG_AGENT_DEFAULTS=\S+\s+)*(?:(?:~|/Users/[^/\s]+|/home/[^/\s]+)/\.local/bin/)?twg(\s+.*)?$",
-    re.DOTALL,
-)
 _SHELL_READER_BINS = frozenset({"cat", "head", "tail", "sed", "awk", "less", "bat", "nl"})
 _UNBOUNDED_SHELL_DUMP_BINS = frozenset({"cat", "less", "bat", "nl"})
 
@@ -401,26 +396,23 @@ def _grep_targets_excluded_dir(args_str: str) -> bool:
     return True if tokens is None else any(_GREP_EXCLUDED_DIRS.intersection(t.replace("\\", "/").split("/")) for t in [t for t in tokens if not t.startswith("-")][1:])
 
 
-def _twg_has_relative_file_arg(args_str: str) -> bool:
-    tokens = _split_tokens(args_str)
-    return True if tokens is None else any(not t.startswith("-") and _RELATIVE_FILE_ARG_RE.match(t) for t in tokens)
-
-
 def _has_double_dash_or_bad_quotes(command: str) -> bool:
     tokens = _split_tokens(command)
     return tokens is None or "--" in tokens
 
 
-def rewrite_quiet_cli_flags(command_line: str) -> str | None:
+def rewrite_quiet_cli_flags(command_line: str, *, enable_atlassian_twg: bool = False) -> str | None:
     """Append output-trimming flags to single-statement test runners, bare git status, or recursive grep."""
     cd_prefix, remainder = split_leading_cd_prefix(command_line.strip())
     stripped = remainder.strip()
     if any(op in _unquoted_text(stripped) for op in (*_SHELL_CHAIN_OPERATORS, "&", *_SHELL_REDIRECTION_OPERATORS)):
         return None
-    twg_match = _TWG_NONCANONICAL_RE.match(stripped)
-    if twg_match and "$(" not in stripped and (cd_prefix or (not stripped.startswith("twg ") and stripped != "twg")):
-        suffix = twg_match.group(1) or ""
-        return None if (cd_prefix and _twg_has_relative_file_arg(suffix)) else f"twg{suffix}"
+    if enable_atlassian_twg and "twg" in stripped:
+        from integrations.atlassian_twg import rewrite_twg_cli_command
+
+        twg_rewritten = rewrite_twg_cli_command(command_line)
+        if twg_rewritten is not None:
+            return twg_rewritten
     if any(op in stripped for op in ("\n", "`", "$(")):
         return None
     grep_match = _GREP_BIN_RE.match(stripped)
