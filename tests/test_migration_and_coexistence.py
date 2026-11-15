@@ -60,9 +60,10 @@ def _make_pack(
         target = pack_root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         _chmod_if_posix(target.parent, 0o700)
-        target.write_text(content, encoding="utf-8")
+        raw_bytes = content.encode("utf-8")
+        target.write_bytes(raw_bytes)
         _chmod_if_posix(target, 0o600)
-        file_hashes[rel] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        file_hashes[rel] = hashlib.sha256(raw_bytes).hexdigest()
     if include_artifacts:
         (pack_root / "__pycache__").mkdir(exist_ok=True)
         (pack_root / "__pycache__" / "pack.cpython-39.pyc").write_bytes(b"pyc-bytes")
