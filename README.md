@@ -1,4 +1,4 @@
-# Context-Guard (v4.5.0)
+# Context-Guard (v4.5.1)
 
 Zero-prompt policy host, Read Ledger v2 (`range_trim`), reversible output spooling, machine-artifact unwrapper, and multi-harness telemetry plugin for **Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex** (`macOS`, `Linux`, `Windows`).
 
@@ -130,11 +130,11 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 Context-Guard runs from wherever you clone it (`~/.gemini` is needed only if you use Antigravity).
 
 ```bash
-# 1. Clone anywhere (or unpack dist/context-guard-v4.5.0.zip there)
+# 1. Clone anywhere (or unpack dist/context-guard-v4.5.1.zip there)
 CG_DIR=~/tools/context-guard
 git clone https://github.com/dpopek/context-guard.git "$CG_DIR"
 
-# 2. Install hooks (Claude Code, Codex, Cursor, Antigravity) & advox.context-guard-statusbar-4.5.0 extension
+# 2. Install hooks (Claude Code, Codex, Cursor, Antigravity) & advox.context-guard-statusbar-4.5.1 extension
 python3 "$CG_DIR/bin/install_harnesses.py" --install
 
 # Check status, preview dry-run, stage verified policy packs, or uninstall cleanly

@@ -5,6 +5,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 
 ## [Unreleased]
 
+## [4.5.1] - 2026-11-15
+
+### Fixed
+- **Multi-OS CI `mypy >= 2.0` (`ci.yml`):** Pass `--python-version ${{ matrix.python-version }}` to all 4 `mypy` runs.
+- **Windows `pwsh` fail-fast (`ci.yml`):** Split static, lint, and smoke checks into single-command steps so failures abort.
+
 ## [4.5.0] - 2026-11-15
 
 ### Added

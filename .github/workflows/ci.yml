@@ -40,21 +40,35 @@ jobs:
       - name: Install pytest, mypy, and ruff
         run: python -m pip install --upgrade pip pytest mypy ruff
 
-      - name: Run static type and lint checks
-        run: |
-          python -m mypy spool hooks bin policies integrations tests
-          python -m mypy --python-version 3.9 --platform darwin spool hooks bin policies integrations
-          python -m mypy --python-version 3.9 --platform linux spool hooks bin policies integrations
-          python -m mypy --python-version 3.9 --platform win32 spool hooks bin policies integrations
-          python -m ruff check spool hooks bin policies integrations tests
-          python -c "import glob, shutil, subprocess; nb = shutil.which('node') or 'node'; fs = sorted(glob.glob('vscode-extension/*.js')); assert fs; [subprocess.run([nb, '--check', f], check=True) for f in fs]"
+      - name: Run mypy type check (Python ${{ matrix.python-version }})
+        run: python -m mypy --python-version ${{ matrix.python-version }} spool hooks bin policies integrations tests
 
-      - name: Run replay, benchmark, public-json, and release hygiene smoke checks
-        run: |
-          python bin/cg_status.py --replay
-          python bin/cg_status.py --benchmark
-          python bin/cg_status.py --public-json
-          python -c "from bin.replay_benchmark import check_release_hygiene; issues = check_release_hygiene(); assert not issues, issues"
+      - name: Run mypy type check (darwin, Python ${{ matrix.python-version }})
+        run: python -m mypy --python-version ${{ matrix.python-version }} --platform darwin spool hooks bin policies integrations
+
+      - name: Run mypy type check (linux, Python ${{ matrix.python-version }})
+        run: python -m mypy --python-version ${{ matrix.python-version }} --platform linux spool hooks bin policies integrations
+
+      - name: Run mypy type check (win32, Python ${{ matrix.python-version }})
+        run: python -m mypy --python-version ${{ matrix.python-version }} --platform win32 spool hooks bin policies integrations
+
+      - name: Run ruff lint check
+        run: python -m ruff check spool hooks bin policies integrations tests
+
+      - name: Run Node syntax check on VS Code extension
+        run: python -c "import glob, shutil, subprocess; nb = shutil.which('node') or 'node'; fs = sorted(glob.glob('vscode-extension/*.js')); assert fs; [subprocess.run([nb, '--check', f], check=True) for f in fs]"
+
+      - name: Run deterministic replay smoke check
+        run: python bin/cg_status.py --replay
+
+      - name: Run deterministic benchmark smoke check
+        run: python bin/cg_status.py --benchmark
+
+      - name: Run public-json scrubber smoke check
+        run: python bin/cg_status.py --public-json
+
+      - name: Run release hygiene check
+        run: python -c "from bin.replay_benchmark import check_release_hygiene; issues = check_release_hygiene(); assert not issues, issues"
 
       - name: Run full test suite
         run: python -m pytest -q tests/
