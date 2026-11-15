@@ -294,3 +294,157 @@ def test_evaluate_purity_and_pass2_overwrite_rejection(isolated_user_env: Path) 
     pass2_dec = policy_engine.verify_security_policies_post_transform(norm_read, runtime_cfg)
     assert pass2_dec is not None and pass2_dec["decision"] == "deny" and "Pass-2" in pass2_dec["reason"]
 
+
+def test_policy_loader_detects_tampered_sibling_module_and_unpinned_py_or_pyc_files(
+    isolated_user_env: Path,
+) -> None:
+    from policies.loader import clear_pack_cache
+
+    policies_dir = isolated_user_env / ".config" / "context-guard" / "policies"
+    cfg_path = isolated_user_env / ".config" / "context-guard" / "config.json"
+    pack_dir, entry = _write_synthetic_pack(policies_dir, "pin-check")
+
+    clear_pack_cache()
+    loaded = policy_engine.load_verified_policy_pack(entry, config_path=cfg_path)
+    assert loaded.pack_id == "pin-check"
+
+    helper_file = pack_dir / "helper.py"
+    orig_helper = helper_file.read_bytes()
+    helper_file.write_bytes(b"def check_target(path):\n    return False\n")
+    os.chmod(helper_file, 0o600)
+    clear_pack_cache()
+    with pytest.raises(policy_engine.PolicyPackLoadError, match="SHA-256 mismatch"):
+        policy_engine.load_verified_policy_pack(entry, config_path=cfg_path)
+
+    helper_file.write_bytes(orig_helper)
+    os.chmod(helper_file, 0o600)
+    clear_pack_cache()
+    assert policy_engine.load_verified_policy_pack(entry, config_path=cfg_path).pack_id == "pin-check"
+
+    extra_py = pack_dir / "extra.py"
+    extra_py.write_text("EVIL = True\n", encoding="utf-8")
+    os.chmod(extra_py, 0o600)
+    clear_pack_cache()
+    with pytest.raises(policy_engine.PolicyPackLoadError, match="unpinned"):
+        policy_engine.load_verified_policy_pack(entry, config_path=cfg_path)
+    extra_py.unlink()
+
+    root_pyc = pack_dir / "helper.pyc"
+    root_pyc.write_bytes(b"pyc-data")
+    clear_pack_cache()
+    with pytest.raises(policy_engine.PolicyPackLoadError, match="unpinned"):
+        policy_engine.load_verified_policy_pack(entry, config_path=cfg_path)
+    root_pyc.unlink()
+
+    pycache = pack_dir / "__pycache__"
+    pycache.mkdir()
+    os.chmod(pycache, 0o700)
+    (pycache / "pack.cpython-39.pyc").write_bytes(b"pyc-bytes")
+    clear_pack_cache()
+    with pytest.raises(policy_engine.PolicyPackLoadError, match="__pycache__"):
+        policy_engine.load_verified_policy_pack(entry, config_path=cfg_path)
+
+
+def test_pass2_four_cases_and_double_evaluate_idempotency(
+    isolated_user_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+    from hooks import pre_tool_use
+    from tests.helpers import read_session_state
+
+    policies_dir = isolated_user_env / ".config" / "context-guard" / "policies"
+    cfg_path = isolated_user_env / ".config" / "context-guard" / "config.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    big = ws / "big.py"
+    big.write_text("".join(f"x_{i} = {i}\n" for i in range(250)), encoding="utf-8")
+
+    # Case 1: security pack Pass-1 overwrite rejected in Pass-2 -> must deny (never fall back to orig)
+    case1_src = (
+        "from policies.api import POLICY_API_VERSION, PolicyDecision, PolicyPackManifest\n"
+        "def evaluate(ctx):\n"
+        "    if ctx.canonical_tool == 'read_file':\n"
+        "        end_l = ctx.canonical_args.get('EndLine')\n"
+        "        if end_l == -1:\n"
+        "            return PolicyDecision(decision='allow', overwrite={'StartLine': 1, 'EndLine': 10})\n"
+        "        if end_l == 10:\n"
+        "            return PolicyDecision(decision='deny', reason='CASE1_SEC_OW_REJECTED')\n"
+        "    return PolicyDecision(decision='allow')\n"
+        "PACK_MANIFEST = PolicyPackManifest(pack_id='c1', api_version=POLICY_API_VERSION, kind='security', covered_domains=('c1',), evaluate=evaluate)\n"
+    )
+    _, e1 = _write_synthetic_pack(policies_dir, "c1", pack_src=case1_src)
+    cfg_path.write_text(json.dumps({"read_confirm_policy": "bounded", "policy_packs": [e1]}), encoding="utf-8")
+    hooks_config.clear_config_cache()
+    sd1 = str(tmp_path / "sd1")
+    d1 = pre_tool_use.evaluate_hook({"conversationId": "c1", "stepIdx": 1, "toolCall": {"name": "read_file", "args": {"Path": str(big), "StartLine": 1, "EndLine": -1}}}, state_dir=sd1)
+    assert d1["decision"] == "deny" and "CASE1_SEC_OW_REJECTED" in d1["reason"]
+
+    # Case 2: optimizer transform violates Pass-2 -> discard optimizer, allow safe post_pass1, zero pending/unwrap
+    side = isolated_user_env / "p2_marker.txt"
+    case2_src = (
+        "from pathlib import Path\n"
+        "from policies.api import POLICY_API_VERSION, PolicyDecision, PolicyPackManifest\n"
+        f"_M = Path({str(side)!r})\n"
+        "def evaluate(ctx):\n"
+        "    if ctx.canonical_tool == 'run_command' and 'git status -sb' in str(ctx.canonical_args.get('CommandLine', '')):\n"
+        "        return PolicyDecision(decision='deny', reason='CASE2_CLI_REJECTED')\n"
+        "    if ctx.canonical_tool == 'read_file' and ctx.canonical_args.get('StartLine') == 101:\n"
+        "        return PolicyDecision(decision='deny', reason='CASE2_TRIM_REJECTED')\n"
+        "    if ctx.canonical_tool == 'read_file' and str(ctx.canonical_args.get('Path', '')).endswith('mod.py'):\n"
+        "        return PolicyDecision(decision='deny', reason='CASE2_UNWRAP_REJECTED')\n"
+        "    return PolicyDecision(decision='allow', metadata={'tool': ctx.canonical_tool})\n"
+        "def on_pre_decision(ctx, dec):\n"
+        "    _M.write_text(_M.read_text(encoding='utf-8') + f'{ctx.canonical_tool};' if _M.exists() else f'{ctx.canonical_tool};', encoding='utf-8')\n"
+        "PACK_MANIFEST = PolicyPackManifest(pack_id='c2', api_version=POLICY_API_VERSION, kind='security', covered_domains=('c2',), evaluate=evaluate, on_pre_decision=on_pre_decision)\n"
+    )
+    _, e2 = _write_synthetic_pack(policies_dir, "c2", pack_src=case2_src)
+    cfg_path.write_text(json.dumps({"read_confirm_policy": "bounded", "policy_packs": [e2]}), encoding="utf-8")
+    hooks_config.clear_config_cache()
+    sd2 = str(tmp_path / "sd2")
+    # 2a: cli_rewrite denied by Pass-2 -> original command allowed without overwrite; idempotent double evaluate
+    r_cli = pre_tool_use.evaluate_hook({"session_id": "s2", "tool_name": "Bash", "tool_input": {"command": "git status"}, "permission_mode": "bypassPermissions"}, state_dir=sd2, cli_harness="claude")
+    assert r_cli == {}
+    assert side.read_text(encoding="utf-8") == "run_command;"
+    # 2b: range_trim denied by Pass-2 -> allow original range without pending_reads commit
+    assert pre_tool_use.evaluate_hook({"session_id": "s2", "tool_name": "Read", "tool_input": {"file_path": str(big), "offset": 1, "limit": 100}}, state_dir=sd2, cli_harness="claude") == {}
+    r_trim = pre_tool_use.evaluate_hook({"session_id": "s2", "tool_name": "Read", "tool_input": {"file_path": str(big), "offset": 1, "limit": 200}}, state_dir=sd2, cli_harness="claude")
+    assert r_trim == {} and not read_session_state(sd2).get("pending_reads")
+    # 2c: auto_outline/TWG unwrap redirect denied in Pass-2 -> discard redirect, zero unwrap files created
+    cfg_path.write_text(
+        json.dumps({"read_confirm_policy": "bounded", "optimizers": {"auto_outline": "off"}, "integrations": {"atlassian_twg": "active"}, "policy_packs": [e2]}),
+        encoding="utf-8",
+    )
+    hooks_config.clear_config_cache()
+    sd2_unw = tmp_path / "sd2_unw"
+    mcp = tmp_path / ".system_generated" / "steps" / "9" / "output.txt"
+    mcp.parent.mkdir(parents=True)
+    mcp.write_text(json.dumps({"file_name": "mod.py", "content": "\n".join(f"v_{i}={i}" for i in range(1500))}), encoding="utf-8")
+    r_unw = pre_tool_use.evaluate_hook({"conversationId": "s2u", "stepIdx": 9, "toolCall": {"name": "read_file", "args": {"Path": str(mcp), "StartLine": 1, "EndLine": 50}}}, state_dir=str(sd2_unw))
+    assert r_unw == {"decision": "allow"} and not (mcp.parent / "mod.py").exists()
+    cfg_path.write_text(json.dumps({"read_confirm_policy": "bounded", "policy_packs": [e2]}), encoding="utf-8")
+    hooks_config.clear_config_cache()
+
+    # Case 3: Pass-2 security load/eval error -> immediate scoped deny (never passthrough)
+    e3 = {**e2, "fallback_matchers": {"protected_path_prefixes": [".githooks/"], "shell_commands": ["git"]}}
+    cfg_path.write_text(json.dumps({"read_confirm_policy": "bounded", "policy_packs": [e3]}), encoding="utf-8")
+    hooks_config.clear_config_cache()
+    orig_load = policy_engine.load_verified_policy_pack
+    calls = {"n": 0}
+
+    def _boom_on_pass2(entry_arg: Any, *, config_path: Path | None = None, cwd: str | None = None) -> Any:
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise policy_engine.PolicyPackLoadError("tampered during Pass-2")
+        return orig_load(entry_arg, config_path=config_path, cwd=cwd)
+
+    monkeypatch.setattr(policy_engine, "load_verified_policy_pack", _boom_on_pass2)
+    r_c3 = pre_tool_use.evaluate_hook({"session_id": "s3", "tool_name": "Bash", "tool_input": {"command": "git status"}, "permission_mode": "bypassPermissions"}, state_dir=str(tmp_path / "sd3"), cli_harness="claude")
+    assert r_c3["hookSpecificOutput"]["permissionDecision"] == "deny"
+    monkeypatch.setattr(policy_engine, "load_verified_policy_pack", orig_load)
+
+    # Case 4: commit_planned_file_read raises OSError -> safe passthrough of allow_dec
+    monkeypatch.setattr(pre_tool_use, "commit_planned_file_read", lambda _p: (_ for _ in ()).throw(OSError("readonly fs")))
+    r_c4 = pre_tool_use.evaluate_hook({"session_id": "s4", "tool_name": "Read", "tool_input": {"file_path": str(big), "offset": 1, "limit": 200}}, state_dir=str(tmp_path / "sd4"), cli_harness="claude")
+    assert r_c4 == {}
+

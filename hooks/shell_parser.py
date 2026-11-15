@@ -433,7 +433,45 @@ def rewrite_quiet_cli_flags(command_line: str, *, enable_atlassian_twg: bool = F
     return None
 
 
+def command_uses_rtk(command_line: str) -> bool:
+    """Return True if any shell segment in `command_line` invokes `rtk` (incl. env/path prefixes)."""
+    if not isinstance(command_line, str) or not command_line.strip():
+        return False
+    segs: list[str] = []
+    start = 0
+    for idx, ch in _iter_unquoted(command_line):
+        if ch in ";\n|&()":
+            segs.append(command_line[start:idx])
+            start = idx + 1
+    segs.append(command_line[start:])
+    for seg in segs:
+        if not seg.strip():
+            continue
+        toks = _split_tokens(seg)
+        if toks is None:
+            if re.match(r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:env\s+)?(?:[^\s;|&()\"']*/)?rtk(?:\.exe)?(?:\s|$)", seg):
+                return True
+            continue
+        i = 0
+        while i < len(toks):
+            tok = toks[i]
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
+                i += 1
+                continue
+            if tok in ("env", "command", "exec", "nohup", "time", "builtin") and not (
+                tok == "command" and i + 1 < len(toks) and toks[i + 1] in ("-v", "-V")
+            ):
+                i += 1
+                while i < len(toks) and toks[i].startswith("-") and toks[i] != "--":
+                    i += 1
+                continue
+            if normalize_cmd_basename(tok) == "rtk":
+                return True
+            break
+    return False
+
+
 __all__ = [
-    "extract_outline_pull_targets", "extract_shell_read_targets", "is_bounded_shell_read",
+    "command_uses_rtk", "extract_outline_pull_targets", "extract_shell_read_targets", "is_bounded_shell_read",
     "is_outline_pull", "is_unbounded_shell_dump", "rewrite_quiet_cli_flags", "split_leading_cd_prefix",
 ]

@@ -13,6 +13,7 @@ if _PLUGIN_ROOT not in sys.path:
     sys.path.insert(0, _PLUGIN_ROOT)
 
 from hooks.config import load_runtime_config  # noqa: E402
+from hooks.outcomes import close_outcome_windows, ledger_path_for  # noqa: E402
 from hooks.policy_engine import notify_session_transition  # noqa: E402
 from hooks.session_lifecycle import apply_compaction_boundary  # noqa: E402
 from hooks.state_store import (  # noqa: E402
@@ -22,6 +23,7 @@ from hooks.state_store import (  # noqa: E402
     state_file_in,
     warn,
 )
+from hooks.telemetry import DEFAULT_SHADOW_PATH, invalidate_shadow_ledger, shadow_path_for  # noqa: E402
 
 
 def handle_pre_compact(
@@ -30,6 +32,11 @@ def handle_pre_compact(
 ) -> dict[str, Any]:
     """Clear cached file reads and outlines in the session ledger when native auto-compaction triggers."""
     try:
+        sess_id = str(payload.get("session_id") or payload.get("conversation_id") or payload.get("conversationId") or "default")
+        sp = shadow_path_for(state_dir)
+        if (sp or DEFAULT_SHADOW_PATH).is_file():
+            invalidate_shadow_ledger(session_id=sess_id, full_compact=True, shadow_path=sp)
+        close_outcome_windows(sess_id, force_all=True, ledger_path=ledger_path_for(state_dir))
         state_dir_path = resolve_state_dir(payload, state_dir)
         if not state_file_in(state_dir_path).exists():
             return {}

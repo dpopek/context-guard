@@ -42,9 +42,16 @@ jobs:
 
       - name: Run static type and lint checks
         run: |
-          python -m mypy hooks bin tests
-          python -m ruff check hooks bin tests
-          node --check vscode-extension/extension.js vscode-extension/view_model.js vscode-extension/updater.js vscode-extension/renderers.js
+          python -m mypy hooks bin policies integrations tests
+          python -m ruff check hooks bin policies integrations tests
+          python -c "import glob, shutil, subprocess; nb = shutil.which('node') or 'node'; fs = sorted(glob.glob('vscode-extension/*.js')); assert fs; [subprocess.run([nb, '--check', f], check=True) for f in fs]"
+
+      - name: Run replay, benchmark, public-json, and release hygiene smoke checks
+        run: |
+          python bin/cg_status.py --replay
+          python bin/cg_status.py --benchmark
+          python bin/cg_status.py --public-json
+          python -c "from bin.replay_benchmark import check_release_hygiene; issues = check_release_hygiene(); assert not issues, issues"
 
       - name: Run full test suite
         run: python -m pytest -q tests/

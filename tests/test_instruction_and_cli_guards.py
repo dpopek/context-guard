@@ -303,3 +303,101 @@ def test_python_markdown_and_new_format_outliners() -> None:
     assert outline_shell(sh_src) == ["function real_fn(): L7-L9"]
     assert extract_outline_symbols(sh_src, ".sh") == ["function real_fn(): L7-L9"]
 
+
+def test_codex_pre_tool_use_intercepts_and_blocks_apply_patch_with_exit_2_and_deny_json(
+    isolated_user_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import io
+    import subprocess
+    import sys
+    from hooks import pre_tool_use
+
+    policies_dir = isolated_user_env / ".config" / "context-guard" / "policies"
+    policies_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(policies_dir, 0o700)
+    pack_dir = policies_dir / "codex-sec"
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(pack_dir, 0o700)
+    pack_src = (
+        "from policies.api import POLICY_API_VERSION, PolicyDecision, PolicyPackManifest\n"
+        "def evaluate(ctx):\n"
+        "    if ctx.canonical_tool == 'edit_file' and any('.githooks/' in p for p in (*ctx.mutated_paths, str(ctx.canonical_args.get('Path', '')))):\n"
+        "        return PolicyDecision(decision='deny', reason='BLOCKED_GITHOOKS_PATCH')\n"
+        "    return PolicyDecision(decision='allow')\n"
+        "PACK_MANIFEST = PolicyPackManifest(pack_id='codex-sec', api_version=POLICY_API_VERSION, kind='security', covered_domains=('codex_patch',), evaluate=evaluate)\n"
+    )
+    pack_file = pack_dir / "pack.py"
+    raw = pack_src.encode("utf-8")
+    pack_file.write_bytes(raw)
+    os.chmod(pack_file, 0o600)
+    fhash = hashlib.sha256(raw).hexdigest()
+    tsha = hashlib.sha256(f"pack.py:{fhash}\n".encode("utf-8")).hexdigest()
+    cfg_file = isolated_user_env / ".config" / "context-guard" / "config.json"
+    cfg_file.write_text(
+        json.dumps(
+            {
+                "read_confirm_policy": "bounded",
+                "policy_packs": [
+                    {
+                        "id": "codex-sec",
+                        "path": str(pack_file),
+                        "enabled": True,
+                        "kind": "security",
+                        "scopes": ["file_mutation"],
+                        "fallback_matchers": {"protected_path_prefixes": [".githooks/"]},
+                        "file_hashes": {"pack.py": fhash},
+                        "tree_sha256": tsha,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    clear_config_cache()
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    patch_payload = {
+        "session_id": "cx-patch-1",
+        "tool_name": "apply_patch",
+        "cwd": str(ws),
+        "tool_input": {
+            "patch": "*** Begin Patch\n*** Update File: .githooks/pre-commit\n@@\n+echo tampered\n*** End Patch\n"
+        },
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(patch_payload)))
+    rc = pre_tool_use.main(["--harness", "codex"])
+    cap = capsys.readouterr()
+    assert rc == 2
+    out_doc = json.loads(cap.out)
+    assert out_doc["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "BLOCKED_GITHOOKS_PATCH" in out_doc["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "BLOCKED_GITHOOKS_PATCH" in cap.err
+
+    # Also verify real subprocess invocation + fail-closed exit 2 on corrupt/non-dict/empty stdin
+    script = Path(__file__).resolve().parent.parent / "hooks" / "pre_tool_use.py"
+    proc = subprocess.run(
+        [sys.executable, str(script), "--harness", "codex"],
+        input=json.dumps(patch_payload),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert proc.returncode == 2
+    assert json.loads(proc.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "BLOCKED_GITHOOKS_PATCH" in proc.stderr
+
+    for bad_stdin in ("", "{corrupt", '["not-a-dict"]'):
+        bad_proc = subprocess.run(
+            [sys.executable, str(script), "--harness", "codex"],
+            input=bad_stdin,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert bad_proc.returncode == 2
+        bad_doc = json.loads(bad_proc.stdout)
+        assert bad_doc["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert bad_proc.stderr.strip() != ""
+
+

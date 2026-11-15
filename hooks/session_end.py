@@ -9,11 +9,14 @@ from typing import Any
 
 sys.path[:0] = [r] if (r := str(Path(__file__).resolve().parent.parent)) not in sys.path else []
 from hooks import config, policy_engine, state_store  # noqa: E402
+from hooks.outcomes import close_outcome_windows, ledger_path_for  # noqa: E402
 from hooks.telemetry import warn  # noqa: E402
 
 def handle_session_end(payload: dict[str, Any], state_dir: str | None = None) -> dict[str, Any]:
     """Clear transient `pending_reads` markers and emit `session_end` transition event."""
     try:
+        sess_id = str(payload.get("session_id") or payload.get("conversation_id") or payload.get("conversationId") or "default")
+        close_outcome_windows(sess_id, force_all=True, ledger_path=ledger_path_for(state_dir))
         sdir = state_store.resolve_state_dir(payload, state_dir)
         if state_store.state_file_in(sdir).exists():
             cfg = config.load_runtime_config()

@@ -16,7 +16,7 @@ from typing import Any
 sys.path[:0] = [r] if (r := str(Path(__file__).resolve().parent.parent)) not in sys.path else []
 from hooks import config, file_io, harness_adapter, policy_engine, read_planner  # noqa: E402
 from hooks import session_lifecycle, state_store, telemetry  # noqa: E402
-from hooks.outcomes import ledger_path_for, record_direct_outcome  # noqa: E402
+from hooks.outcomes import dispatch_direct_outcome, ledger_path_for, record_direct_outcome  # noqa: E402
 from hooks.shell_output import classify_family, measure  # noqa: E402
 from hooks.telemetry import record_shell_output, record_telemetry_event, warn  # noqa: E402
 from policies.api import PolicyPostContext  # noqa: E402
@@ -214,8 +214,9 @@ def _apply_read_confirmation(
     )
     if not items:
         return
-    credits: list[tuple[str, int, int]] = []
+    credits: list[tuple[str, int, int, int, str | None]] = []
     outcomes_path = ledger_path_for(str(state_dir_path))
+    sess_id = str(payload.get("session_id") or payload.get("conversation_id") or payload.get("conversationId") or "default")
     cwd = raw.strip() if isinstance((raw := payload.get("cwd")), str) and raw.strip() else None
     is_batch, is_fail = eff_event == "PostToolBatch", eff_event == "PostToolUseFailure"
     with state_store.locked_state(state_dir_path) as txn:
@@ -253,16 +254,19 @@ def _apply_read_confirmation(
                 if pend.get("is_trim") and tier >= min_tier and not pend.get("credited"):
                     credited, pm_m = True, pend.get("model")
                     mod = pm_m if isinstance(pm_m, str) and pm_m not in ("", "unknown") else state_mod
-                    credits.append((mod, int(pend.get("req_bytes") or 0), int(pend.get("saved_bytes") or 0)))
+                    p_step = int(pend.get("step") or 0)
+                    p_cid = None if pend.get("synthetic_id") else (cid or None)
+                    credits.append((mod, int(pend.get("req_bytes") or 0), int(pend.get("saved_bytes") or 0), p_step, p_cid))
             if cid:
                 session_lifecycle.record_completed_read_id(entry, cid, tier, credited)
             txn.dirty = True
-    for mod, req_b, saved_b in credits:
+    for mod, req_b, saved_b, p_step, p_cid in credits:
         record_telemetry_event(harness, "ranges_trimmed", req_b, saved_b, stats_path=stats_path)
-        record_direct_outcome(harness, mod, "range_trim", "applied", outcomes_path)
+        dispatch_direct_outcome(record_direct_outcome, harness, mod, "range_trim", "applied", outcomes_path,
+                                session_id=sess_id, step_idx=p_step, call_id=p_cid)
 
-def _apply_mutation_invalidation(payload: dict[str, Any], sdir: Path) -> None:
-    if (tn := _tool_name(payload)) not in _MUTATION_TOOLS or not state_store.state_file_in(sdir).is_file():
+def _apply_mutation_invalidation(payload: dict[str, Any], sdir: Path, shadow_path: Path | None = None) -> None:
+    if (tn := _tool_name(payload)) not in _MUTATION_TOOLS:
         return
     cwd = raw.strip() if isinstance((raw := payload.get("cwd")), str) and raw.strip() else None
     targets = list(_candidate_paths_from_payload(payload, cwd))
@@ -271,10 +275,15 @@ def _apply_mutation_invalidation(payload: dict[str, Any], sdir: Path) -> None:
         targets.extend(harness_adapter.extract_apply_patch_paths(
             src if isinstance(src, (dict, str)) else "", cwd,
         ))
-    if targets:
+    if not targets:
+        return
+    if state_store.state_file_in(sdir).is_file():
         with state_store.locked_state(sdir) as txn:
             if session_lifecycle.invalidate_mutated_paths(txn.state, targets):
                 txn.dirty = True
+    if (shadow_path or telemetry.DEFAULT_SHADOW_PATH).is_file():
+        for t in targets:
+            telemetry.invalidate_shadow_ledger(raw_path=t, shadow_path=shadow_path)
 
 def _warn_hook_error(exc: BaseException, context: str) -> None:
     e_type = type(exc).__name__
@@ -294,7 +303,9 @@ def handle_post_tool_use(
         cfg = config.load_runtime_config()
         sdir = state_store.resolve_state_dir(payload, str(state_dir) if state_dir is not None else None)
         if ev == "PostToolUse":
-            _apply_mutation_invalidation(payload, sdir)
+            _apply_mutation_invalidation(
+                payload, sdir, telemetry.shadow_path_for(str(state_dir) if state_dir is not None else None),
+            )
         _apply_read_confirmation(harness, payload, sdir, cfg, sp, eff_event=ev)
         packs = cfg.get("policy_packs") or ()
         if ev != "PostToolBatch" and any(isinstance(p, dict) and p.get("enabled", True) for p in packs):

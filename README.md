@@ -1,8 +1,8 @@
-# Context-Guard (v4.3.0)
+# Context-Guard (v4.4.0)
 
-Zero-prompt policy host, silent range-trim, machine-artifact unwrapper, and multi-harness telemetry plugin for **Google Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex CLI/App** across **macOS, Linux, and Windows**.
+Zero-prompt policy host, verified Read Ledger v2 (`range_trim`), machine-artifact unwrapper, and multi-harness telemetry plugin for **Google Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex CLI/App** across **macOS, Linux, and Windows**.
 
-Combines voluntary `cg-outline <path>` structural AST outlining (`Python 3.9+` stdlib + optional `tree-sitter-language-pack`), silent `range_trim` overlap trimming, machine-artifact unwrapping, verified Policy API v1 packs, and cross-harness preamble attribution.
+Combines voluntary `cg-outline <path>` structural AST outlining (`Python 3.9+` stdlib + optional `tree-sitter-language-pack`), Read Ledger v2 overlap trimming, verified Policy API v1 packs, Outcomes Schema v4 attribution, and deterministic `--replay` / `--benchmark` evaluation.
 
 ---
 
@@ -11,9 +11,9 @@ Combines voluntary `cg-outline <path>` structural AST outlining (`Python 3.9+` s
 | Harness | Config File | Registered Hooks | Read Caps | Compaction Integration | Live Status UI |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Google Antigravity** | `hooks.json` | `PreInvocation`, `PreToolUse`, `PostToolUse` | `800` lines (`45 KB`) | `O(delta)` `PreInvocation` (`80`/`200` steps) | IDE Status Bar & Side Panel |
-| **Claude Code** | `~/.claude/settings.json` | `SessionStart`, `PreToolUse`, `PostToolUse`, `PreCompact`, `Stop` | `2,000` lines (`80 KB`) | Native `autoCompactWindow` + `PreCompact` | `statusLine` ANSI HUD |
-| **Cursor IDE** | `~/.cursor/hooks.json` | `sessionStart`, `preToolUse`, `postToolUse`, `preCompact`, `stop` | `2,000` lines (`80 KB`) | Native compaction + `preCompact` | IDE Status Bar & Side Panel |
-| **OpenAI Codex** | `~/.codex/hooks.json` & `config.toml` | `SessionStart`, `PreToolUse`, `PostToolUse`, `PreCompact`, `Stop` | `Bash` / `exec_command` | `model_auto_compact_token_limit` + `PreCompact` | CLI `cg_status.py` |
+| **Claude Code** | `~/.claude/settings.json` | `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PostToolBatch`, `PreCompact`, `SessionEnd`, `statusLine` | `2,000` lines (`80 KB`) | Native `autoCompactWindow` + `PreCompact` | `statusLine` ANSI HUD |
+| **Cursor IDE** | `~/.cursor/hooks.json` | `preToolUse`, `postToolUse`, `preCompact` | `2,000` lines (`80 KB`) | Native compaction + `preCompact` | IDE Status Bar & Side Panel |
+| **OpenAI Codex** | `~/.codex/hooks.json` & `config.toml` | `PreToolUse`, `PostToolUse`, `PreCompact` | `Bash` / `exec_command` | `model_auto_compact_token_limit` + `PreCompact` | CLI `cg_status.py` |
 
 ---
 
@@ -33,14 +33,17 @@ Source code and Markdown reads never block; `cg-outline <path>` handles on-deman
 
 ## Core Guard & Telemetry Layers
 
-### 1. Silent `range_trim` & Rewind-Resilient Cache
-- Tracks streaming 64 KB `SHA-256` hashes (`10 MB` stat fallback) and `[StartLine, EndLine]` spans in `.context_guard_state.json`.
-- Silently trims partially overlapping bounded reads via `overwrite` / `updatedInput` (`range_trim`) to uncovered lines; invalidates on edits (`edit_file`, `Edit`, `StrReplace`, `apply_patch`).
+### 1. Read Ledger v2 & Silent `range_trim`
+- Tracks streaming 64 KB `SHA-256` hashes (`10 MB` fallback), `[StartLine, EndLine]` spans, and `confirm_tier` (`0`/`1`/`2`) in `.context_guard_state.json` (`READ_LEDGER_SCHEMA = 2`).
+- **Product Asymmetry (`spec §7.5`):** Default `"read_confirm_policy": "strict"` trusts only `confirm_tier == 2` (Claude `PostToolBatch`, Cursor `tool_output`).
+- **Antigravity & Codex:** Default `"strict"` yields `0` `range_trim` savings there unless `"bounded"` is opted into.
+- **Shadow Mode:** `"shadow"` optimizer mode logs counterfactual savings to `0o600` `telemetry/shadow.json`, invalidated on edit, compaction, or rewind.
 
-### 2. Verified Policy API v1 & Two-Pass Execution (`policies/api.py`, `policies/loader.py`)
+### 2. Verified Policy API v1 & Security Boundaries (`policies/api.py`, `policies/loader.py`)
 - Normalizes tool and MCP calls across Antigravity (`mcp_<server>_<tool>`), Claude/Codex (`mcp__<server>__<tool>`), Cursor (`MCP:<tool>`), and `call_mcp_tool`.
-- Loads external security and optimization packs strictly from verified in-memory bytes (`file_hashes` + `tree_sha256` under trusted roots), enforcing Stage-2 scoped fail-closed fallbacks on config or pack errors.
-- Pass-2 security verification (`verify_security_policies_post_transform`) re-checks pack or optimizer rewrites before allowing execution.
+- Loads packs from verified in-memory bytes (`file_hashes` + `tree_sha256` under trusted roots), enforcing Stage-2 scoped fail-closed fallbacks and `verify_security_policies_post_transform`.
+- **Platform Fail-Closed:** Claude `>= 2.1.295` sets `"onFailure": "block"` (older falls back + warns); Cursor sets `"failClosed": true` (`NATIVE_FAIL_CLOSED_DRIFT`).
+- **Codex & Integrity Limits:** Antigravity exits `2`; Codex requires `[features].hooks = true` + trust (`openai/codex#27833`); `repo_map_path`/stdlib stay outside pack hashes.
 
 ### 3. Lossless Quiet CLI Rewrites (`PreToolUse`)
 
@@ -86,13 +89,14 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 | `hooks/outline.py` | Outliners | Structural AST/regex/tree-sitter code outliner across 21 file extensions (`<= 2 MB`). |
 | `hooks/markup_outliners.py` | Outliners | Outliners for `.phtml`, `.vue`, `.xml`, `.md`/`.mdx` headings, `.diff`/`.patch`, `.json`, `.yaml`. |
 | `hooks/json_outliners.py` | Outliners | Unwrappers/summarizers for wrapped MCP JSON envelopes, tabular rows, and `transcript*.jsonl`. |
-| `hooks/telemetry.py` | Telemetry | Atomic cumulative token savings ledger (`telemetry/stats.json`), slice-byte estimator, and daily rollup. |
-| `hooks/outcomes.py` | Telemetry | `O(1)` intervention outcome ledger (`outcomes.json` v3: follow-ups and bypasses) and delivered-line estimation. |
+| `hooks/telemetry.py` | Telemetry | Atomic cumulative savings ledger (`telemetry/stats.json`), slice-byte estimator, daily rollup, and `0o600` `telemetry/shadow.json`. |
+| `hooks/outcomes.py` | Telemetry | `O(1)` Outcomes Schema v4 ledger (`outcomes.json`, `step_ledger`, `unattributed_anon`) for recovery, regret, and evidence tiers. |
 | `hooks/shell_output.py` | Telemetry | Extracts shell stdout/stderr, classifies command families, and updates `stats.json`. |
 | `hooks/model_identity.py` | Telemetry | Resolves canonical model slugs (Antigravity transcript/sibling fallback, Claude, Codex) and harness `model_labels` overrides. |
-| `bin/cg_status.py` | CLI & UI | Status CLI (`--short`, `--claude-hud`, `--markdown`, `--json`, `--outcomes`, `--usage`, `--doctor`). |
+| `bin/cg_status.py` | CLI & UI | Status CLI (`--short`, `--claude-hud`, `--markdown`, `--json`, `--outcomes`, `--usage`, `--doctor`, `--replay`, `--benchmark`, `--public-json`). |
 | `bin/install_harnesses.py` | CLI & UI | Multi-harness hook & IDE extension installer (`--install`, `--uninstall`, `--status`, `--dry-run`, `--pack-source`). |
-| `bin/migration_guard.py` | CLI & UI | Staged pack transaction, rollback journal, and migration preflight safety checks (`--pack-source`). |
+| `bin/migration_guard.py` | CLI & UI | Staged pack transaction (`StagedPackTransaction`), rollback journal, and migration preflight checks (`--pack-source`). |
+| `bin/replay_benchmark.py` | CLI & UI | Deterministic trace `--replay`, `--benchmark` aggregator, `--public-json` exporter, and release hygiene/secret checks. |
 | `bin/codex_toml.py` | CLI & UI | Lexical TOML scanner for non-destructive `~/.codex/config.toml` sync. |
 | `bin/harness_status.py` | CLI & UI | Cycle-free status verifier and dynamic matcher merger across Claude Code, Cursor, and OpenAI Codex configs. |
 | `bin/outline.py` | CLI & UI | CLI wrapper around `hooks/outline.py` (`cg-outline`). |
@@ -102,13 +106,13 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 | `bin/transcript_parsers.py` | CLI & UI | Stateless record parsers and UTC day normalizer for Claude, Codex, Antigravity, and Cursor logs. |
 | `bin/preamble_attribution.py` | CLI & UI | Measures always-on instruction files, separates CLI/Desktop apps, and computes `sunset_verdict`. |
 | `bin/usage_report.py` | CLI & UI | Formats real token usage, cache read share, preamble breakdowns, and sunset advice. |
-| `bin/outcomes_report.py` | CLI & UI | Formats per-rule follow-up outcomes and estimated delivered cost insights (`--json`, `--rules`). |
-| `bin/tariffs.py` | CLI & UI | Loads bundled model token tariff tables and computes USD/saved cost estimates (`pricing_table.json`). |
+| `bin/outcomes_report.py` | CLI & UI | Formats Schema v4 follow-up outcomes and `"Estimated Cost Impact (non-counterfactual)"` (`1/k` step-weighted, budget-capped). |
+| `bin/tariffs.py` | CLI & UI | Bundled model token tariff tables (`TARIFF_EFFECTIVE_DATE`) for non-counterfactual associated cost estimates. |
 | `vscode-extension/extension.js` | IDE Extension | Status bar pill, 4s pulse, report panel, `update.lock` backoff, and one-click updater. |
 | `vscode-extension/view_model.js` | IDE Extension | Pure telemetry normalization, v4.x insights summarization, SemVer validation, and CSP. |
-| `vscode-extension/updater.js` | IDE Extension | Self-update runner, `plugin_root.json` resolver, and harness `probeDoctor`. |
+| `vscode-extension/updater.js` | IDE Extension | Self-update runner with dirty precheck, safe `git reset --keep` rollback, `plugin_root.json` resolver, and `probeDoctor`. |
 | `vscode-extension/renderers.js` | IDE Extension | Escaped tooltip Markdown, sidebar SVG donut HTML, and dashboard report views. |
-| `vscode-extension/cost_insights.js` | IDE Extension | Summarizes and formats cost savings and model attribution insights for extension views. |
+| `vscode-extension/cost_insights.js` | IDE Extension | Summarizes and formats bounded non-counterfactual cost estimates and model attribution insights for extension views. |
 
 ---
 
@@ -117,11 +121,11 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 Context-Guard runs from wherever you clone it: the installer points every harness hook at that checkout. Pick any directory; `~/.gemini` is needed only if you use Antigravity.
 
 ```bash
-# 1. Clone anywhere (or unpack dist/context-guard-v4.3.0.zip there)
+# 1. Clone anywhere (or unpack dist/context-guard-v4.4.0.zip there)
 CG_DIR=~/tools/context-guard
 git clone https://github.com/dpopek/context-guard.git "$CG_DIR"
 
-# 2. Install hooks (Claude Code, Codex, Cursor, Antigravity) & advox.context-guard-statusbar-4.3.0 extension
+# 2. Install hooks (Claude Code, Codex, Cursor, Antigravity) & advox.context-guard-statusbar-4.4.0 extension
 python3 "$CG_DIR/bin/install_harnesses.py" --install
 
 # Check status, preview dry-run, stage verified policy packs, or uninstall cleanly
@@ -131,6 +135,7 @@ python3 "$CG_DIR/bin/install_harnesses.py" --install --pack-source /path/to/poli
 python3 "$CG_DIR/bin/install_harnesses.py" --uninstall
 ```
 
+- **Two-phase `v4.3 -> v4.4` migration:** Stage via companion policy-pack `install_pack.py --stage` before upgrading, or run `install_harnesses.py --install --pack-source <dir>`.
 - **Antigravity users:** clone into Antigravity's plugin directory instead (`CG_DIR=~/.gemini/config/plugins/context-guard`) so Antigravity loads it as a plugin.
 - **Moving the checkout:** hooks store the checkout path, so re-run `--install` after moving or re-cloning it.
 - `CG_DIR` is only a shell variable for these commands; `CONTEXT_GUARD_HOME` overrides the checkout location at runtime for the installer and every hook.
@@ -147,6 +152,9 @@ python3 "$CG_DIR/bin/cg_status.py" --json
 python3 "$CG_DIR/bin/cg_status.py" --outcomes
 python3 "$CG_DIR/bin/cg_status.py" --usage
 python3 "$CG_DIR/bin/cg_status.py" --doctor
+python3 "$CG_DIR/bin/cg_status.py" --replay     # built-in isolated deterministic synthetic corpus
+python3 "$CG_DIR/bin/cg_status.py" --benchmark  # deterministic synthetic corpus benchmark
+python3 "$CG_DIR/bin/cg_status.py" --public-json
 python3 "$CG_DIR/bin/cg_status.py" --json \
   --stats-path /tmp/stats.json --outcomes-path /tmp/outcomes.json \
   --usage-path /tmp/token_usage.json --update-path /tmp/update.json
@@ -162,7 +170,7 @@ Optional per-user config (override via `CONTEXT_GUARD_CONFIG_PATH`). Absent = de
 | Key | Default | Description |
 | :--- | :--- | :--- |
 | `"read_confirm_policy"` | `"strict"` | Read confirmation mode (`"strict"` or `"bounded"`). |
-| `"optimizers"` | `{"range_trim": "active", "auto_outline": "active", "cli_rewrites": "auto", "output_spool": "off"}` | Optimizer modes (`active`/`shadow`/`off`; `cli_rewrites`: `auto`/`force`/`off`). |
+| `"optimizers"` | `{"range_trim": "active", "auto_outline": "active", "cli_rewrites": "auto", "output_spool": "off"}` | Optimizer modes (`active`/`shadow`/`off`; `cli_rewrites`: `auto`/`force`/`shadow`/`off`). |
 | `"integrations"` | `{"atlassian_twg": "off"}` | Opt-in external CLI/artifact integration adapters (`active` or `off`). |
 | `"regret_window_steps"` | `2` | Positive integer tracking follow-up regret attribution horizon across steps. |
 | `"policy_packs"` | `[]` | Verified Policy API v1 packs pinned by `file_hashes` + `tree_sha256` and declared `scopes`. |

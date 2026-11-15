@@ -560,3 +560,88 @@ def test_unquoted_text_handles_escaped_quotes_in_outline_and_cli_rewrites() -> N
     assert rewrite_quiet_cli_flags('pytest \\"a && echo hi" \\"') is None
     assert rewrite_quiet_cli_flags('grep -n "\\" -r \\"" src/main.py') is None
     assert rewrite_quiet_cli_flags('grep -rn "foo\\"bar" src/') is not None
+
+
+def test_rtk_three_tier_coexistence_and_cli_rewrites_shadow_parity(
+    isolated_user_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from hooks.shell_parser import command_uses_rtk
+
+    # command_uses_rtk detection across env assignments, wrappers, paths, and chained segments
+    assert command_uses_rtk("rtk git status") is True
+    assert command_uses_rtk("FOO=1 /usr/local/bin/rtk pytest") is True
+    assert command_uses_rtk("env -i VAR=x rtk cargo test") is True
+    assert command_uses_rtk("echo ok && /opt/bin/rtk git diff") is True
+    assert command_uses_rtk("command -v rtk") is False
+    assert command_uses_rtk("echo rtk && git status") is False
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    assert guard_config.scan_hooks_for_rtk(cwd=ws, home=isolated_user_env) is False
+    ws_hook = ws / ".claude" / "settings.local.json"
+    ws_hook.parent.mkdir(parents=True)
+    ws_hook.write_text(json.dumps({"hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": "/usr/local/bin/rtk proxy"}]}]}}), encoding="utf-8")
+    assert guard_config.scan_hooks_for_rtk(cwd=ws, home=isolated_user_env) is True
+
+    cfg_path = isolated_user_env / ".config" / "context-guard" / "config.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(json.dumps({"optimizers": {"cli_rewrites": "auto"}}), encoding="utf-8")
+    guard_config.clear_config_cache()
+    sd = str(tmp_path / "sd")
+
+    # Tier 1 ("auto"): yields when workspace hook runs RTK or command uses rtk
+    auto_hook_res = evaluate_hook(
+        {"session_id": "s-auto", "cwd": str(ws), "tool_name": "Bash", "tool_input": {"command": "git status"}, "permission_mode": "bypassPermissions"},
+        state_dir=sd,
+        cli_harness="claude",
+    )
+    assert auto_hook_res == {}
+
+    # Without RTK hook in cwd, command-level rtk yields while plain git status rewrites
+    ws_plain = tmp_path / "ws_plain"
+    ws_plain.mkdir()
+    assert evaluate_hook(
+        {"session_id": "s-auto", "cwd": str(ws_plain), "tool_name": "Bash", "tool_input": {"command": "FOO=1 rtk git status"}, "permission_mode": "bypassPermissions"},
+        state_dir=sd,
+        cli_harness="claude",
+    ) == {}
+    plain_rewritten = evaluate_hook(
+        {"session_id": "s-auto", "cwd": str(ws_plain), "tool_name": "Bash", "tool_input": {"command": "git status"}, "permission_mode": "bypassPermissions"},
+        state_dir=sd,
+        cli_harness="claude",
+    )
+    assert plain_rewritten["hookSpecificOutput"]["updatedInput"]["command"] == "git status -sb"
+
+    # Tier 2 ("force"): rewrites even with RTK hook present, unless segment itself invokes rtk
+    cfg_path.write_text(json.dumps({"optimizers": {"cli_rewrites": "force"}}), encoding="utf-8")
+    guard_config.clear_config_cache()
+    force_res = evaluate_hook(
+        {"session_id": "s-force", "cwd": str(ws), "tool_name": "Bash", "tool_input": {"command": "git status"}, "permission_mode": "bypassPermissions"},
+        state_dir=sd,
+        cli_harness="claude",
+    )
+    assert force_res["hookSpecificOutput"]["updatedInput"]["command"] == "git status -sb"
+    assert evaluate_hook(
+        {"session_id": "s-force", "cwd": str(ws), "tool_name": "Bash", "tool_input": {"command": "/usr/bin/rtk pytest"}, "permission_mode": "bypassPermissions"},
+        state_dir=sd,
+        cli_harness="claude",
+    ) == {}
+
+    # Tier 3 ("off" vs "shadow"): identical stdout/rc/telemetry (neither rewrites)
+    outs: dict[str, tuple[int, str, list[str]]] = {}
+    for mode in ("off", "shadow"):
+        cfg_path.write_text(json.dumps({"optimizers": {"cli_rewrites": mode}}), encoding="utf-8")
+        guard_config.clear_config_cache()
+        msd = tmp_path / f"sd_{mode}"
+        msd.mkdir()
+        monkeypatch.setenv("CONTEXT_GUARD_STATE_DIR", str(msd))
+        monkeypatch.setattr(
+            sys,
+            "stdin",
+            io.StringIO(json.dumps({"session_id": "s-par", "cwd": str(ws_plain), "tool_name": "Bash", "tool_input": {"command": "git status"}, "permission_mode": "bypassPermissions"})),
+        )
+        rc = pre_tool_use_main(["--harness", "claude"])
+        outs[mode] = (rc, capsys.readouterr().out, sorted(p.name for p in msd.iterdir()))
+    assert outs["shadow"] == outs["off"]
+    assert outs["shadow"][0] == 0 and json.loads(outs["shadow"][1]) == {} and outs["shadow"][2] == []
+

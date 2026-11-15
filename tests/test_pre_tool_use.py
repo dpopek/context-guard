@@ -365,3 +365,117 @@ def test_auto_step_seq_advances_and_prune_on_rewind_works(tmp_path: Path) -> Non
     state["files"][canon]["reads"].append([60, 80, 50, 2])
     assert prune_state_on_rewind(state, current_step=3, inclusive=True) is True
     assert all(int(r[2]) < 3 for r in state["files"][canon]["reads"])
+
+
+def _run_shadow_or_off_sequence(
+    isolated_user_env: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mode: str,
+) -> tuple[list[tuple[int, str]], Path]:
+    import tempfile
+    from hooks import outcomes, pre_tool_use, telemetry
+
+    src = tmp_path / "big_src.py"
+    if not src.exists():
+        src.write_text("".join(f"line_{i} = {i}\n" for i in range(1, 301)), encoding="utf-8")
+    mcp = tmp_path / ".system_generated" / "steps" / "11" / "output.txt"
+    if not mcp.exists():
+        mcp.parent.mkdir(parents=True)
+        mcp.write_text(json.dumps({"file_name": "big.py", "content": "\n".join(f"x_{i}={i}" for i in range(1500))}), encoding="utf-8")
+
+    cfg_path = isolated_user_env / ".config" / "context-guard" / "config.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(
+        json.dumps({"read_confirm_policy": "bounded", "optimizers": {"range_trim": mode, "auto_outline": mode, "cli_rewrites": mode}}),
+        encoding="utf-8",
+    )
+    clear_config_cache()
+    sd = tmp_path / f"state_{mode}"
+    sd.mkdir(parents=True, exist_ok=True)
+    sess_tmp = sd / "sess_tmp"
+    sess_tmp.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(sess_tmp))
+    monkeypatch.setattr(telemetry, "DEFAULT_TELEMETRY_PATH", sd / "telemetry_stats.json")
+    monkeypatch.setattr(pre_tool_use, "DEFAULT_SHADOW_PATH", sd / "shadow.json")
+    monkeypatch.setattr(telemetry, "DEFAULT_SHADOW_PATH", sd / "shadow.json")
+    monkeypatch.setattr(outcomes, "DEFAULT_OUTCOMES_PATH", sd / "outcomes.json")
+
+    calls = [
+        (["--harness", "claude"], {"session_id": "s-par", "tool_use_id": "c-1", "tool_name": "Read", "tool_input": {"file_path": str(src), "offset": 1, "limit": 80}}),
+        (["--harness", "claude"], {"session_id": "s-par", "tool_use_id": "c-2", "tool_name": "Read", "tool_input": {"file_path": str(src), "offset": 1, "limit": 160}}),
+        (["--harness", "antigravity"], {"conversationId": "s-par", "stepIdx": 3, "toolCall": {"name": "read_file", "callId": "c-3", "args": {"Path": str(mcp), "StartLine": 1, "EndLine": -1}}}),
+        (["--harness", "claude"], {"session_id": "s-par", "tool_use_id": "c-4", "tool_name": "Bash", "tool_input": {"command": "git status"}, "permission_mode": "bypassPermissions"}),
+    ]
+    results: list[tuple[int, str]] = []
+    for argv, payload in calls:
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+        rc = main(argv)
+        results.append((rc, capsys.readouterr().out))
+    return results, sd
+
+
+def test_shadow_mode_byte_parity_with_off_and_shadow_ledger_invalidation(
+    isolated_user_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from hooks.telemetry import load_shadow_ledger, pseudonymize_shadow_path, shadow_path_for
+
+    off_res, sd_off = _run_shadow_or_off_sequence(isolated_user_env, tmp_path, monkeypatch, capsys, "off")
+    sh_res, sd_sh = _run_shadow_or_off_sequence(isolated_user_env, tmp_path, monkeypatch, capsys, "shadow")
+    assert sh_res == off_res
+    sh_off, sh_path = shadow_path_for(sd_off), shadow_path_for(sd_sh)
+    assert sh_off is not None and not sh_off.exists()
+
+    for sub in ("sess_tmp/context-guard-s-par/.context_guard_state.json", "telemetry_stats.json", "outcomes.json"):
+        p_off, p_sh = sd_off / sub, sd_sh / sub
+        assert p_off.exists() == p_sh.exists()
+        if p_off.exists():
+            d_off, d_sh = json.loads(p_off.read_text(encoding="utf-8")), json.loads(p_sh.read_text(encoding="utf-8"))
+            d_off.pop("updated_at", None)
+            d_sh.pop("updated_at", None)
+            for doc in (d_off, d_sh):
+                for ent in (doc.get("files") or {}).values():
+                    for pend in (ent.get("pending_reads") or {}).values():
+                        pend.pop("ts", None)
+            assert d_off == d_sh
+    assert not list(sd_sh.rglob("unwrap*"))
+
+    assert sh_path is not None and sh_path.is_file()
+    if os.name != "nt":
+        assert (os.stat(sh_path).st_mode & 0o777) == 0o600
+    src_ph = pseudonymize_shadow_path(os.path.realpath(str(tmp_path / "big_src.py")))
+    ledger = load_shadow_ledger(sh_path)
+    par_reads = ledger["sessions"]["s-par"]["paths"][src_ph]["reads"]
+    assert any(r[3] == 2 for r in par_reads)
+
+    # Tier verification: antigravity=1, codex=0 (min_tier=1 filters codex reads list while path entry is tracked)
+    evaluate_hook({"conversationId": "s-ag", "stepIdx": 1, "toolCall": {"name": "read_file", "args": {"Path": str(tmp_path / "big_src.py"), "StartLine": 1, "EndLine": 80}}}, state_dir=str(sd_sh))
+    evaluate_hook({"conversationId": "s-ag", "stepIdx": 2, "toolCall": {"name": "read_file", "args": {"Path": str(tmp_path / "big_src.py"), "StartLine": 1, "EndLine": 160}}}, state_dir=str(sd_sh))
+    evaluate_hook({"session_id": "s-cx", "tool_name": "read_file", "tool_input": {"file_path": str(tmp_path / "big_src.py"), "offset": 1, "limit": 80}}, state_dir=str(sd_sh), cli_harness="codex")
+    evaluate_hook({"session_id": "s-cx", "tool_name": "read_file", "tool_input": {"file_path": str(tmp_path / "big_src.py"), "offset": 1, "limit": 160}}, state_dir=str(sd_sh), cli_harness="codex")
+    sessions = load_shadow_ledger(sh_path)["sessions"]
+    assert any(r[3] == 1 for r in sessions["s-ag"]["paths"][src_ph]["reads"])
+    assert sessions["s-cx"]["paths"][src_ph]["reads"] == []
+
+    # File mutation in pre_tool_use invalidates shadow records for that path
+    evaluate_hook({"session_id": "s-par", "tool_name": "Edit", "tool_input": {"file_path": str(tmp_path / "big_src.py")}}, state_dir=str(sd_sh), cli_harness="claude")
+    after_mut = load_shadow_ledger(sh_path)["sessions"]
+    assert src_ph not in after_mut["s-par"]["paths"]
+
+
+def test_legacy_security_keys_activate_fail_closed_exit_2_on_corrupt_stdin(
+    isolated_user_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg_path = isolated_user_env / ".config" / "context-guard" / "config.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(json.dumps({"restricted_bq_datasets": ["raw_sales"]}), encoding="utf-8")
+    clear_config_cache()
+    monkeypatch.setenv("CONTEXT_GUARD_STATE_DIR", str(tmp_path / "st"))
+    monkeypatch.setattr(sys, "stdin", io.StringIO("{corrupt-json"))
+    rc = main(["--harness", "claude"])
+    cap = capsys.readouterr()
+    assert rc == 2
+    assert json.loads(cap.out)["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert cap.err.strip() != ""
+

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -236,3 +236,38 @@ def check_status(
         name: bool(_inspect_harness_config(path)["registered"])
         for name, path in _resolve_harness_paths(claude_settings_path, cursor_hooks_path, codex_hooks_path)
     }
+
+
+def native_fail_closed_hook_extras(
+    runtime_cfg: Mapping[str, Any],
+    *,
+    claude_version: tuple[int, int, int] | None = None,
+    probe_claude_fn: Any = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Return `(claude_pre_extra, cursor_pre_extra)` when security policy enforcement is active."""
+    packs = runtime_cfg.get("policy_packs")
+    sec_active = bool(
+        runtime_cfg.get("config_error")
+        or runtime_cfg.get("legacy_security_keys")
+        or (
+            isinstance(packs, list)
+            and any(
+                isinstance(e, Mapping)
+                and e.get("enabled", True)
+                and str(e.get("kind") or "security") == "security"
+                for e in packs
+            )
+        )
+    )
+    if not sec_active:
+        return None, None
+    cursor_extra: dict[str, Any] = {"failClosed": True, "timeout": 10}
+    eff_ver = claude_version
+    if eff_ver is None and probe_claude_fn is not None:
+        eff_ver = probe_claude_fn()
+    claude_extra: dict[str, Any] | None = (
+        {"onFailure": "block", "timeout": 15}
+        if (eff_ver is not None and eff_ver >= (2, 1, 295))
+        else None
+    )
+    return claude_extra, cursor_extra

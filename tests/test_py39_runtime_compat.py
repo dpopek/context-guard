@@ -189,6 +189,9 @@ def test_system_python3_imports_all_hooks_and_bin_modules(tmp_path: Path) -> Non
             True,
         ),
         ("bin/cg_status.py", ["--short"], None, False),
+        ("bin/cg_status.py", ["--replay"], None, False),
+        ("bin/cg_status.py", ["--benchmark"], None, False),
+        ("bin/cg_status.py", ["--public-json"], None, False),
         ("bin/install_harnesses.py", ["--status"], None, False),
     ],
 )

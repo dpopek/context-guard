@@ -199,3 +199,42 @@ def test_codex_exec_command_is_classified_end_to_end(tmp_path: Path) -> None:
     families = load_telemetry_stats(stats)["shell_output"]["harnesses"]["codex"]
     assert families["git_diff"]["count"] == 1
     assert "other" not in families
+
+
+def test_post_tool_use_deferred_range_trim_outcomes_and_shadow_invalidation(tmp_path: Path) -> None:
+    import os
+    from hooks import outcomes, pre_tool_use, telemetry
+
+    src = tmp_path / "mod.py"
+    lines = [f"v_{i} = {i}" for i in range(1, 251)]
+    src.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    sd = tmp_path / "st"
+    sd.mkdir()
+
+    # Real tool_use_id via Claude PostToolBatch attributes deferred range_trim outcome to step_ledger
+    pre_tool_use.evaluate_hook({"session_id": "s1", "tool_use_id": "id-1", "tool_name": "Read", "tool_input": {"file_path": str(src), "offset": 1, "limit": 80}}, state_dir=str(sd), cli_harness="claude")
+    handle_post_tool_use("claude", {"session_id": "s1", "tool_calls": [{"tool_name": "Read", "tool_use_id": "id-1", "tool_input": {"file_path": str(src), "offset": 1, "limit": 80}, "tool_response": "\n".join(lines[:80])}]}, state_dir=str(sd), event_name="PostToolBatch")
+    pre_tool_use.evaluate_hook({"session_id": "s1", "tool_use_id": "id-trim", "tool_name": "Read", "tool_input": {"file_path": str(src), "offset": 1, "limit": 180}}, state_dir=str(sd), cli_harness="claude")
+    handle_post_tool_use("claude", {"session_id": "s1", "tool_calls": [{"tool_name": "Read", "tool_use_id": "id-trim", "tool_input": {"file_path": str(src), "offset": 81, "limit": 100}, "tool_response": "\n".join(lines[80:180])}]}, state_dir=str(sd), event_name="PostToolBatch")
+
+    out_doc = outcomes.load_outcomes(sd / "outcomes.json")
+    assert any(any(ev.get("event_id") == "id-trim:range_trim" for ev in evs) for evs in out_doc["step_ledger"].values())
+    assert out_doc["unattributed_anon"]["total"] == 0
+
+    # Synthetic call_id (missing tool_use_id) produces tier 0 / synthetic fallback -> unattributed_anon on Cursor single read
+    pre_tool_use.evaluate_hook({"session_id": "s2", "tool_name": "Read", "tool_input": {"file_path": str(src), "offset": 1, "limit": 80}}, state_dir=str(sd), cli_harness="cursor")
+    handle_post_tool_use("cursor", {"session_id": "s2", "tool_name": "Read", "tool_input": {"file_path": str(src), "offset": 1, "limit": 80}, "tool_output": "\n".join(lines[:80])}, state_dir=str(sd))
+
+    # PostToolUse Edit and Codex apply_patch invalidate shadow.json even in a fresh state_dir
+    sd_fresh = tmp_path / "st_fresh"
+    sd_fresh.mkdir()
+    sp = telemetry.shadow_path_for(sd_fresh)
+    assert sp is not None
+    canon = os.path.realpath(str(src))
+    telemetry.record_shadow_read("sx", canon, 1, 50, 1, 2, "sha1", shadow_path=sp)
+    handle_post_tool_use("claude", {"session_id": "sx", "tool_name": "Edit", "tool_input": {"file_path": str(src)}, "tool_response": "ok"}, state_dir=str(sd_fresh))
+    assert telemetry.load_shadow_ledger(sp)["sessions"].get("sx", {}).get("paths", {}) == {}
+
+    telemetry.record_shadow_read("sy", canon, 1, 50, 1, 0, "sha2", min_tier=0, shadow_path=sp)
+    handle_post_tool_use("codex", {"session_id": "sy", "tool_name": "apply_patch", "cwd": str(tmp_path), "tool_input": {"patch": f"*** Begin Patch\n*** Update File: {src.name}\n@@\n*** End Patch"}, "tool_response": "ok"}, state_dir=str(sd_fresh))
+    assert telemetry.load_shadow_ledger(sp)["sessions"].get("sy", {}).get("paths", {}) == {}

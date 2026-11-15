@@ -1,9 +1,9 @@
 {
   "name": "context-guard",
   "displayName": "Context-Guard",
-  "version": "4.3.0",
+  "version": "4.4.0",
   "license": "MIT",
-  "description": "Lightweight security guard and silent token-trim plugin for Antigravity, Claude Code, Cursor, and OpenAI Codex: silent overlap trimming, MCP/TWG/transcript outlining, Local-First GitLab & BigQuery Zero-Trust guards, governance protections, and preamble attribution.",
+  "description": "Zero-prompt Policy API v1 host and token-optimization plugin for Antigravity, Claude Code, Cursor, and Codex: verified Read Ledger v2 overlap trimming, MCP/transcript outlining, policy_packs, Outcomes Schema v4, shadow/replay evaluation, and preamble attribution.",
   "logo": "assets/logo.svg",
   "author": {
     "name": "Advox",

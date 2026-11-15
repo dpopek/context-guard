@@ -26,12 +26,21 @@ If Context-Guard is cloned outside `~/.gemini/config/plugins/context-guard`, run
    ```bash
    python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg_status.py" --outcomes
    ```
-   Review the v3 (`SCHEMA_VERSION = 3`) 7-column breakdown: `Interventions`, `Targeted follow-up` %, `Full bypass` %, and `Shell bypass` % per `Harness`, `Model`, and `Kind` (`outline`, `outline_pull`, `range_trim`, `cli_rewrite`; follow-up/bypass rates apply to `outline` and `outline_pull`, and bounded Codex CLI shell reads via `sed -n`, `head`, or `tail` `<= 250` lines resolve as `targeted_followup` rather than `shell_bypass`).
+   Review the v4 (`SCHEMA_VERSION = 4`) 10-column breakdown: `Harness`, `Model`, `Kind`, `Interventions`, `Targeted recovery`, `Full recovery`, `Suspected regret`, `Confirmed regret`, `Weighted steps`, and `Est. associated model cost` (bounded non-counterfactual `1/k` step-weighted attribution). Note regret/attribution telemetry fields (`confirmed_regret_rate`, `suspected_regret_rate`, `unattributed_anon`, `late_unattributed`), 30-day `sunset_verdict` (`net_saved`), and default `"strict"` `read_confirm_policy` asymmetry (`0` `range_trim` savings on Antigravity/Codex unless `"bounded"`).
 
-3. **Run Environment & Skill Hygiene Doctor:**
+3. **Run Environment & Security Doctor:**
    ```bash
    python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg_status.py" --doctor
    ```
    Verify:
    - Python runtime (`>= 3.9`), file locking (`flock`), writable telemetry directory, and harness registration (`antigravity`, `claude`, `cursor`, `codex`).
+   - Native fail-closed security sync (`NATIVE_FAIL_CLOSED_DRIFT`, `degraded Claude < 2.1.295`, and `Codex trust / #27833`).
    - **Skill hygiene:** Report any duplicate skill names detected within `.gemini` or `.claude` ecosystems.
+
+4. **Deterministic Replay, Benchmark & Public JSON (`replay_benchmark.py`):**
+   ```bash
+   python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg_status.py" --replay
+   python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg_status.py" --benchmark
+   python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg_status.py" --public-json
+   ```
+   Evaluate the built-in isolated deterministic synthetic corpus (`--replay`, `--benchmark`) without mutating live state, and export scrubbed OSS snapshots (`--public-json`).

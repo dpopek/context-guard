@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -232,6 +233,10 @@ def open_outcome_window(harness: str, model: str, kind: str, session_id: str, ta
 def close_outcome_windows(session_id: str, current_step: int | None = None, *, force_all: bool = False,
                           rewind_step: int | None = None, ledger_path: Path | None = None) -> None:
     """Close expired, compacted, rewound, or ended windows into none/none/observed."""
+    target = ledger_path or DEFAULT_OUTCOMES_PATH
+    if not target.is_file():
+        return
+
     def _close(st: dict[str, Any], _k: str) -> bool:
         exp = [wk for wk, w in st["open_windows"].items() if w.get("session_id") == session_id and (
             force_all or (current_step is not None and current_step >= int(w.get("expires_step", 0)))
@@ -240,3 +245,63 @@ def close_outcome_windows(session_id: str, current_step: int | None = None, *, f
             _apply_row_outcome(st, st["open_windows"].pop(wk)["key"], rec="none", reg="none", evi="observed")
         return bool(exp)
     record_direct_outcome("unknown", "unknown", "outline", ledger_path=ledger_path, count=0, _mut=_close)
+
+
+def consume_outcome_windows(session_id: str, target_paths: tuple[str, ...] | list[str] | str, *,
+                            kind: str | None = None, ledger_path: Path | None = None) -> None:
+    """Drop resolved open regret windows for `target_paths` so recovery.none is never double-counted."""
+    target = ledger_path or DEFAULT_OUTCOMES_PATH
+    if not target.is_file():
+        return
+    raw = (target_paths,) if isinstance(target_paths, str) else tuple(target_paths)
+    cands: set[str] = set()
+    for p in raw:
+        if isinstance(p, str) and p:
+            cands.add(p)
+            try:
+                cands.add(os.path.realpath(p))
+            except OSError:
+                pass
+    if not cands:
+        return
+
+    def _consume(st: dict[str, Any], _k: str) -> bool:
+        removed = False
+        for wk in list(st["open_windows"]):
+            w = st["open_windows"].get(wk)
+            if not isinstance(w, Mapping) or w.get("session_id") != session_id:
+                continue
+            parts = wk.split("|")
+            w_path = "|".join(parts[1:-1]) if len(parts) >= 3 else ""
+            w_kind = parts[-1] if len(parts) >= 3 else ""
+            if kind is not None and w_kind != kind:
+                continue
+            try:
+                w_real = os.path.realpath(w_path) if w_path else ""
+            except OSError:
+                w_real = w_path
+            if w_path in cands or w_real in cands:
+                st["open_windows"].pop(wk, None)
+                removed = True
+        return removed
+
+    record_direct_outcome("unknown", "unknown", kind or "outline", ledger_path=ledger_path, count=0, _mut=_consume)
+
+
+def dispatch_direct_outcome(
+    fn: Callable[..., Any],
+    harness: str, model: str, kind: str, outcome: str = "applied", ledger_path: Path | None = None,
+    *, increment_total: bool = True, count: int = 1, session_id: str | None = None,
+    step_idx: int | None = None, call_id: str | None = None,
+) -> None:
+    """Call `record_direct_outcome` (real or legacy-mocked) with Schema v4 attribution fallback."""
+    if fn is record_direct_outcome:
+        fn(harness, model, kind, outcome, ledger_path, increment_total=increment_total,
+           count=count, session_id=session_id, step_idx=step_idx, call_id=call_id)
+        return
+    try:
+        fn(harness, model, kind, outcome, ledger_path, increment_total=increment_total,
+           count=count, session_id=session_id, step_idx=step_idx, call_id=call_id)
+    except TypeError:
+        for _ in range(max(1, count)):
+            fn(harness, model, kind, outcome, ledger_path, increment_total=increment_total)

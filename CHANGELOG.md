@@ -5,6 +5,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 
 ## [Unreleased]
 
+## [4.4.0] - 2026-11-15
+
+### Added
+- **Policy API v1 (`policies/api.py`, `policies/loader.py`):** Zero-TOCTOU in-memory byte loader verifying `file_hashes` and `tree_sha256`.
+- **Transactional migration (`bin/migration_guard.py`):** Added `StagedPackTransaction`, rollback journal, and `--pack-source`.
+- **Read Ledger v2 (`READ_LEDGER_SCHEMA = 2`):** Three-tier `confirm_tier` checks via Claude `PostToolBatch` and Cursor `tool_output`.
+- **Outcomes Schema v4 (`hooks/outcomes.py`):** Added `step_ledger`, recovery/regret/evidence tiers, and `unattributed_anon` tracking.
+- **Shadow evaluation (`hooks/telemetry.py`):** Added `0o600` `telemetry/shadow.json` counterfactual log cleared on edit/compact/rewind.
+- **Cost & replay CLI (`bin/tariffs.py`, `bin/replay_benchmark.py`):** Added bounded cost insights, `--replay`, and `--benchmark`.
+- **Hygiene & doctor gates:** Added `NATIVE_FAIL_CLOSED_DRIFT` in `--doctor` plus OSS release hygiene and git-history secret scans.
+
+### Changed
+- **Default `"strict"` policy:** Restricts `range_trim` to `confirm_tier == 2` (`0` savings on Antigravity/Codex unless `"bounded"`).
+- **Pass-2 & native fail-closed:** Enforced 4-case Pass-2 security verification, Claude `onFailure: "block"`, and Cursor `failClosed: true`.
+- **Outcomes & cost reporting (`bin/outcomes_report.py`):** Conservative `v3 -> v4` migration and non-counterfactual `1/k` cost share.
+- **Safe IDE updater (`vscode-extension/updater.js`):** Added dirty-tree precheck and rollback via `git reset --keep`.
+
+### Removed
+- **Bundled workspace guards:** Moved workspace-specific guard logic into external Policy API v1 packs for a universal OSS core.
+
 ## [4.3.0] - 2026-11-14
 
 ### Added

@@ -23,7 +23,7 @@ fi
 
 # 2. If production code/hooks/rules change, require README.md (or CHANGELOG.md) update unless ALLOW_NO_DOC_UPDATE=1.
 if [[ "${ALLOW_NO_DOC_UPDATE:-0}" != "1" ]]; then
-  if echo "$STAGED" | grep -Eq '^(hooks/|bin/|vscode-extension/.*\.js|hooks\.json|rules/)'; then
+  if echo "$STAGED" | grep -Eq '^(hooks/|bin/|policies/|integrations/|vscode-extension/.*\.js|hooks\.json|rules/)'; then
     if ! echo "$STAGED" | grep -Eq '^(README\.md|vscode-extension/README\.md|CHANGELOG\.md)$'; then
       echo "[context-guard pre-commit] ERROR: Production changes require updating README.md / CHANGELOG.md (or set ALLOW_NO_DOC_UPDATE=1 for internal-only refactors)." >&2
       exit 1
@@ -37,6 +37,11 @@ if echo "$STAGED" | grep -Eq '^vscode-extension/.*\.js$' && command -v node >/de
 fi
 if command -v mypy >/dev/null 2>&1; then
   mypy hooks bin policies integrations tests
+fi
+if command -v python3 >/dev/null 2>&1; then
+  python3 -c "import sys; from bin.replay_benchmark import check_release_hygiene; issues = check_release_hygiene(); sys.exit('\n'.join(issues) if issues else 0)" || exit 1
+else
+  python -c "import sys; from bin.replay_benchmark import check_release_hygiene; issues = check_release_hygiene(); sys.exit('\n'.join(issues) if issues else 0)" || exit 1
 fi
 if command -v pytest >/dev/null 2>&1; then
   pytest -q tests/test_version_source.py tests/test_module_boundaries.py

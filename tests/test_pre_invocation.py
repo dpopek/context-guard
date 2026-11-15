@@ -549,3 +549,51 @@ def test_full_transcript_inode_change_resets_full_offset(
     assert scan_2.cursor is not None
     assert scan_2.last_cp_step == 9
     assert scan_2.cursor["full_inode"] == full_file.stat().st_ino
+
+
+def test_pre_invocation_pre_compact_and_session_end_invalidate_shadow_and_close_windows(
+    isolated_user_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hooks.config as cfg_mod
+    from hooks import outcomes, pre_compact, session_end, telemetry
+
+    sd = tmp_path / "st"
+    sd.mkdir()
+    sp, op = telemetry.shadow_path_for(sd), outcomes.ledger_path_for(str(sd))
+    assert sp is not None and op is not None
+    telemetry.record_shadow_read("s1", "/tmp/a.py", 1, 50, 2, 2, "sha1", shadow_path=sp)
+    telemetry.record_shadow_read("s1", "/tmp/b.py", 1, 60, 6, 2, "sha2", shadow_path=sp)
+    outcomes.open_outcome_window("claude", "m", "outline", "s1", "/tmp/a.py", step_idx=2, regret_window_steps=20, ledger_path=op)
+    outcomes.open_outcome_window("claude", "m", "outline", "s1", "/tmp/b.py", step_idx=6, regret_window_steps=20, ledger_path=op)
+
+    # Advance invocation high-water mark to step 6, then rewind to step 4 removing step 6 shadow entry
+    assert handle_pre_invocation({"conversationId": "s1", "initialNumSteps": 6}, state_dir=str(sd)) == {}
+    assert handle_pre_invocation({"conversationId": "s1", "initialNumSteps": 4}, state_dir=str(sd)) == {}
+    paths_s1 = telemetry.load_shadow_ledger(sp)["sessions"].get("s1", {}).get("paths", {})
+    assert any(r[2] == 2 for v in paths_s1.values() for r in v.get("reads", []))
+    assert all(int(r[2]) < 4 for v in paths_s1.values() for r in v.get("reads", []))
+
+    # Pre-compact clears all shadow records and closes open outcome windows
+    assert pre_compact.handle_pre_compact({"session_id": "s1"}, state_dir=str(sd)) == {}
+    paths_after = telemetry.load_shadow_ledger(sp)["sessions"].get("s1", {}).get("paths", {})
+    assert paths_after == {}
+    outcomes.open_outcome_window("claude", "m", "outline", "s1", "/tmp/c.py", step_idx=9, regret_window_steps=20, ledger_path=op)
+    assert session_end.handle_session_end({"session_id": "s1"}, state_dir=str(sd)) == {}
+    assert outcomes.load_outcomes(op)["open_windows"] == {}
+
+    # Non-spammy NATIVE_FAIL_CLOSED_DRIFT warning in handle_pre_invocation when security active & drift present
+    cursor_hooks = isolated_user_env / ".cursor" / "hooks.json"
+    cursor_hooks.parent.mkdir(parents=True)
+    cursor_hooks.write_text(json.dumps({"hooks": {"preToolUse": [{"command": "python3 pre_tool_use.py --harness cursor"}]}}), encoding="utf-8")
+    cfg_file = isolated_user_env / ".config" / "context-guard" / "config.json"
+    cfg_file.parent.mkdir(parents=True, exist_ok=True)
+    cfg_file.write_text(json.dumps({"restricted_bq_datasets": ["raw_sales"]}), encoding="utf-8")
+    cfg_mod.clear_config_cache()
+
+    sd2 = tmp_path / "st2"
+    sd2.mkdir()
+    r1 = handle_pre_invocation({"conversationId": "s-drift", "initialNumSteps": 1}, state_dir=str(sd2))
+    assert "injectSteps" in r1 and "NATIVE_FAIL_CLOSED_DRIFT" in r1["injectSteps"][0]["ephemeralMessage"]
+    r2 = handle_pre_invocation({"conversationId": "s-drift", "initialNumSteps": 2}, state_dir=str(sd2))
+    assert r2 == {}
+

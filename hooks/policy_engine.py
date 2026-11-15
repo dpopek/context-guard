@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 from hooks.config import resolve_user_config_path
 from hooks.harness_adapter import NormalizedToolCall
@@ -39,6 +39,7 @@ __all__ = [
     "load_verified_policy_pack",
     "normalize_pack_ns",
     "notify_session_transition",
+    "reconcile_post_transform",
     "run_post_tool_hooks",
     "run_pre_decision_hooks",
     "verify_policy_pack_tree",
@@ -216,17 +217,19 @@ def apply_overwrite_to_call(norm: NormalizedToolCall, overwrite: Mapping[str, An
     return _with_overwrite(norm, overwrite)
 
 
-def apply_policy_packs_with_records(
+def _run_policy_pass(
     norm: NormalizedToolCall, runtime_cfg: Mapping[str, Any], *,
     state_dir_path: Path | None = None, session_state_snapshot: Mapping[str, Any] | None = None, security_only: bool = False,
-) -> tuple[dict[str, Any] | None, list[tuple[PolicyPackManifest, PolicyContext, PolicyDecision | None]], NormalizedToolCall, dict[str, Any] | None]:
-    """Evaluate active policy packs with Stage-2 scoped fail-closed fallback and pure evaluate() records."""
+) -> tuple[dict[str, Any] | None, list[tuple[PolicyPackManifest, PolicyContext, PolicyDecision | None]], NormalizedToolCall, dict[str, Any] | None, bool]:
+    """Evaluate active policy packs, returning `(decision, records, norm, overwrite, is_security_error)`."""
     tool_scopes, cfg_err = infer_tool_scopes(norm), runtime_cfg.get("config_error")
     if isinstance(cfg_err, str) and cfg_err:
-        return ({"decision": "deny", "reason": f"CONTEXT-GUARD CONFIG ERROR (fail-closed): {cfg_err}"} if tool_scopes else None), [], norm, None
+        dec = {"decision": "deny", "reason": f"CONTEXT-GUARD CONFIG ERROR (fail-closed): {cfg_err}"} if tool_scopes else None
+        return dec, [], norm, None, bool(dec)
     packs = [p for p in (runtime_cfg.get("policy_packs") or []) if isinstance(p, Mapping) and p.get("enabled", True)]
     if tuple(runtime_cfg.get("legacy_security_keys") or ()) and not any(p.get("kind") == "security" for p in packs):
-        return ({"decision": "deny", "reason": "CONTEXT-GUARD UNMIGRATED SECURITY CONFIG (fail-closed): Run install_pack.py --stage."} if tool_scopes else None), [], norm, None
+        dec = {"decision": "deny", "reason": "CONTEXT-GUARD UNMIGRATED SECURITY CONFIG (fail-closed): Run install_pack.py --stage."} if tool_scopes else None
+        return dec, [], norm, None, bool(dec)
     if runtime_cfg.get("repo_map_path") and not packs:
         warn("repo_map_path configured without a loaded policy pack; failing open")
 
@@ -242,7 +245,7 @@ def apply_policy_packs_with_records(
             continue
         if pid in collisions or f"{PACK_MODULE_PREFIX}{re.sub(r'[^a-z0-9_]', '_', pid)}" in collisions:
             if kind == "security" and tool_scopes:
-                return {"decision": "deny", "reason": f"CONTEXT-GUARD PACK COLLISION (fail-closed): {pid}"}, eval_records, cur_norm, (cur_overwrite or None)
+                return {"decision": "deny", "reason": f"CONTEXT-GUARD PACK COLLISION (fail-closed): {pid}"}, eval_records, cur_norm, (cur_overwrite or None), True
             if kind != "security":
                 warn(f"optimization policy pack collision skipped: {pid}")
             continue
@@ -252,7 +255,7 @@ def apply_policy_packs_with_records(
             if kind == "security":
                 deny_dec = _scoped_fail_closed(cur_norm, entry, f"CONTEXT-GUARD SECURITY PACK ERROR (fail-closed): {exc}")
                 if deny_dec is not None:
-                    return deny_dec, eval_records, cur_norm, (cur_overwrite or None)
+                    return deny_dec, eval_records, cur_norm, (cur_overwrite or None), True
             else:
                 warn(f"optimization pack {pid!r} skipped: {exc}")
             continue
@@ -266,24 +269,36 @@ def apply_policy_packs_with_records(
             raw_command=str(cur_norm.canonical_args.get("CommandLine") or "") or None,
         )
         try:
-            dec = manifest.evaluate(ctx)
+            p_dec = manifest.evaluate(ctx)
         except Exception as exc:
             if kind == "security":
                 deny_dec = _scoped_fail_closed(cur_norm, entry, f"CONTEXT-GUARD POLICY EVALUATE ERROR (fail-closed): {type(exc).__name__}")
                 if deny_dec is not None:
-                    return deny_dec, eval_records, cur_norm, (cur_overwrite or None)
+                    return deny_dec, eval_records, cur_norm, (cur_overwrite or None), True
             else:
                 warn(f"optimization pack {pid!r} crashed: {type(exc).__name__}")
             continue
-        eval_records.append((manifest, ctx, dec))
-        if dec is not None and dec.decision == "deny":
-            return {"decision": "deny", "reason": dec.reason or f"Blocked by policy pack {pid}"}, eval_records, cur_norm, (cur_overwrite or None)
-        if dec is not None and isinstance(dec.overwrite, Mapping) and dec.overwrite:
+        eval_records.append((manifest, ctx, p_dec))
+        if p_dec is not None and p_dec.decision == "deny":
+            return {"decision": "deny", "reason": p_dec.reason or f"Blocked by policy pack {pid}"}, eval_records, cur_norm, (cur_overwrite or None), False
+        if p_dec is not None and isinstance(p_dec.overwrite, Mapping) and p_dec.overwrite:
             if security_only and kind == "security":
-                return {"decision": "deny", "reason": f"Disallowed overwrite proposed by security pack {pid} in Pass-2"}, eval_records, cur_norm, (cur_overwrite or None)
-            cur_overwrite.update(dict(dec.overwrite))
-            cur_norm = _with_overwrite(cur_norm, dec.overwrite)
-    return None, eval_records, cur_norm, (cur_overwrite or None)
+                return {"decision": "deny", "reason": f"Disallowed overwrite proposed by security pack {pid} in Pass-2"}, eval_records, cur_norm, (cur_overwrite or None), False
+            cur_overwrite.update(dict(p_dec.overwrite))
+            cur_norm = _with_overwrite(cur_norm, p_dec.overwrite)
+    return None, eval_records, cur_norm, (cur_overwrite or None), False
+
+
+def apply_policy_packs_with_records(
+    norm: NormalizedToolCall, runtime_cfg: Mapping[str, Any], *,
+    state_dir_path: Path | None = None, session_state_snapshot: Mapping[str, Any] | None = None, security_only: bool = False,
+) -> tuple[dict[str, Any] | None, list[tuple[PolicyPackManifest, PolicyContext, PolicyDecision | None]], NormalizedToolCall, dict[str, Any] | None]:
+    """Evaluate active policy packs with Stage-2 scoped fail-closed fallback and pure evaluate() records."""
+    dec, recs, out_norm, ow, _ = _run_policy_pass(
+        norm, runtime_cfg, state_dir_path=state_dir_path,
+        session_state_snapshot=session_state_snapshot, security_only=security_only,
+    )
+    return dec, recs, out_norm, ow
 
 
 def apply_policy_packs(
@@ -307,6 +322,42 @@ def verify_security_policies_post_transform(
         transformed_norm, runtime_cfg, state_dir_path=state_dir_path, session_state_snapshot=session_state_snapshot, security_only=True
     )
     return dec
+
+
+def reconcile_post_transform(
+    candidate_norm: NormalizedToolCall, runtime_cfg: Mapping[str, Any], *,
+    fallback_norm: NormalizedToolCall | None = None,
+    state_dir_path: Path | None = None, session_state_snapshot: Mapping[str, Any] | None = None,
+    verify_fn: Callable[..., dict[str, Any] | None] | None = None,
+) -> tuple[str, dict[str, Any] | None]:
+    """Run Pass-2 4-case resolution: `'allow'` candidate, `'discard'` to safe fallback, or `'deny'`."""
+    if verify_fn is not None:
+        p2_dec = verify_fn(
+            candidate_norm, runtime_cfg, state_dir_path=state_dir_path,
+            session_state_snapshot=session_state_snapshot,
+        )
+        if p2_dec is None:
+            return "allow", None
+        if fallback_norm is None:
+            return "deny", p2_dec
+        fb_dec = verify_fn(
+            fallback_norm, runtime_cfg, state_dir_path=state_dir_path,
+            session_state_snapshot=session_state_snapshot,
+        )
+        return ("deny", fb_dec) if fb_dec is not None else ("discard", None)
+    p2_dec, _, _, _, sec_err = _run_policy_pass(
+        candidate_norm, runtime_cfg, state_dir_path=state_dir_path,
+        session_state_snapshot=session_state_snapshot, security_only=True,
+    )
+    if p2_dec is None:
+        return "allow", None
+    if sec_err or fallback_norm is None:
+        return "deny", p2_dec
+    fb_dec, _, _, _, _ = _run_policy_pass(
+        fallback_norm, runtime_cfg, state_dir_path=state_dir_path,
+        session_state_snapshot=session_state_snapshot, security_only=True,
+    )
+    return ("deny", fb_dec) if fb_dec is not None else ("discard", None)
 
 
 def run_pre_decision_hooks(

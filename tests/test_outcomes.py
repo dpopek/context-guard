@@ -651,3 +651,62 @@ def test_outcomes_unattributed_anon_archived_terminal_steps_and_open_windows(tmp
     assert win_row["regret"]["none"] == 1
     assert win_row["evidence"]["observed"] == 1
 
+
+def test_pre_tool_use_attribution_and_window_consumption_no_double_count(tmp_path: Path) -> None:
+    sd = tmp_path / "state"
+    sd.mkdir()
+    canon_a = os.path.realpath(str(tmp_path / "a.py"))
+    (tmp_path / "a.py").write_text("".join(f"x_{i} = {i}\n" for i in range(400)), encoding="utf-8")
+
+    # Synthetic callId -> unattributed_anon; explicit callId -> step_ledger
+    ptu.evaluate_hook(
+        {"conversationId": "s-attr", "stepIdx": 1, "toolCall": {"name": "run_command", "args": {"CommandLine": "git status"}}},
+        state_dir=str(sd),
+    )
+    doc1 = read_outcomes_ledger(sd)
+    assert doc1["unattributed_anon"]["total"] == 1 and doc1["step_ledger"] == {}
+
+    ptu.evaluate_hook(
+        {"conversationId": "s-attr", "stepIdx": 2, "toolCall": {"name": "run_command", "callId": "ag-real-2", "args": {"CommandLine": "git status"}}},
+        state_dir=str(sd),
+    )
+    doc2 = read_outcomes_ledger(sd)
+    assert "s-attr:2" in doc2["step_ledger"] and doc2["unattributed_anon"]["total"] == 1
+
+    # Consumed open window does not double-count recovery.none when steps advance past regret_window_steps
+    mcp_dir = tmp_path / ".system_generated" / "steps" / "1"
+    mcp_dir.mkdir(parents=True)
+    mcp = mcp_dir / "output.txt"
+    mcp.write_text(json.dumps({"file_name": "big.py", "content": "\n".join(f"v_{i}={i}" for i in range(1500))}), encoding="utf-8")
+    sd_w = tmp_path / "sd_win"
+    sd_w.mkdir()
+    ptu.evaluate_hook(
+        {"conversationId": "s-w", "stepIdx": 1, "toolCall": {"name": "read_file", "callId": "o1", "args": {"Path": str(mcp), "StartLine": 1, "EndLine": -1}}},
+        state_dir=str(sd_w),
+    )
+    # Bounded followup on target resolves outline recovery.targeted and consumes the open window
+    ptu.evaluate_hook(
+        {"conversationId": "s-w", "stepIdx": 2, "toolCall": {"name": "read_file", "callId": "r2", "args": {"Path": str(mcp), "StartLine": 1, "EndLine": 40}}},
+        state_dir=str(sd_w),
+    )
+    # Advance stepIdx well beyond default regret_window_steps=2; window was consumed -> recovery.none stays 0!
+    ptu.evaluate_hook(
+        {"conversationId": "s-w", "stepIdx": 15, "toolCall": {"name": "run_command", "callId": "c15", "args": {"CommandLine": "echo done"}}},
+        state_dir=str(sd_w),
+    )
+    row = read_outcomes_ledger(sd_w)["by_key"]["antigravity|unknown|outline"]
+    assert row["recovery"]["targeted"] == 1 and row["recovery"]["none"] == 0
+
+    # Unfollowed outline_pull open window closes cleanly to recovery.none once step advances
+    ptu.evaluate_hook(
+        {"conversationId": "s-u", "stepIdx": 1, "toolCall": {"name": "run_command", "callId": "p1", "args": {"CommandLine": f"cg-outline {canon_a}"}}},
+        state_dir=str(sd_w),
+    )
+    ptu.evaluate_hook(
+        {"conversationId": "s-u", "stepIdx": 10, "toolCall": {"name": "run_command", "callId": "p10", "args": {"CommandLine": "echo next"}}},
+        state_dir=str(sd_w),
+    )
+    row_pull = read_outcomes_ledger(sd_w)["by_key"]["antigravity|unknown|outline_pull"]
+    assert row_pull["recovery"]["none"] == 1 and row_pull["regret"]["none"] == 1
+
+

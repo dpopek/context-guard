@@ -14,28 +14,24 @@ sys.path[:0] = [r] if (r := str(Path(__file__).resolve().parent.parent)) not in 
 
 from hooks import config, model_identity  # noqa: E402
 from hooks.file_io import compute_file_sha256, count_file_lines_streaming  # noqa: E402
-from hooks.outcomes import ledger_path_for, record_direct_outcome  # noqa: E402
-from hooks.telemetry import record_file_read_outcome, record_telemetry_count  # noqa: E402
-from hooks.harness_adapter import (  # noqa: E402
-    NormalizedToolCall, can_rewrite_shell_command, detect_harness, format_pre_tool_output,
-    normalize_line_bounds, normalize_pre_tool_payload,
-)
-from hooks.policy_engine import (  # noqa: E402
-    apply_overwrite_to_call, apply_policy_packs_with_records, run_pre_decision_hooks,
-    verify_security_policies_post_transform,
-)
-from hooks.read_planner import (  # noqa: E402
-    FOLLOWUP_TARGETED_MAX_LINES, commit_planned_file_read, plan_file_read_verdict,
-)
+from hooks.outcomes import (close_outcome_windows, consume_outcome_windows, dispatch_direct_outcome,  # noqa: E402
+                            ledger_path_for, open_outcome_window, record_direct_outcome)
+from hooks.telemetry import (DEFAULT_SHADOW_PATH, invalidate_shadow_ledger, record_file_read_outcome,  # noqa: E402
+                             record_shadow_read, record_telemetry_count, shadow_path_for)
+from hooks.harness_adapter import (NormalizedToolCall, can_rewrite_shell_command, detect_harness,  # noqa: E402
+                                   format_pre_tool_output, normalize_line_bounds, normalize_pre_tool_payload)
+from hooks.policy_engine import (apply_overwrite_to_call, apply_policy_packs_with_records,  # noqa: E402
+                                 reconcile_post_transform, run_pre_decision_hooks,
+                                 verify_security_policies_post_transform)
+from hooks.read_planner import FOLLOWUP_TARGETED_MAX_LINES, commit_planned_file_read, plan_file_read_verdict  # noqa: E402
 from hooks.session_lifecycle import invalidate_mutated_paths, prune_state_on_rewind  # noqa: E402
-from hooks.shell_parser import (  # noqa: E402
-    extract_outline_pull_targets, extract_shell_read_targets, is_bounded_shell_read,
-    is_outline_pull, rewrite_quiet_cli_flags,
-)
-from hooks.state_store import (  # noqa: E402
-    advance_session_step, emit_json_and_sanitize_stdio, locked_state, resolve_state_dir,
-    run_telemetry_safely, state_file_in, warn,
-)
+from hooks.shell_parser import (command_uses_rtk, extract_outline_pull_targets, extract_shell_read_targets,  # noqa: E402
+                                is_bounded_shell_read, is_outline_pull, rewrite_quiet_cli_flags)
+from hooks.state_store import (advance_session_step, emit_json_and_sanitize_stdio, locked_state,  # noqa: E402
+                               resolve_state_dir, run_telemetry_safely, state_file_in, warn)
+
+_ORIG_VERIFY_P2 = verify_security_policies_post_transform
+_SHADOW_TIERS: dict[str, int] = {"claude": 2, "cursor": 2, "antigravity": 1, "codex": 0}
 
 STATIC_POLICY_INTERNAL_DENY_REASON = (
     "CONTEXT-GUARD POLICY ENGINE INTERNAL ERROR (fail-closed): "
@@ -50,14 +46,11 @@ def _static_harness_deny_output(harness: str, reason: str) -> dict[str, Any]:
     }}
 
 def _has_active_security(runtime_cfg: Mapping[str, Any]) -> bool:
-    if isinstance(runtime_cfg.get("config_error"), str) and runtime_cfg["config_error"]:
+    if (isinstance(runtime_cfg.get("config_error"), str) and runtime_cfg["config_error"]) or runtime_cfg.get("legacy_security_keys"):
         return True
     if not isinstance((packs := runtime_cfg.get("policy_packs")), list):
         return False
-    return any(
-        isinstance(e, Mapping) and e.get("enabled", True) and str(e.get("kind") or "security") == "security"
-        for e in packs
-    )
+    return any(isinstance(e, Mapping) and e.get("enabled", True) and str(e.get("kind") or "security") == "security" for e in packs)
 
 def _snapshot_session_state(state_dir_path: Path) -> dict[str, Any]:
     """Capture a consistent snapshot of session ledger state without creating new files."""
@@ -109,16 +102,22 @@ def _memoize_session_model(
         )
     return model
 
-def _handle_file_mutation(state_dir_path: Path, raw_paths: str | tuple[str, ...]) -> dict[str, Any]:
+def _handle_file_mutation(state_dir_path: Path, raw_paths: str | tuple[str, ...], shadow_path: Path | None = None) -> dict[str, Any]:
     targets = (raw_paths,) if isinstance(raw_paths, str) else raw_paths
     if targets:
         try:
             with locked_state(state_dir_path) as txn:
-                if invalidate_mutated_paths(txn.state, targets):
-                    txn.dirty = True
+                if invalidate_mutated_paths(txn.state, targets): txn.dirty = True
         except OSError:
             pass
+        if (shadow_path or DEFAULT_SHADOW_PATH).is_file():
+            run_telemetry_safely(lambda: [invalidate_shadow_ledger(raw_path=t, shadow_path=shadow_path) for t in targets], context="shadow_invalidate")
     return {"decision": "allow"}
+
+def _reconcile_p2(cand_norm: NormalizedToolCall, runtime_cfg: Mapping[str, Any], *,
+                  fallback_norm: NormalizedToolCall | None, state_dir_path: Path, snapshot: Mapping[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    vfn = None if verify_security_policies_post_transform is _ORIG_VERIFY_P2 else verify_security_policies_post_transform
+    return reconcile_post_transform(cand_norm, runtime_cfg, fallback_norm=fallback_norm, state_dir_path=state_dir_path, session_state_snapshot=snapshot, verify_fn=vfn)
 
 def _pop_followup(entry: dict[str, Any]) -> tuple[Any, Any]:
     return entry.pop("pending_followup_kind", None), entry.pop("outline_pull_step", None)
@@ -162,29 +161,36 @@ def evaluate_hook(
                 return format_pre_tool_output({"decision": "allow"}, orig_norm)
             return _format_deny_safely(block_dec, orig_norm, STATIC_POLICY_INTERNAL_DENY_REASON)
 
-        if pack_ow and verify_security_policies_post_transform(
-            norm, runtime_cfg, state_dir_path=state_dir_path, session_state_snapshot=snapshot,
-        ) is not None:
-            norm, pack_ow = orig_norm, None
+        if pack_ow:
+            sec_ow = any(m.kind == "security" and d is not None and isinstance(d.overwrite, Mapping) and d.overwrite for m, _c, d in eval_records)
+            st_p2, dec_p2 = _reconcile_p2(norm, runtime_cfg, fallback_norm=None if sec_ow else orig_norm, state_dir_path=state_dir_path, snapshot=snapshot)
+            if st_p2 == "deny":
+                run_pre_decision_hooks(eval_records)
+                return _format_deny_safely(dec_p2 or {}, orig_norm, STATIC_POLICY_INTERNAL_DENY_REASON)
+            if st_p2 == "discard":
+                norm, pack_ow = orig_norm, None
 
         tool_name, args, step_idx = norm.canonical_tool, norm.canonical_args, norm.step_idx
         stats_path = (Path(state_dir) / "telemetry_stats.json") if state_dir else None
-        outcomes_path = ledger_path_for(state_dir)
+        outcomes_path, shadow_path = ledger_path_for(state_dir), shadow_path_for(state_dir)
+        eff_cid = None if norm.has_synthetic_call_id else (norm.call_id or None)
+        reg_win = int(runtime_cfg.get("regret_window_steps") or 2)
         tr_raw = payload.get("transcript_path") or payload.get("transcriptPath")
         transcript_path = tr_raw if isinstance(tr_raw, str) else None
-        allow_dec: dict[str, Any] = (
-            {"decision": "allow", "overwrite": pack_ow} if pack_ow else {"decision": "allow"}
-        )
+        allow_dec: dict[str, Any] = {"decision": "allow", "overwrite": pack_ow} if pack_ow else {"decision": "allow"}
+        _close_win = lambda s: (run_telemetry_safely(lambda: close_outcome_windows(norm.session_id, s, ledger_path=outcomes_path), context="close_windows") if s > 0 else None)
 
         if tool_name in ("edit_file", "write_file"):
             targets: tuple[str, ...] = tuple(norm.mutated_paths)
             if not targets:
                 rp = args.get("Path") or args.get("TargetFile") or args.get("AbsolutePath")
                 targets = (rp.strip(),) if isinstance(rp, str) and rp.strip() else ()
+            cur_s = step_idx
             if targets:
-                _handle_file_mutation(state_dir_path, targets)
+                _handle_file_mutation(state_dir_path, targets, shadow_path=shadow_path)
                 if norm.harness != "antigravity" and step_idx <= 0:
-                    advance_session_step(state_dir_path)
+                    cur_s = advance_session_step(state_dir_path)
+            _close_win(cur_s)
             run_pre_decision_hooks(eval_records)
             return format_pre_tool_output(allow_dec, norm)
 
@@ -195,68 +201,65 @@ def evaluate_hook(
                 return format_pre_tool_output(allow_dec, norm)
             path_arg_key = "AbsolutePath" if "AbsolutePath" in args and "Path" not in args else "Path"
             start_line, end_line, is_inv = normalize_line_bounds(
-                args.get("StartLine"), args.get("EndLine"),
-                has_start_key="StartLine" in args, has_end_key="EndLine" in args,
-            )
+                args.get("StartLine"), args.get("EndLine"), has_start_key="StartLine" in args, has_end_key="EndLine" in args)
             if is_inv:
                 run_pre_decision_hooks(eval_records)
                 return format_pre_tool_output(allow_dec, norm)
             off_raw = args.get("ByteOffset") or args.get("ContentOffset")
             byte_offset = int(off_raw) if isinstance(off_raw, int) and off_raw > 0 else 0
             opt_cfg = runtime_cfg.get("optimizers", {})
+            auto_mode, trim_mode = str(opt_cfg.get("auto_outline", "active")), str(opt_cfg.get("range_trim", "active"))
+            enable_twg = runtime_cfg.get("integrations", {}).get("atlassian_twg") == "active"
+            allow_auto_outline, can_trim = (auto_mode == "active"), (trim_mode == "active")
             min_tier = 1 if runtime_cfg.get("read_confirm_policy", "strict") == "bounded" else 2
             planned = plan_file_read_verdict(
-                state_dir_path=state_dir_path, raw_path=raw_path.strip(), start_line=start_line,
-                end_line=end_line, byte_offset=byte_offset, step_idx=step_idx,
-                allow_auto_outline=opt_cfg.get("auto_outline", "active") != "off",
-                path_arg_key=path_arg_key,
-                auto_increment_step=(norm.harness != "antigravity" and step_idx <= 0),
-                harness=norm.harness, read_tool=tool_name,
-                can_trim=opt_cfg.get("range_trim", "active") != "off",
-                call_id=norm.call_id, synthetic_id=norm.has_synthetic_call_id,
-                model=str(snapshot.get("model") or "unknown"), min_tier=min_tier,
-            )
+                state_dir_path=state_dir_path, raw_path=raw_path.strip(), start_line=start_line, end_line=end_line,
+                byte_offset=byte_offset, step_idx=step_idx, allow_auto_outline=allow_auto_outline, path_arg_key=path_arg_key,
+                auto_increment_step=(norm.harness != "antigravity" and step_idx <= 0), harness=norm.harness, read_tool=tool_name,
+                can_trim=can_trim, can_redirect_path=(allow_auto_outline or enable_twg), call_id=norm.call_id,
+                synthetic_id=norm.has_synthetic_call_id, model=str(snapshot.get("model") or "unknown"), min_tier=min_tier)
             ov_plan = planned.outcome.decision.get("overwrite")
-            p2_read_block = verify_security_policies_post_transform(
-                apply_overwrite_to_call(norm, ov_plan), runtime_cfg,
-                state_dir_path=state_dir_path, session_state_snapshot=snapshot,
-            ) if isinstance(ov_plan, dict) and ov_plan else None
-            if p2_read_block is not None:
-                orig_p2 = verify_security_policies_post_transform(
-                    norm, runtime_cfg, state_dir_path=state_dir_path, session_state_snapshot=snapshot,
-                )
-                if orig_p2 is not None:
-                    run_pre_decision_hooks(eval_records)
-                    return _format_deny_safely(orig_p2, norm, STATIC_POLICY_INTERNAL_DENY_REASON)
-                read_outcome, dec, kind = planned.outcome, {"decision": "allow"}, "none"
+            p2_act, p2_dec = (_reconcile_p2(apply_overwrite_to_call(norm, ov_plan), runtime_cfg, fallback_norm=norm, state_dir_path=state_dir_path, snapshot=snapshot)
+                              if isinstance(ov_plan, dict) and ov_plan else ("allow", None))
+            if p2_act == "deny":
+                run_pre_decision_hooks(eval_records)
+                return _format_deny_safely(p2_dec or {}, norm, STATIC_POLICY_INTERNAL_DENY_REASON)
+            if p2_act == "discard":
+                read_outcome, dec, kind = planned.outcome, dict(allow_dec), "none"
             else:
-                if (
-                    planned.outcome.intervention == "range_trim"
-                    and isinstance(planned.meta.get("pending"), dict)
-                ):
-                    eff = planned.outcome.effective_step_idx or step_idx
-                    planned.meta["pending"]["model"] = _memoize_session_model(
-                        state_dir_path, norm, transcript_path, eff,
-                    )
-                read_outcome = commit_planned_file_read(planned)
-                dec, kind = dict(read_outcome.decision), (read_outcome.intervention or "none")
+                if planned.outcome.intervention == "range_trim" and isinstance(planned.meta.get("pending"), dict):
+                    planned.meta["pending"]["model"] = _memoize_session_model(state_dir_path, norm, transcript_path, planned.outcome.effective_step_idx or step_idx)
+                try:
+                    read_outcome = commit_planned_file_read(planned)
+                    dec, kind = dict(read_outcome.decision), (read_outcome.intervention or "none")
+                except OSError as exc:
+                    err_t = type(exc).__name__
+                    run_telemetry_safely(lambda: warn(f"commit_planned_file_read fallback ({err_t})"), context="commit_read")
+                    read_outcome, dec, kind = planned.outcome, dict(allow_dec), "none"
             run_pre_decision_hooks(eval_records)
             output = format_pre_tool_output(dec, norm)
 
             def _record_read_telemetry() -> None:
                 if kind != "range_trim":
                     log_dec = dec if kind == "outline" else {"decision": "allow"}
-                    record_file_read_outcome(norm.harness, raw_path.strip(), start_line, end_line,
-                                             log_dec, kind, stats_path, byte_offset=byte_offset)
+                    record_file_read_outcome(norm.harness, raw_path.strip(), start_line, end_line, log_dec, kind, stats_path, byte_offset=byte_offset)
                 eff_step = read_outcome.effective_step_idx or step_idx
+                if trim_mode == "shadow" and kind != "outline" and byte_offset == 0 and isinstance((pend := planned.meta.get("pending")), dict):
+                    s_end = int(pend["delivered_end"]) if int(pend.get("delivered_end") or -1) > 0 else end_line
+                    record_shadow_read(norm.session_id, str(pend.get("canonical_target") or raw_path.strip()), int(pend.get("exec_start") or start_line),
+                                       s_end, eff_step, _SHADOW_TIERS.get(norm.harness, 0), str(pend.get("sha256") or ""), min_tier=min_tier, shadow_path=shadow_path)
                 if kind == "outline" or read_outcome.followup_resolution is not None:
                     mod = _memoize_session_model(state_dir_path, norm, transcript_path, eff_step)
                     if kind == "outline":
-                        record_direct_outcome(norm.harness, mod, "outline", "applied", outcomes_path)
+                        dispatch_direct_outcome(record_direct_outcome, norm.harness, mod, "outline", "applied", outcomes_path, session_id=norm.session_id, step_idx=eff_step, call_id=eff_cid)
+                        if planned.meta.get("pk_name") == "outline":
+                            open_outcome_window(norm.harness, mod, "outline", norm.session_id, planned.canon, eff_step, regret_window_steps=reg_win, ledger_path=outcomes_path)
                     if read_outcome.followup_resolution is not None:
                         p_kind, p_out = read_outcome.followup_resolution
-                        record_direct_outcome(norm.harness, mod, p_kind, p_out,
-                                              outcomes_path, increment_total=False)
+                        dispatch_direct_outcome(record_direct_outcome, norm.harness, mod, p_kind, p_out, outcomes_path, increment_total=False, session_id=norm.session_id, step_idx=eff_step, call_id=eff_cid)
+                        consume_outcome_windows(norm.session_id, (planned.canon, *planned.meta.get("peers", ())), kind=p_kind, ledger_path=outcomes_path)
+                if eff_step > 0:
+                    close_outcome_windows(norm.session_id, eff_step, ledger_path=outcomes_path)
 
             run_telemetry_safely(_record_read_telemetry, context="read_telemetry")
             return output
@@ -266,18 +269,13 @@ def evaluate_hook(
             if not isinstance(cmd_line, str) or not cmd_line.strip():
                 run_pre_decision_hooks(eval_records)
                 return format_pre_tool_output(allow_dec, norm)
-            auto_step = (
-                advance_session_step(state_dir_path)
-                if (norm.harness != "antigravity" and step_idx <= 0) else 0
-            )
+            auto_step = advance_session_step(state_dir_path) if (norm.harness != "antigravity" and step_idx <= 0) else 0
+            cur_cmd_step = step_idx if step_idx > 0 else auto_step
             raw_cwd = args.get("Cwd")
             cmd_cwd = norm.cwd or (raw_cwd.strip() if isinstance(raw_cwd, str) and raw_cwd.strip() else None)
             if is_outline_pull(cmd_line):
-                pull_targets = [
-                    (t, sha) for t in extract_outline_pull_targets(cmd_line, cmd_cwd)
-                    for sha in (compute_file_sha256(t),) if sha is not None
-                ]
-                pull_count = max(1, len(pull_targets))
+                pull_targets = [(t, sha) for t in extract_outline_pull_targets(cmd_line, cmd_cwd) for sha in (compute_file_sha256(t),) if sha is not None]
+                pull_count, pull_step = max(1, len(pull_targets)), [cur_cmd_step]
                 if pull_targets:
                     def _stamp_pull() -> None:
                         with locked_state(state_dir_path) as txn:
@@ -292,97 +290,93 @@ def evaluate_hook(
                                 txn.state["auto_step_seq"] = max(cur_seq, eff_step)
                             else:
                                 eff_step = cur_seq
+                            pull_step[0] = eff_step
                             if eff_step > int(txn.state.get("max_tool_step_idx") or 0):
                                 txn.state["max_tool_step_idx"] = eff_step
                             files_map = txn.state.setdefault("files", {})
                             for target, sha in pull_targets:
                                 re_ = files_map.get(target)
-                                ok_e = isinstance(re_, dict) and re_.get("sha256") == sha
-                                entry = dict(re_) if ok_e else {"sha256": sha, "reads": []}
-                                entry["pending_followup_kind"] = "outline_pull"
-                                entry["outline_pull_step"] = eff_step
+                                entry = dict(re_) if isinstance(re_, dict) and re_.get("sha256") == sha else {"sha256": sha, "reads": []}
+                                entry["pending_followup_kind"], entry["outline_pull_step"] = "outline_pull", eff_step
                                 files_map[target] = entry
                             txn.dirty = True
                     run_telemetry_safely(_stamp_pull, context="stamp_outline_pull")
 
                 def _record_pull() -> None:
                     record_telemetry_count(norm.harness, "outline_pulls", stats_path)
-                    mod = _memoize_session_model(state_dir_path, norm, transcript_path, step_idx)
-                    kw: dict[str, Any] = {"count": pull_count} if pull_count > 1 else {}
-                    record_direct_outcome(norm.harness, mod, "outline_pull", "applied", outcomes_path, **kw)
-
+                    mod = _memoize_session_model(state_dir_path, norm, transcript_path, pull_step[0])
+                    dispatch_direct_outcome(record_direct_outcome, norm.harness, mod, "outline_pull", "applied", outcomes_path, count=pull_count, session_id=norm.session_id, step_idx=pull_step[0], call_id=eff_cid)
+                    for target, _ in pull_targets:
+                        open_outcome_window(norm.harness, mod, "outline_pull", norm.session_id, target, pull_step[0], regret_window_steps=reg_win, ledger_path=outcomes_path)
+                    if pull_step[0] > 0:
+                        close_outcome_windows(norm.session_id, pull_step[0], ledger_path=outcomes_path)
                 run_telemetry_safely(_record_pull, context="outline_pull")
             elif (shell_targets := extract_shell_read_targets(cmd_line, cmd_cwd)):
                 def _record_shell_followups() -> None:
-                    if not state_file_in(state_dir_path).is_file():
-                        return
-                    shell_shas = {t: compute_file_sha256(t) for t in shell_targets}
-                    resolved: list[tuple[str, str, int]] = []
-                    with locked_state(state_dir_path, create=False) as txn:
-                        prev_max = int(txn.state.get("max_tool_step_idx") or 0)
-                        rewound = step_idx > 0 and prev_max > 0 and step_idx < prev_max
-                        if rewound and prune_state_on_rewind(txn.state, step_idx, inclusive=True):
-                            txn.dirty = True
-                        if step_idx > int(txn.state.get("max_tool_step_idx") or 0):
-                            txn.state["max_tool_step_idx"], txn.dirty = step_idx, True
-                        if isinstance((files_map := txn.state.get("files")), dict):
-                            for target in shell_targets:
-                                if not isinstance((entry := files_map.get(target)), dict):
-                                    continue
-                                p_kind, p_step = _pop_followup(entry)
-                                kl = int(entry.get("outlined_total_lines") or 0)
-                                if p_kind is not None or p_step is not None:
-                                    txn.dirty = True
-                                for other in (entry.get("unwrapped_path"), entry.get("mirror_source")):
-                                    o_ent = files_map.get(other) if isinstance(other, str) else None
-                                    if isinstance(o_ent, dict):
-                                        op, ops = _pop_followup(o_ent)
-                                        kl = kl or int(o_ent.get("outlined_total_lines") or 0)
-                                        if op is not None or ops is not None:
-                                            txn.dirty = True
-                                            p_kind = op if p_kind is None else p_kind
-                                sha = shell_shas.get(target)
-                                sha_ok = not entry.get("sha256") or not sha or entry.get("sha256") == sha
-                                if p_kind in ("outline", "outline_pull") and sha_ok:
-                                    resolved.append((target, p_kind, kl))
-                    if resolved:
-                        mod = _memoize_session_model(state_dir_path, norm, transcript_path, step_idx)
-                        counts: dict[tuple[str, str], int] = {}
-                        for target, p_kind, kl in resolved:
-                            bounded = norm.harness == "codex" and is_bounded_shell_read(
-                                cmd_line, total_lines=(kl or count_file_lines_streaming(target)),
-                                max_lines=FOLLOWUP_TARGETED_MAX_LINES,
-                            )
-                            key = (p_kind, "targeted_followup" if bounded else "shell_bypass")
-                            counts[key] = counts.get(key, 0) + 1
-                        for (p_kind, out_name), cnt in counts.items():
-                            kw: dict[str, Any] = {"count": cnt} if cnt > 1 else {}
-                            record_direct_outcome(norm.harness, mod, p_kind, out_name,
-                                                  outcomes_path, increment_total=False, **kw)
+                    if state_file_in(state_dir_path).is_file():
+                        shell_shas, resolved = {t: compute_file_sha256(t) for t in shell_targets}, []
+                        with locked_state(state_dir_path, create=False) as txn:
+                            prev_max = int(txn.state.get("max_tool_step_idx") or 0)
+                            rewound = step_idx > 0 and prev_max > 0 and step_idx < prev_max
+                            if rewound and prune_state_on_rewind(txn.state, step_idx, inclusive=True): txn.dirty = True
+                            if step_idx > int(txn.state.get("max_tool_step_idx") or 0): txn.state["max_tool_step_idx"], txn.dirty = step_idx, True
+                            if isinstance((files_map := txn.state.get("files")), dict):
+                                for target in shell_targets:
+                                    if not isinstance((entry := files_map.get(target)), dict): continue
+                                    p_kind, p_step = _pop_followup(entry)
+                                    kl = int(entry.get("outlined_total_lines") or 0)
+                                    if p_kind is not None or p_step is not None: txn.dirty = True
+                                    for other in (entry.get("unwrapped_path"), entry.get("mirror_source")):
+                                        if isinstance((o_ent := files_map.get(other) if isinstance(other, str) else None), dict):
+                                            op, ops = _pop_followup(o_ent)
+                                            kl = kl or int(o_ent.get("outlined_total_lines") or 0)
+                                            if op is not None or ops is not None: txn.dirty, p_kind = True, (op if p_kind is None else p_kind)
+                                    sha = shell_shas.get(target)
+                                    if p_kind in ("outline", "outline_pull") and (not entry.get("sha256") or not sha or entry.get("sha256") == sha):
+                                        resolved.append((target, p_kind, kl))
+                        if rewound:
+                            if (shadow_path or DEFAULT_SHADOW_PATH).is_file():
+                                invalidate_shadow_ledger(session_id=norm.session_id, max_step=step_idx, inclusive_rewind=True, shadow_path=shadow_path)
+                            close_outcome_windows(norm.session_id, rewind_step=step_idx, ledger_path=outcomes_path)
+                        if resolved:
+                            mod = _memoize_session_model(state_dir_path, norm, transcript_path, cur_cmd_step)
+                            counts: dict[tuple[str, str], int] = {}
+                            by_kind: dict[str, list[str]] = {}
+                            for target, p_kind, kl in resolved:
+                                bounded = norm.harness == "codex" and is_bounded_shell_read(cmd_line, total_lines=(kl or count_file_lines_streaming(target)), max_lines=FOLLOWUP_TARGETED_MAX_LINES)
+                                key = (p_kind, "targeted_followup" if bounded else "shell_bypass")
+                                counts[key] = counts.get(key, 0) + 1
+                                by_kind.setdefault(p_kind, []).append(target)
+                            for (p_kind, out_name), cnt in counts.items():
+                                dispatch_direct_outcome(record_direct_outcome, norm.harness, mod, p_kind, out_name, outcomes_path, increment_total=False, session_id=norm.session_id, step_idx=cur_cmd_step, call_id=eff_cid, count=cnt)
+                            for p_kind, tgts in by_kind.items():
+                                consume_outcome_windows(norm.session_id, tgts, kind=p_kind, ledger_path=outcomes_path)
+                    if cur_cmd_step > 0:
+                        close_outcome_windows(norm.session_id, cur_cmd_step, ledger_path=outcomes_path)
                 run_telemetry_safely(_record_shell_followups, context="shell_bypass")
+            else:
+                _close_win(cur_cmd_step)
 
             enable_twg = runtime_cfg.get("integrations", {}).get("atlassian_twg") == "active"
             cli_mode = str(runtime_cfg.get("optimizers", {}).get("cli_rewrites", "auto"))
-            if cli_mode != "off" and can_rewrite_shell_command(norm):
+            rtk_yield = command_uses_rtk(cmd_line) or (cli_mode == "auto" and config.scan_hooks_for_rtk(cwd=cmd_cwd))
+            if cli_mode in ("auto", "force") and not rtk_yield and can_rewrite_shell_command(norm):
                 rewritten = rewrite_quiet_cli_flags(cmd_line, enable_atlassian_twg=enable_twg)
                 if rewritten is not None and rewritten != cmd_line:
                     cand_ow = {"CommandLine": rewritten}
-                    if verify_security_policies_post_transform(
-                        apply_overwrite_to_call(norm, cand_ow), runtime_cfg,
-                        state_dir_path=state_dir_path, session_state_snapshot=snapshot,
-                    ) is None:
+                    p2_act, p2_dec = _reconcile_p2(apply_overwrite_to_call(norm, cand_ow), runtime_cfg, fallback_norm=norm, state_dir_path=state_dir_path, snapshot=snapshot)
+                    if p2_act == "deny":
+                        run_pre_decision_hooks(eval_records)
+                        return _format_deny_safely(p2_dec or {}, norm, STATIC_POLICY_INTERNAL_DENY_REASON)
+                    if p2_act == "allow":
                         run_pre_decision_hooks(eval_records)
                         merged_ow = {**pack_ow, **cand_ow} if pack_ow else cand_ow
-                        output = format_pre_tool_output(
-                            {"decision": "allow", "overwrite": merged_ow}, norm,
-                        )
-
-                        def _record_rewrite() -> None:
+                        output = format_pre_tool_output({"decision": "allow", "overwrite": merged_ow}, norm)
+                        def _rec_cli() -> None:
                             record_telemetry_count(norm.harness, "cli_rewrites", stats_path)
-                            mod = _memoize_session_model(state_dir_path, norm, transcript_path, step_idx)
-                            record_direct_outcome(norm.harness, mod, "cli_rewrite", "applied", outcomes_path)
-
-                        run_telemetry_safely(_record_rewrite, context="cli_rewrites")
+                            dispatch_direct_outcome(record_direct_outcome, norm.harness, _memoize_session_model(state_dir_path, norm, transcript_path, cur_cmd_step),
+                                                    "cli_rewrite", "applied", outcomes_path, session_id=norm.session_id, step_idx=cur_cmd_step, call_id=eff_cid)
+                        run_telemetry_safely(_rec_cli, context="cli_rewrites")
                         return output
             run_pre_decision_hooks(eval_records)
             return format_pre_tool_output(allow_dec, norm)
@@ -396,31 +390,51 @@ def evaluate_hook(
             return _static_harness_deny_output(orig_norm.harness, STATIC_POLICY_INTERNAL_DENY_REASON)
         return {} if orig_norm.harness != "antigravity" else {"decision": "allow"}
 
+def _fail_closed_exit(harness_hint: str | None, msg: str) -> int:
+    run_telemetry_safely(lambda: warn(msg), context="main_fallback")
+    try:
+        sec = _has_active_security(config.load_runtime_config())
+    except Exception:
+        sec = True
+    if not sec:
+        return emit_json_and_sanitize_stdio(
+            {} if harness_hint in ("claude", "cursor", "codex") else {"decision": "allow"}
+        )
+    h = harness_hint if harness_hint in ("claude", "cursor", "codex") else "antigravity"
+    if h == "codex":
+        sys.stderr.write(f"{STATIC_POLICY_INTERNAL_DENY_REASON}\n")
+    emit_json_and_sanitize_stdio(_static_harness_deny_output(h, STATIC_POLICY_INTERNAL_DENY_REASON))
+    return 2
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint reading PreToolUse JSON from stdin and printing decision JSON to stdout."""
-    fallback, out_obj, harness_hint = {"decision": "allow"}, {"decision": "allow"}, None
+    harness_hint: str | None = None
     try:
         parser = argparse.ArgumentParser(add_help=False)
         parser.add_argument("--harness", default=None)
         cli_args, _ = parser.parse_known_args(argv)
         harness_hint = cli_args.harness
-        fallback = {} if harness_hint in ("claude", "cursor", "codex") else {"decision": "allow"}
-        out_obj = fallback
-        if (raw_in := sys.stdin.read()).strip() and isinstance((pl := json.loads(raw_in)), dict):
-            out_obj = evaluate_hook(pl, cli_harness=harness_hint)
-    except (Exception, SystemExit) as exc:
-        err_t = type(exc).__name__
-        run_telemetry_safely(lambda: warn(f"pre_tool_use main fallback ({err_t})"), context="main_fallback")
-        try:
-            sec_active = _has_active_security(config.load_runtime_config())
-        except Exception:
-            sec_active = True
-        if sec_active:
-            h = harness_hint if harness_hint in ("claude", "cursor", "codex") else "antigravity"
-            emit_json_and_sanitize_stdio(_static_harness_deny_output(h, STATIC_POLICY_INTERNAL_DENY_REASON))
+        if not (raw_in := sys.stdin.read()).strip():
+            return _fail_closed_exit(harness_hint, "pre_tool_use main fallback (empty stdin)")
+        if not isinstance((pl := json.loads(raw_in)), dict):
+            return _fail_closed_exit(harness_hint, "pre_tool_use main fallback (non-dict payload)")
+        out_obj = evaluate_hook(pl, cli_harness=harness_hint)
+        hso = out_obj.get("hookSpecificOutput") if isinstance(out_obj, Mapping) else None
+        if isinstance(hso, Mapping) and hso.get("permissionDecision") == "deny" and (
+            harness_hint == "codex" or detect_harness(pl, cli_harness=harness_hint) == "codex"
+        ):
+            sys.stderr.write(f"{hso.get('permissionDecisionReason') or STATIC_POLICY_INTERNAL_DENY_REASON}\n")
+            emit_json_and_sanitize_stdio(out_obj)
             return 2
-        out_obj = fallback
-    return emit_json_and_sanitize_stdio(out_obj)
+        return emit_json_and_sanitize_stdio(out_obj)
+    except (Exception, SystemExit) as exc:
+        return _fail_closed_exit(harness_hint, f"pre_tool_use main fallback ({type(exc).__name__})")
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except BaseException as exc:
+        sys.stderr.write(f"context-guard pre_tool_use fatal ({type(exc).__name__})\n")
+        raise SystemExit(2)

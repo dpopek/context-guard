@@ -38,11 +38,12 @@ from bin.harness_status import (  # noqa: E402
     check_status as check_harness_status,
     claude_post_hook_groups,
     merge_harness_matcher,
+    native_fail_closed_hook_extras,
     without_cg_handlers,
 )
 from bin.instruction_block import DEFAULT_INSTRUCTION_FILES, DEFAULT_SHIM_BIN_DIR, install_outline_pull, shim_installed, uninstall_outline_pull  # noqa: E402
 from bin.migration_guard import RollbackJournal, StagedPackTransaction, preflight_migration_check  # noqa: E402
-from hooks.config import cached_raw_config_status, clear_config_cache, load_runtime_config, resolve_user_config_path  # noqa: E402
+from hooks.config import cached_raw_config_status, clear_config_cache, load_runtime_config, probe_claude_cli_version, resolve_user_config_path  # noqa: E402
 from hooks.policy_engine import PolicyPackLoadError, load_verified_policy_pack  # noqa: E402
 from hooks.state_store import resolve_plugin_root, warn  # noqa: E402
 from policies.api import InstallerHookSpec  # noqa: E402
@@ -212,6 +213,7 @@ def _update_nested_hooks_json(
     post_events: tuple[str, ...] = (),
     post_matcher: str | None = None,
     post_handler_extra: dict[str, Any] | None = None,
+    pre_handler_extra: dict[str, Any] | None = None,
     post_groups: Sequence[dict[str, Any]] | None = None,
     unmatchered_events: Sequence[tuple[str, str]] = (),
     extra_hooks: Sequence[InstallerHookSpec] = (),
@@ -249,8 +251,11 @@ def _update_nested_hooks_json(
                 hooks_root.pop(evt_key, None)
 
     if pre_cmd is not None:
+        pre_handler: dict[str, Any] = {"type": "command", "command": pre_cmd}
+        if pre_handler_extra:
+            pre_handler.update(pre_handler_extra)
         hooks_root.setdefault("PreToolUse", []).append(
-            {"matcher": pre_matcher, "hooks": [{"type": "command", "command": pre_cmd}]}
+            {"matcher": pre_matcher, "hooks": [pre_handler]}
         )
     if compact_cmd is not None:
         hooks_root.setdefault("PreCompact", []).append(
@@ -309,6 +314,7 @@ def _update_cursor_hooks_json(
     managed_cmds: frozenset[str] = frozenset(),
     managed_frags: tuple[tuple[str, ...], ...] = (),
     managed_events: frozenset[str] = frozenset(),
+    pre_entry_extra: dict[str, Any] | None = None,
     journal: RollbackJournal | None = None,
 ) -> str:
     if not cfg_path.exists():
@@ -339,7 +345,10 @@ def _update_cursor_hooks_json(
                 hooks_root.pop(evt_key, None)
 
     if pre_cmd is not None:
-        hooks_root.setdefault("preToolUse", []).append({"command": pre_cmd, "matcher": pre_matcher})
+        pre_entry: dict[str, Any] = {"command": pre_cmd, "matcher": pre_matcher}
+        if pre_entry_extra:
+            pre_entry.update(pre_entry_extra)
+        hooks_root.setdefault("preToolUse", []).append(pre_entry)
     if compact_cmd is not None:
         hooks_root.setdefault("preCompact", []).append({"command": compact_cmd})
     if post_cmd is not None:
@@ -489,6 +498,7 @@ def install_all(
     instruction_files: Sequence[Path] | None = None,
     workspace_root: Path | None = None,
     pack_source: Path | None = None,
+    claude_version: tuple[int, int, int] | None = None,
 ) -> dict[str, str]:
     """Idempotently install Context-Guard hooks & status bars across Claude Code, Cursor, Antigravity, and Codex."""
     plugin_root = _active_plugin_root(plugin_root)
@@ -530,6 +540,11 @@ def install_all(
         cursor_matcher = merge_harness_matcher(CURSOR_MATCHER, pack_matchers.get("cursor", ()))
         codex_matcher = merge_harness_matcher(CODEX_MATCHER, pack_matchers.get("codex", ()), regex_anchored=True)
         claude_post_cmd = f"{py_cmd} {post_script} --harness claude"
+        claude_pre_extra, cursor_pre_extra = native_fail_closed_hook_extras(
+            load_runtime_config(),
+            claude_version=claude_version,
+            probe_claude_fn=(probe_claude_cli_version if claude_settings_path.exists() else None),
+        )
 
         claude_status, _ = _update_nested_hooks_json(
             claude_settings_path,
@@ -549,6 +564,7 @@ def install_all(
             managed_cmds=managed_cmds,
             managed_frags=managed_frags,
             managed_events=managed_events,
+            pre_handler_extra=claude_pre_extra,
             journal=journal if not dry_run else None,
         )
         cursor_status = _update_cursor_hooks_json(
@@ -562,6 +578,7 @@ def install_all(
             managed_cmds=managed_cmds,
             managed_frags=managed_frags,
             managed_events=managed_events,
+            pre_entry_extra=cursor_pre_extra,
             journal=journal if not dry_run else None,
         )
         codex_status, codex_data = _update_nested_hooks_json(

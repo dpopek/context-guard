@@ -396,3 +396,160 @@ def test_staged_tx_uses_resolved_default_config_path_under_isolated_env(isolated
     tx.commit()
     assert expected_cfg.is_file()
     assert (isolated_user_env / ".config" / "context-guard" / "policies" / "sample-security" / "pack.py").is_file()
+
+
+def test_integrated_pack_source_rolls_back_pack_dir_and_config_json_on_preflight_or_install_failure(
+    isolated_user_env: Path, tmp_path: Path
+) -> None:
+    from bin import install_harnesses
+    from hooks.config import clear_config_cache
+
+    claude_cfg = tmp_path / "claude" / "settings.json"
+    cursor_cfg = tmp_path / "cursor" / "hooks.json"
+    codex_cfg = tmp_path / "codex" / "hooks.json"
+    codex_toml = tmp_path / "codex" / "config.toml"
+    for p, txt in ((claude_cfg, "{}\n"), (cursor_cfg, "{}\n"), (codex_cfg, "{}\n"), (codex_toml, "")):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(txt, encoding="utf-8")
+
+    src_v1 = tmp_path / "pack-v1"
+    _make_pack(src_v1, extra_files={"ver.py": "VER = 'v1'\n"})
+    install_harnesses.install_all(
+        claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
+        codex_hooks_path=codex_cfg, codex_config_path=codex_toml, pack_source=src_v1,
+    )
+    clear_config_cache()
+    cfg_path = isolated_user_env / ".config" / "context-guard" / "config.json"
+    policies_dir = isolated_user_env / ".config" / "context-guard" / "policies"
+    live_ver = policies_dir / "sample-security" / "ver.py"
+    v1_cfg_text = cfg_path.read_text(encoding="utf-8")
+    v1_claude_text = claude_cfg.read_text(encoding="utf-8")
+    assert live_ver.read_text(encoding="utf-8") == "VER = 'v1'\n"
+
+    # Preflight failure during pack_source validation preserves v1 pack dir and config.json
+    bad_src = tmp_path / "pack-bad"
+    _make_pack(bad_src, broken_syntax=True)
+    with pytest.raises(PolicyPackLoadError):
+        install_harnesses.install_all(
+            claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
+            codex_hooks_path=codex_cfg, codex_config_path=codex_toml, pack_source=bad_src,
+        )
+    assert cfg_path.read_text(encoding="utf-8") == v1_cfg_text
+    assert live_ver.read_text(encoding="utf-8") == "VER = 'v1'\n"
+    assert list(policies_dir.glob(".staging-*")) == []
+
+    # Mid-install failure after StagedPackTransaction.activate rolls back pack dir, config.json, and harness files
+    src_v2 = tmp_path / "pack-v2"
+    _make_pack(src_v2, extra_files={"ver.py": "VER = 'v2'\n"})
+    cursor_cfg.write_text("{corrupt-json", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="harness installation error"):
+        install_harnesses.install_all(
+            claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
+            codex_hooks_path=codex_cfg, codex_config_path=codex_toml, pack_source=src_v2,
+        )
+    assert cfg_path.read_text(encoding="utf-8") == v1_cfg_text
+    assert live_ver.read_text(encoding="utf-8") == "VER = 'v1'\n"
+    assert claude_cfg.read_text(encoding="utf-8") == v1_claude_text
+    assert list(policies_dir.glob(".staging-*")) == []
+    assert list(policies_dir.glob(".backup-*")) == []
+
+
+def test_claude_2_1_295_registers_on_failure_block_older_falls_back_and_doctor_detects_security_drift(
+    isolated_user_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+    from bin import cg_status, install_harnesses
+    from hooks import config as hooks_config
+
+    claude_cfg = tmp_path / "claude" / "settings.json"
+    cursor_cfg = tmp_path / "cursor" / "hooks.json"
+    codex_cfg = tmp_path / "codex" / "hooks.json"
+    codex_toml = tmp_path / "codex" / "config.toml"
+    for p, txt in ((claude_cfg, "{}\n"), (cursor_cfg, "{}\n"), (codex_cfg, "{}\n"), (codex_toml, "")):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(txt, encoding="utf-8")
+
+    # Inactive security: neither onFailure nor failClosed written
+    hooks_config.clear_config_cache()
+    install_harnesses.install_all(
+        claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
+        codex_hooks_path=codex_cfg, codex_config_path=codex_toml, claude_version=(2, 1, 295),
+    )
+    cl_inact = json.loads(claude_cfg.read_text(encoding="utf-8"))["hooks"]["PreToolUse"][0]["hooks"][0]
+    cu_inact = json.loads(cursor_cfg.read_text(encoding="utf-8"))["hooks"]["preToolUse"][0]
+    assert "onFailure" not in cl_inact and "failClosed" not in cu_inact
+
+    # probe_claude_cli_version handles valid, invalid, timeout, and missing binary
+    class _Proc:
+        def __init__(self, rc: int, out: str) -> None:
+            self.returncode, self.stdout, self.stderr = rc, out, ""
+
+    assert hooks_config.probe_claude_cli_version(runner=lambda *_a, **_kw: _Proc(0, "2.1.295 (Claude Code)\n")) == (2, 1, 295)
+    assert hooks_config.probe_claude_cli_version(runner=lambda *_a, **_kw: _Proc(1, "2.1.295")) is None
+    assert hooks_config.probe_claude_cli_version(runner=lambda *_a, **_kw: (_ for _ in ()).throw(subprocess.TimeoutExpired("claude", 2))) is None
+    assert hooks_config.probe_claude_cli_version(runner=lambda *_a, **_kw: (_ for _ in ()).throw(FileNotFoundError("nope"))) is None
+
+    # Active security pack with Claude >= 2.1.295 writes onFailure=block & Cursor failClosed=True
+    sec_src = tmp_path / "sec-src"
+    _make_pack(sec_src)
+    install_harnesses.install_all(
+        claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
+        codex_hooks_path=codex_cfg, codex_config_path=codex_toml,
+        pack_source=sec_src, claude_version=(2, 1, 295),
+    )
+    hooks_config.clear_config_cache()
+    cl_295 = json.loads(claude_cfg.read_text(encoding="utf-8"))["hooks"]["PreToolUse"][0]["hooks"][0]
+    cu_295 = json.loads(cursor_cfg.read_text(encoding="utf-8"))["hooks"]["preToolUse"][0]
+    assert cl_295["onFailure"] == "block" and cl_295["timeout"] == 15
+    assert cu_295["failClosed"] is True and cu_295["timeout"] == 10
+    drift_ok = hooks_config.inspect_native_security_drift(
+        hooks_config.load_runtime_config(),
+        claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
+        codex_hooks_path=codex_cfg, codex_config_path=codex_toml, claude_version=(2, 1, 295),
+    )
+    assert drift_ok["ok"] is True and drift_ok["drift_codes"] == []
+    assert any("27833" in n for n in drift_ok["codex"]["notices"])
+
+    # Older Claude CLI (< 2.1.295) omits onFailure and sets degraded_older_cli without false drift
+    install_harnesses.install_all(
+        claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
+        codex_hooks_path=codex_cfg, codex_config_path=codex_toml, claude_version=(2, 1, 294),
+    )
+    cl_294 = json.loads(claude_cfg.read_text(encoding="utf-8"))["hooks"]["PreToolUse"][0]["hooks"][0]
+    assert "onFailure" not in cl_294
+    drift_old = hooks_config.inspect_native_security_drift(
+        hooks_config.load_runtime_config(),
+        claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
+        codex_hooks_path=codex_cfg, codex_config_path=codex_toml, claude_version=(2, 1, 294),
+    )
+    assert drift_old["ok"] is True and drift_old["claude"]["degraded_older_cli"] is True
+    monkeypatch.setattr(install_harnesses, "probe_claude_cli_version", lambda: (2, 1, 295))
+    install_harnesses.install_all(
+        claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
+        codex_hooks_path=codex_cfg, codex_config_path=codex_toml, claude_version=None,
+    )
+    assert json.loads(claude_cfg.read_text(encoding="utf-8"))["hooks"]["PreToolUse"][0]["hooks"][0]["onFailure"] == "block"
+    assert hooks_config.inspect_native_security_drift(
+        hooks_config.load_runtime_config(),
+        claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
+        codex_hooks_path=codex_cfg, codex_config_path=codex_toml, claude_version=None, probe_claude=False,
+    )["drift_codes"] == []
+
+    # Strip failClosed on Cursor -> doctor & inspect_native_security_drift report NATIVE_FAIL_CLOSED_DRIFT
+    cu_raw = json.loads(cursor_cfg.read_text(encoding="utf-8"))
+    cu_raw["hooks"]["preToolUse"][0].pop("failClosed", None)
+    cursor_cfg.write_text(json.dumps(cu_raw), encoding="utf-8")
+    drift_bad = hooks_config.inspect_native_security_drift(
+        hooks_config.load_runtime_config(),
+        claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
+        codex_hooks_path=codex_cfg, codex_config_path=codex_toml, claude_version=(2, 1, 295),
+    )
+    assert drift_bad["ok"] is False and "NATIVE_FAIL_CLOSED_DRIFT" in drift_bad["drift_codes"]
+    doc = cg_status.run_doctor(
+        claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg, codex_hooks_path=codex_cfg,
+    )
+    assert "security_drift" in doc and "NATIVE_FAIL_CLOSED_DRIFT" in doc["security_drift"]["drift_codes"]
+    assert doc["security_drift"]["ok"] is False
+    doc_md = cg_status.render_doctor_report(doc)
+    assert "Native security sync" in doc_md and "WARN" in doc_md
+    assert "NATIVE_FAIL_CLOSED_DRIFT" in doc_md

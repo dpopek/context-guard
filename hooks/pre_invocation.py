@@ -13,8 +13,9 @@ _PLUGIN_ROOT = str(Path(__file__).resolve().parent.parent)
 if _PLUGIN_ROOT not in sys.path:
     sys.path.insert(0, _PLUGIN_ROOT)
 
-from hooks.config import load_runtime_config
+from hooks.config import inspect_native_security_drift, load_runtime_config
 from hooks.json_outliners import ANTIGRAVITY_FULL_TRANSCRIPT_NAME
+from hooks.outcomes import close_outcome_windows, ledger_path_for
 from hooks.policy_engine import notify_session_transition
 from hooks.session_lifecycle import apply_compaction_boundary, prune_state_on_rewind
 from hooks.state_store import (
@@ -23,6 +24,7 @@ from hooks.state_store import (
     resolve_state_dir,
     warn,
 )
+from hooks.telemetry import DEFAULT_SHADOW_PATH, invalidate_shadow_ledger, shadow_path_for
 
 STEP_THRESHOLD = 80
 HARD_STEP_THRESHOLD = 200
@@ -181,12 +183,15 @@ def handle_pre_invocation(
 
     transcript_path = payload.get("transcriptPath")
     state_dir_path = resolve_state_dir(payload, state_dir)
+    sess_id = str(payload.get("session_id") or payload.get("conversationId") or payload.get("conversation_id") or "default")
+    sp, op = shadow_path_for(state_dir), ledger_path_for(state_dir)
 
     should_warn = False
     is_hard_stop = False
     is_subagent = False
     steps_since_cp = 0
     bytes_since_cp = 0
+    drift_notice: str | None = None
     try:
         with locked_state(state_dir_path) as txn:
             state = txn.state
@@ -199,6 +204,9 @@ def handle_pre_invocation(
             if is_rewind:
                 if prune_state_on_rewind(state, initial_steps, inclusive=True):
                     mutated = True
+                if (sp or DEFAULT_SHADOW_PATH).is_file():
+                    invalidate_shadow_ledger(session_id=sess_id, max_step=initial_steps, inclusive_rewind=True, shadow_path=sp)
+                close_outcome_windows(sess_id, rewind_step=initial_steps, ledger_path=op)
                 runtime_cfg = load_runtime_config()
                 before_rewind = copy.deepcopy(state)
                 notify_session_transition("rewind", state, runtime_cfg)
@@ -226,10 +234,23 @@ def handle_pre_invocation(
             prev_cp_step = int(state.get("last_checkpoint_step") or 0)
             if last_cp_step > prev_cp_step:
                 apply_compaction_boundary(state, checkpoint_step=last_cp_step)
+                if (sp or DEFAULT_SHADOW_PATH).is_file():
+                    invalidate_shadow_ledger(session_id=sess_id, checkpoint_step=last_cp_step, shadow_path=sp)
+                close_outcome_windows(sess_id, force_all=True, ledger_path=op)
                 if runtime_cfg is None:
                     runtime_cfg = load_runtime_config()
                 notify_session_transition("compact", state, runtime_cfg)
                 mutated = True
+
+            if not state.get("drift_warned"):
+                if runtime_cfg is None:
+                    runtime_cfg = load_runtime_config()
+                drift = inspect_native_security_drift(runtime_cfg, probe_claude=True)
+                if drift.get("security_active"):
+                    state["drift_warned"], mutated = True, True
+                    if "NATIVE_FAIL_CLOSED_DRIFT" in drift.get("drift_codes", ()):
+                        rem = drift.get("remediation") or "Re-run install_harnesses.py."
+                        drift_notice = f"CONTEXT-GUARD NATIVE_FAIL_CLOSED_DRIFT: {rem}"
 
             is_hard_stop = (
                 steps_since_cp >= HARD_STEP_THRESHOLD or bytes_since_cp >= HARD_BYTES_THRESHOLD
@@ -259,53 +280,35 @@ def handle_pre_invocation(
     except (OSError, ValueError, TypeError) as exc:
         warn(f"pre_invocation sensor skipped: {type(exc).__name__}: {exc}")
 
-    if not should_warn:
-        return {}
-
-    kb_since_cp = max(1, bytes_since_cp // 1024)
-    if is_subagent:
-        return {
-            "injectSteps": [
-                {
-                    "ephemeralMessage": (
-                        f"CONTEXT-GUARD SUBAGENT CONTEXT CEILING: Subagent trajectory has reached "
-                        f"{steps_since_cp} steps ({kb_since_cp} KB). Subagents cannot run `/compact`. "
-                        "Finish your current atomic step, synthesize your findings into a concise summary "
-                        "(<40 lines), and immediately return your response to the parent agent via `send_message`."
-                    )
-                }
-            ]
-        }
-
-    if is_hard_stop:
-        return {
-            "injectSteps": [
-                {
-                    "ephemeralMessage": (
-                        f"CONTEXT-GUARD AUTO-COMPACT HARD STOP: Active context since last checkpoint "
-                        f"has reached {steps_since_cp} steps ({kb_since_cp} KB), exceeding the hard ceiling "
-                        f"({HARD_STEP_THRESHOLD} steps / {HARD_BYTES_THRESHOLD // 1024} KB). "
-                        "MANDATORY HARD STOP: Finish ONLY your current atomic step (if running `/executing-plans`, "
-                        "update the progress ledger and DO NOT start the next plan task). "
-                        "Do NOT start any new multi-step exploration or implementation phase — immediately yield the turn "
-                        "and ask the user to run `/compact` before continuing."
-                    )
-                }
-            ]
-        }
-
-    return {
-        "injectSteps": [
-            {
-                "ephemeralMessage": (
-                    f"CONTEXT-GUARD AUTO-COMPACT SENSOR: Active context since last checkpoint "
-                    f"has reached {steps_since_cp} steps ({kb_since_cp} KB). "
-                    "At the end of your current response, display a prominent reminder "
-                    "recommending that the user run `/compact` before starting the next phase."
-                )
-            }
-        ]
-    }
+    steps: list[dict[str, Any]] = [{"ephemeralMessage": drift_notice}] if drift_notice else []
+    if should_warn:
+        kb_since_cp = max(1, bytes_since_cp // 1024)
+        if is_subagent:
+            msg = (
+                f"CONTEXT-GUARD SUBAGENT CONTEXT CEILING: Subagent trajectory has reached "
+                f"{steps_since_cp} steps ({kb_since_cp} KB). Subagents cannot run `/compact`. "
+                "Finish your current atomic step, synthesize your findings into a concise summary "
+                "(<40 lines), and immediately return your response to the parent agent via `send_message`."
+            )
+        elif is_hard_stop:
+            msg = (
+                f"CONTEXT-GUARD AUTO-COMPACT HARD STOP: Active context since last checkpoint "
+                f"has reached {steps_since_cp} steps ({kb_since_cp} KB), exceeding the hard ceiling "
+                f"({HARD_STEP_THRESHOLD} steps / {HARD_BYTES_THRESHOLD // 1024} KB). "
+                "MANDATORY HARD STOP: Finish ONLY your current atomic step (if running `/executing-plans`, "
+                "update the progress ledger and DO NOT start the next plan task). "
+                "Do NOT start any new multi-step exploration or implementation phase — immediately yield the turn "
+                "and ask the user to run `/compact` before continuing."
+            )
+        else:
+            msg = (
+                f"CONTEXT-GUARD AUTO-COMPACT SENSOR: Active context since last checkpoint "
+                f"has reached {steps_since_cp} steps ({kb_since_cp} KB). "
+                "At the end of your current response, display a prominent reminder "
+                "recommending that the user run `/compact` before starting the next phase."
+            )
+        steps.append({"ephemeralMessage": msg})
+    return {"injectSteps": steps} if steps else {}
 
 
 def main() -> int:

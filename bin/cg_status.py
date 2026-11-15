@@ -22,11 +22,12 @@ _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 if str(_PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(_PACKAGE_ROOT))
 
+from hooks import config  # noqa: E402
 from hooks.file_io import LOCK_EX, LOCK_NB, LOCK_UN, flock  # noqa: E402
 from hooks.telemetry import DEFAULT_TELEMETRY_PATH, load_telemetry_stats  # noqa: E402
 from hooks.outcomes import DEFAULT_OUTCOMES_PATH, load_outcomes  # noqa: E402
 from hooks.state_store import resolve_plugin_root, warn  # noqa: E402
-from bin import token_usage, usage_report  # noqa: E402
+from bin import replay_benchmark, token_usage, usage_report  # noqa: E402
 from bin.harness_status import check_status, verify_harness_hooks  # noqa: E402
 from bin.outcomes_report import render_outcomes_report  # noqa: E402
 from bin.update_check import UPDATE_LOCK, is_update_stale  # noqa: E402
@@ -590,11 +591,24 @@ def run_doctor(
     dups = usage_report.find_duplicate_skills()
     skill_hygiene = {
         "duplicate_count": len(dups),
-        "duplicates": [
-            {"name": name, "paths": [str(p) for p in paths]} for name, paths in dups
-        ],
+        "duplicates": [{"name": name, "paths": [str(p) for p in paths]} for name, paths in dups],
         "ok": True,
     }
+    security_drift: dict[str, Any] = {
+        "security_active": False, "ok": True, "drift_codes": [], "claude": {}, "cursor": {}, "codex": {}, "remediation": None,
+    }
+    inspect_fn = getattr(config, "inspect_native_security_drift", None)
+    if callable(inspect_fn):
+        try:
+            drift_res = inspect_fn(
+                claude_settings_path=claude_settings_path,
+                cursor_hooks_path=cursor_hooks_path,
+                codex_hooks_path=codex_hooks_path,
+            )
+            if isinstance(drift_res, dict):
+                security_drift = drift_res
+        except Exception as exc:
+            security_drift = {**security_drift, "error": str(exc)}
     overall_ok = bool(py_ok and flock_ok and telem_ok and ag_ok)
     return {
         "ok": overall_ok,
@@ -607,7 +621,31 @@ def run_doctor(
         "harness_details": harness_details,
         "git": {"is_repo": is_repo, "clean": git_clean, "ok": True},
         "skill_hygiene": skill_hygiene,
+        "security_drift": security_drift,
     }
+
+
+def _format_security_drift_row(sec: dict[str, Any]) -> str:
+    codes = [str(c) for c in (sec.get("drift_codes") or []) if c]
+    raw_cl, raw_cx = sec.get("claude"), sec.get("codex")
+    claude_i: dict[str, Any] = raw_cl if isinstance(raw_cl, dict) else {}
+    codex_i: dict[str, Any] = raw_cx if isinstance(raw_cx, dict) else {}
+    notes = list(codes)
+    if claude_i.get("degraded_older_cli"):
+        notes.append("degraded Claude < 2.1.295")
+    codex_drift = bool(
+        codex_i.get("trust_warning")
+        or codex_i.get("features_hooks") is False
+        or "27833" in str(codex_i)
+        or (sec.get("security_active") and (codex_i.get("features_hooks_enabled") is False or codex_i.get("has_trust_level") is False))
+    )
+    if codex_drift:
+        notes.append("Codex trust / #27833")
+    if sec.get("error"):
+        notes.append(f"probe skipped ({sec['error']})")
+    status = "WARN" if (notes or sec.get("ok") is False) else "OK"
+    detail = "; ".join(notes) if notes else ("synced" if sec.get("security_active") else "inactive")
+    return f"| Native security sync | `{status}` | `{detail}` |"
 
 
 def render_doctor_report(report: dict[str, Any]) -> str:
@@ -652,6 +690,9 @@ def render_doctor_report(report: dict[str, Any]) -> str:
     sh_status = "WARN" if dup_count > 0 else "OK"
     sh_detail = f"{dup_count} duplicate skill(s)" if dup_count > 0 else "0 duplicate skills"
     lines.append(f"| Skill hygiene | `{sh_status}` | `{sh_detail}` |")
+    raw_sec = report.get("security_drift")
+    sec: dict[str, Any] = raw_sec if isinstance(raw_sec, dict) else {}
+    lines.append(_format_security_drift_row(sec))
     lines.append("")
     lines.append(f"**Overall status:** `{'OK' if report.get('ok') else 'FAIL'}`")
     return "\n".join(lines) + "\n"
@@ -659,60 +700,40 @@ def render_doctor_report(report: dict[str, Any]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Format Context-Guard token telemetry.")
-    parser.add_argument(
-        "--stats-path",
-        type=Path,
-        default=None,
-        help="Path to telemetry stats.json",
-    )
-    parser.add_argument(
-        "--outcomes-path",
-        type=Path,
-        default=None,
-        help="Path to the intervention outcomes ledger (outcomes.json)",
-    )
-    parser.add_argument(
-        "--usage-path",
-        type=Path,
-        default=None,
-        help="Path to the token usage ledger (token_usage.json)",
-    )
-    parser.add_argument(
-        "--update-path",
-        type=Path,
-        default=DEFAULT_UPDATE_PATH,
-        help="Path to the release check result (update.json)",
-    )
+    parser.add_argument("--stats-path", type=Path, default=None, help="Path to telemetry stats.json")
+    parser.add_argument("--outcomes-path", type=Path, default=None, help="Path to intervention outcomes ledger")
+    parser.add_argument("--usage-path", type=Path, default=None, help="Path to token usage ledger")
+    parser.add_argument("--update-path", type=Path, default=DEFAULT_UPDATE_PATH, help="Path to update.json")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--short", action="store_true", help="Single-line status string")
     group.add_argument("--claude-hud", action="store_true", help="Claude Code statusLine HUD")
     group.add_argument("--markdown", action="store_true", help="Full Markdown report")
     group.add_argument("--json", action="store_true", help="Raw JSON stats")
-    group.add_argument(
-        "--outcomes", action="store_true", help="Markdown report of intervention outcomes per harness × model"
-    )
-    group.add_argument(
-        "--usage", action="store_true", help="Markdown report of real token usage and the session preamble"
-    )
-    group.add_argument(
-        "--doctor", action="store_true", help="Environment and harness self-diagnostics report"
-    )
+    group.add_argument("--public-json", action="store_true", help="Scrubbed public JSON telemetry bundle")
+    group.add_argument("--outcomes", action="store_true", help="Markdown report of outcomes per harness x model")
+    group.add_argument("--usage", action="store_true", help="Markdown report of real token usage and preamble")
+    group.add_argument("--doctor", action="store_true", help="Environment and harness self-diagnostics report")
+    group.add_argument("--replay", action="store_true", help="Run isolated deterministic multi-harness replay")
+    group.add_argument("--benchmark", action="store_true", help="Run isolated deterministic latency/savings benchmark")
     args = parser.parse_args(argv)
 
     try:
-        uses_default_telemetry = (
-            args.outcomes_path is None
-            if args.outcomes
-            else (args.stats_path is None and args.usage_path is None)
-        )
-        if uses_default_telemetry:
-            checkout_warning = detect_checkout_telemetry_mismatch()
-            if checkout_warning:
-                warn(checkout_warning)
+        if not (args.doctor or args.replay or args.benchmark):
+            uses_default = (args.outcomes_path is None) if args.outcomes else (args.stats_path is None and args.usage_path is None)
+            if uses_default and (cw := detect_checkout_telemetry_mismatch()):
+                warn(cw)
         if args.doctor:
             doc = run_doctor()
             print(render_doctor_report(doc), end="")
             return 0 if doc.get("ok") else 1
+        if args.replay:
+            rep = replay_benchmark.run_deterministic_replay()
+            print(replay_benchmark.render_replay_report(rep), end="")
+            return 0 if rep.get("ok") else 1
+        if args.benchmark:
+            bench = replay_benchmark.run_deterministic_benchmark()
+            print(replay_benchmark.render_benchmark_report(bench), end="")
+            return 0 if bench.get("ok") else 1
         if args.outcomes:
             u_path = args.usage_path or (token_usage.DEFAULT_USAGE_PATH if args.outcomes_path is None else None)
             u_state = token_usage.restore_usage_state(u_path) if u_path and u_path.is_file() else None
@@ -722,9 +743,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.claude_hud:
             stdin_data = read_nonblocking_stdin_json()
             update = load_update(args.update_path)
-            if is_update_stale(update, datetime.now(timezone.utc)) and not update_attempt_is_recent(
-                args.update_path, time.time()
-            ):
+            if is_update_stale(update, datetime.now(timezone.utc)) and not update_attempt_is_recent(args.update_path, time.time()):
                 spawn_update_check()
             print(render_claude_hud(stdin_data, stats, update))
             return 0
@@ -736,20 +755,21 @@ def main(argv: list[str] | None = None) -> int:
             update_line = render_update_line(load_update(args.update_path), ROOT)
             print(report + (f"\n{update_line}\n" if update_line else ""), end="")
             return 0
+        if args.public_json:
+            bundle = replay_benchmark.build_public_json_bundle(
+                stats, usage_json(stats, args.usage_path, args.outcomes_path), load_outcomes(args.outcomes_path), load_update(args.update_path),
+            )
+            print(json.dumps(bundle, indent=2))
+            return 0
         if args.json:
-            payload = {
-                **stats,
-                "token_usage": usage_json(stats, args.usage_path, args.outcomes_path),
-                "update": load_update(args.update_path),
-            }
+            payload = {**stats, "token_usage": usage_json(stats, args.usage_path, args.outcomes_path), "update": load_update(args.update_path)}
             print(json.dumps(payload, indent=2))
             return 0
         print(render_short_status(stats))
         return 0
     except Exception as exc:
-        # The status line must always print something; it says so honestly when it cannot.
         warn(f"status line failed: {type(exc).__name__}: {exc}")
-        if getattr(args, "json", False):
+        if getattr(args, "json", False) or getattr(args, "public_json", False):
             print(json.dumps({"error": type(exc).__name__}))
         else:
             print("CG: n/a")
