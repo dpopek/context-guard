@@ -17,6 +17,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 ### Changed
 - **Installer status (`bin/install_harnesses.py`):** Wired `cg_shim` and `cg_budget_shim` into `check_status` and rollback backups.
 - **Docs & audit skill (`README.md`, `ROADMAP.md`, `SKILL.md`):** Documented `cg budget`, `--probe`, and v4.6.0 modules.
+- **English roadmap (`ROADMAP.md`, `AGENTS.md`):** Translated Architectural Freeze roadmap to English as canonical language.
 
 ## [4.5.3] - 2026-11-16
 

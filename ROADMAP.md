@@ -1,365 +1,365 @@
-# Context-Guard — Roadmapa rozwoju `v4.5.2`–`v5.0.0` oraz wpis Architectural Freeze
+# Context-Guard — Development Roadmap `v4.5.2`–`v5.0.0` and Architectural Freeze Record
 
-**Status:** `ARCHITECTURAL FREEZE` — zatwierdzony kierunek; szczegóły implementacyjne podlegają testom kontraktowym  
-**Data:** 16 listopada 2026  
-**Punkt bazowy analizy:** `v4.5.1`, commit `54045e2f793893a895c8693f61c1ac63f0c7ed01` (`7/7` zielonych jobów Multi-OS CI według przekazanej weryfikacji)  
-**Obsługiwane środowiska:** Claude Code, Cursor, OpenAI Codex, Google Antigravity  
-**Przeznaczenie dokumentu:** tworzenie specyfikacji, planów TDD, issue i kryteriów akceptacji kolejnych wydań
+**Status:** `ARCHITECTURAL FREEZE` — approved direction; implementation details subject to contract tests  
+**Date:** November 16, 2026  
+**Analysis baseline:** `v4.5.1`, commit `54045e2f793893a895c8693f61c1ac63f0c7ed01` (`7/7` green Multi-OS CI jobs per reported verification)  
+**Supported harnesses:** Claude Code, Cursor, OpenAI Codex, Google Antigravity  
+**Document purpose:** authoring specifications, TDD plans, issues, and acceptance criteria for upcoming releases
 
 > [!NOTE]
-> **Kontekst stanu repozytorium w `v4.6.0`:** Po domknięciu Architectural Freeze (`INV-1`–`INV-7`) w `v4.5.3`, w `v4.6.0` wdrożono doradcę budżetu preambuły i serwerów MCP (**Preamble & MCP Budget Advisor**): pasywny i wyłącznie odczytowy audyt `cg budget` (`--preamble`, `--mcp`, `--recommendations`) dla Antigravity, Claude Code, Cursor i Codex z jawnym rozdziałem danych `measured` / `estimated` / `unavailable`, redukcją sekretów i ścieżek domowych, wykrywaniem duplikatów oraz nakładek narzędzi MCP, ostrożnymi profilami (`minimal-core`, `full-integrations`), jawnie włączanym sondowaniem stdio `tools/list` pod `--probe` oraz zunifikowanym dispatcherem `cg` (z shimami `cg` i `cg-budget`), otwierając bramkę do prac nad `v4.7.0`.
+> **Repository state in `v4.6.0`:** Following the closure of the Architectural Freeze (`INV-1`–`INV-7`) in `v4.5.3`, `v4.6.0` delivered the **Preamble & MCP Budget Advisor**: passive, read-only `cg budget` auditing (`--preamble`, `--mcp`, `--recommendations`) for Antigravity, Claude Code, Cursor, and Codex with explicit `measured` / `estimated` / `unavailable` separation, secret and home-path redaction, duplicate and MCP tool overlap detection, cautious session profiles (`minimal-core`, `full-integrations`), explicit opt-in `--probe` stdio `tools/list` inspection, and a unified `cg` dispatcher (with `cg` and `cg-budget` shims), opening the gate for `v4.7.0` work.
 
 ---
 
-## Część I — Przegląd architektoniczny i decyzja Architectural Freeze
+## Part I — Architectural Review and Architectural Freeze Decision
 
-Roadmapa zasługuje na ocenę **9,5/10** i nadaje się do zamrożenia architektonicznego (*Architectural Freeze*) po wprowadzeniu pięciu punktowych korekt w granicach kontraktów `v4.5.2`–`v4.7.0`. Zakotwiczenie planu w realnym stanie `v4.5.1` (`54045e2`, komplet `7/7` zielonych jobów Multi-OS CI, istniejący spool `slice`/`grep`/`list`/`gc` oraz Outcomes v4) uchroniło projekt przed efektem drugiego systemu — zamiast przepisywać działające fundamenty, dokument najpierw uszczelnia integralność i izolację dostępu, a dopiero potem buduje warstwę pomiarową i adaptacyjną.
+The roadmap earns a **9.5/10** rating and is ready for **Architectural Freeze** after introducing five targeted adjustments within the `v4.5.2`–`v4.7.0` contracts. Anchoring the plan in the actual `v4.5.1` state (`54045e2`, a full `7/7` green Multi-OS CI suite, existing spool `slice`/`grep`/`list`/`gc`, and Outcomes v4) protected the project from the second-system effect — instead of rewriting working foundations, the document first seals integrity and access isolation, and only then builds the measurement and adaptation layers.
 
-### Co stanowi najmocniejszy fundament dokumentu
+### Strongest Foundations of the Document
 
-* **Brak efektu drugiego systemu:** Pozostawienie Policy API v1, Read Ledgera oraz manifestu JSON + lock do czasu benchmarków w `v4.9.0` chroni stabilność 7 jobów Multi-OS CI.
-* **Właściwa sekwencja ryzyka:** Uszczelnienie integralności spoola i izolacji workspace w `v4.5.2` wyprzedza pomiary A/B (`v4.7.0`) oraz automatyzację decyzji (`v4.8.0`).
-* **Równoległość prac po stabilizacji:** Niezależność `v4.6.0` (Advisor) od `v4.7.0` (Offline Replay) pozwala szybko dostarczyć widoczną funkcję CLI bez wstrzymywania prac nad ewaluacją.
-* **Dyscyplina wydawnicza:** Trzy niezależne bramki (Contract, Reliability, Evidence) oraz warunkowa aktywacja Governora wiążą rozwój wtyczki z twardymi pomiarami.
+* **No second-system effect:** Keeping Policy API v1, Read Ledger, and the JSON + lock manifest until `v4.9.0` benchmarks protects the stability of all 7 Multi-OS CI jobs.
+* **Proper risk sequencing:** Sealing spool integrity and workspace isolation in `v4.5.2` precedes A/B evaluations (`v4.7.0`) and automated decision-making (`v4.8.0`).
+* **Parallelizable post-stabilization work:** Independence of `v4.6.0` (Advisor) from `v4.7.0` (Offline Replay) allows fast delivery of a user-visible CLI capability without stalling evaluation work.
+* **Release discipline:** Three independent gates (Contract, Reliability, Evidence) and conditional Governor activation tie plugin evolution to hard measurements.
 
-### Pięć korekt kontraktowych przed zamrożeniem architektury
+### Five Contract Adjustments Before Architectural Freeze
 
-#### 1. Walidacja UTF-8 przy odczycie a fałszywy błąd integralności (`v4.5.2` A.4)
+#### 1. Read-time UTF-8 validation vs. false integrity error (`v4.5.2` A.4)
 
-Wymuszenie ścisłego dekodowania UTF-8 (bez `errors="replace"`) dopiero podczas operacji `slice` i `grep` ze zwrotem `integrity_mismatch` łamie definicję ukończenia `v4.5.2` na rzeczywistych wyjściach narzędzi CLI. Logi systemowe na Windows (`CP1250`/`CP852`), zrzuty bajtowe w asercjach `pytest` czy `git diff` na plikach o mieszanym kodowaniu potrafią zawierać sekwencje niebędące poprawnym UTF-8. Jeżeli ścieżka zapisu przyjmie taki bufor, policzy poprawny `content_sha256` i odeśle skrót do agenta, a dopiero `slice` zablokuje odczyt błędem `integrity_mismatch`, wtyczka sama odetnie agenta od nieuszkodzonych danych i w `v4.8.0` fałszywie otworzy bezpiecznik. Poprawność UTF-8 trzeba weryfikować **przed podmianą wyniku przy zapisie** (brak poprawnego UTF-8 kieruje wywołanie na natychmiastowy passthrough albo oznacza zasób w manifeście jako binarny), rezerwując `integrity_mismatch` wyłącznie dla rozbieżności `total_bytes` lub `content_sha256`.
+Enforcing strict UTF-8 decoding (without `errors="replace"`) only during `slice` and `grep` operations while returning `integrity_mismatch` breaks the `v4.5.2` definition of done on real CLI tool outputs. System logs on Windows (`CP1250`/`CP852`), byte dumps in `pytest` assertions, or `git diff` on mixed-encoding files can contain byte sequences that are not valid UTF-8. If the write path accepts such a buffer, computes a valid `content_sha256`, and returns a summary to the agent, only for `slice` to reject the read with `integrity_mismatch`, the plugin itself cuts the agent off from uncorrupted data and in `v4.8.0` would trip the circuit breaker falsely. UTF-8 validity must be checked **before payload replacement on write** (invalid UTF-8 triggers immediate passthrough or marks the asset in the manifest as binary), reserving `integrity_mismatch` strictly for `total_bytes` or `content_sha256` mismatches.
 
-#### 2. Domyślne rozszczepienie zakresu `v4.5.2` oraz higiena blokady manifestu (`v4.5.2` A–E)
+#### 2. Default scope split for `v4.5.2` and manifest lock hygiene (`v4.5.2` A–E)
 
-Zapisana w sekcji 5 reguła awaryjnego oddzielenia poprawek P0 od `ContextReceiptV1` powinna stać się planem podstawowym. Punkty A, B i C (weryfikacja `SHA-256`, tombstone’y przy współbieżnym GC oraz izolacja `workspace_id` w serwerze MCP) zamykają luki bezpieczeństwa i spójności danych, natomiast punkty D i E (nowy dziennik `ContextReceiptV1` oraz zmiana klasyfikacji regretu w Outcomes v4) to rozbudowa telemetrii, która zmienia semantykę raportów i zasługuje na osobne `v4.5.3`. Dodatkowo przy pozostawieniu backendu JSON + lock specyfikacja `v4.5.2` musi zabraniać trzymania blokady pliku manifestu w trakcie liczenia `SHA-256` na pliku payloadu oraz definiować górny pułap `max_spool_entry_bytes`, aby pojedynczy kilkusetmegabajtowy zrzut logów nie degradował latencji każdego wywołania `slice`.
+The contingency rule in section 5 separating P0 fixes from `ContextReceiptV1` should become the primary plan. Items A, B, and C (`SHA-256` verification, tombstones under concurrent GC, and `workspace_id` isolation in the MCP server) close security and data-consistency gaps, whereas items D and E (the new `ContextReceiptV1` log and changing regret classification in Outcomes v4) represent telemetry expansion that changes report semantics and belongs in a separate `v4.5.3` release. In addition, while retaining the JSON + lock backend, the `v4.5.2` specification must forbid holding the manifest lock during `SHA-256` hashing of payload files and define an upper `max_spool_entry_bytes` ceiling so a single multi-hundred-megabyte log dump does not degrade latency for every `slice` call.
 
-#### 3. Kanonizacja `workspace_id` między hookiem a serwerem MCP na Multi-OS (`v4.5.2` C)
+#### 3. Cross-OS `workspace_id` canonicalization between hook and MCP server (`v4.5.2` C)
 
-Oparcie domyślnej izolacji o kanoniczny katalog projektu to właściwa granica bezpieczeństwa, ale na macOS, Linuksie i Windows krótkotrwały proces hooka oraz długowieczny serwer MCP w Cursorze łatwo wyliczą różny identyfikator dla tego samego repozytorium. Dowiązania symboliczne na macOS (`/var` kontra `/private/var`), wielkość liter dysku na Windows (`C:\Repo` kontra `c:\repo`) oraz różnica między protokołem MCP `roots/list` a statyczną konfiguracją `.cursor/mcp.json` sprawią, że `slice` i `grep` odrzucą uprawnienia do własnych zasobów sesji. Kontrakt `v4.5.2` powinien narzucać jedną współdzieloną funkcję kanonizacji (`realpath` połączony z normalizacją wielkości liter na systemach plików niewrażliwych na wielkość znaków) oraz test krzyżowy zapisu przez hook i odczytu przez MCP na wszystkich platformach CI.
+Basing default isolation on a canonical project directory is the right security boundary, but on macOS, Linux, and Windows a short-lived hook process and a long-lived MCP server in Cursor can easily compute different identifiers for the same repository. Symbolic links on macOS (`/var` vs. `/private/var`), Windows drive-letter casing (`C:\Repo` vs. `c:\repo`), and differences between the MCP `roots/list` protocol and static `.cursor/mcp.json` configuration would cause `slice` and `grep` to deny access to a session's own resources. The `v4.5.2` contract should mandate a single shared canonicalization helper (`realpath` combined with case normalization on case-insensitive filesystems) plus cross-platform CI tests verifying hook writes and MCP reads across all supported OS runners.
 
-#### 4. Pasywna kontra aktywna inwentaryzacja schematów MCP (`v4.6.0`)
+#### 4. Passive vs. active MCP schema inventory (`v4.6.0`)
 
-Lokalne pliki konfiguracyjne klientów zawierają komendy uruchomieniowe serwerów MCP, lecz nie zawierają samych schematów JSON narzędzi — te powstają dynamicznie po wywołaniu `tools/list`. Gdyby `cg budget --mcp` domyślnie uruchamiał skonfigurowane serwery MCP w celu pobrania ich schematów, naruszyłby zasadę braku efektów ubocznych (serwery mogą wymagać aktywnych tokenów autoryzacji, otwierać połączenia sieciowe lub zawieszać CLI). W `v4.6.0` tryb domyślny powinien analizować wyłącznie pasywne źródła (transkrypty sesji, lokalny cache definicji harnessu i pliki instrukcji, oznaczając brakujące schematy jako `unavailable`), natomiast aktywne odpytanie serwerów przez `tools/list` warto wydzielić za jawną flagą `--probe` ze sztywnym limitem czasu.
+Local client configuration files contain launch commands for MCP servers, not the tool JSON schemas themselves — those are generated dynamically upon `tools/list`. If `cg budget --mcp` spawned configured MCP servers by default to fetch schemas, it would violate the zero-side-effects principle (servers may require live auth tokens, open network connections, or hang the CLI). In `v4.6.0`, default mode should analyze only passive sources (session transcripts, local harness definition caches, and instruction files, reporting missing schemas as `unavailable`), while active `tools/list` querying belongs behind an explicit `--probe` flag with a strict timeout.
 
-#### 5. Jedno źródło prawdy dla Outcomes v4 i wczesny zapis klucza capability (`v4.5.2`–`v4.7.0`)
+#### 5. Single source of truth for Outcomes v4 and early capability key capture (`v4.5.2`–`v4.7.0`)
 
-Ponieważ w `v4.5.1` działa już moduł Outcomes v4, dołożenie obok niego `ContextReceiptV1` rodzi ryzyko utrzymywania dwóch niezależnych potoków zdarzeń, które zaczną rozjeżdżać się w `v4.7.0`. W architekturze należy jawnie wskazać, że `ContextReceiptV1` jest docelowo surowym rejestrem zdarzeń niskiego poziomu, a zagregowane wskaźniki Outcomes mogą być z niego deterministycznie wyliczane po spełnieniu wymagań trwałości i deduplikacji. Równocześnie minimalny odcisk `CapabilityAttestationKey` (identyfikator harnessu, build, wersja adaptera i skrót konfiguracji hooków) powinien być dopisywany do artefaktów pomiarowych już w `v4.7.0` Evidence Engine, aby zebrane przebiegi A/B miały komplet metadanych wymaganych później przez reguły Governora w `v4.8.0`.
+Because `v4.5.1` already ships Outcomes v4, adding `ContextReceiptV1` alongside it risks maintaining two independent event pipelines that could diverge in `v4.7.0`. The architecture should state explicitly that `ContextReceiptV1` is intended as the single low-level raw event log, from which aggregated Outcomes metrics can be deterministically derived once durability and deduplication requirements are met. At the same time, a minimal `CapabilityAttestationKey` fingerprint (harness ID, build, adapter version, and hook config hash) should be recorded in measurement artifacts starting in the `v4.7.0` Evidence Engine so A/B runs include the full metadata set required later by Governor rules in `v4.8.0`.
 
-| Wydanie | Obszar w dokumencie | Rekomendowana korekta | Cel zmiany |
+| Release | Section in Document | Recommended Adjustment | Rationale |
 | :--- | :--- | :--- | :--- |
-| `v4.5.2` | Walidacja UTF-8 w `slice` i `grep` | Weryfikować UTF-8 przy zapisie spoola | Brak fałszywego `integrity_mismatch` |
-| `v4.5.2` | Zakres wydania i blokada JSON | Wydzielić Receipt do `v4.5.3`, hashować poza lockiem | Szybki fix P0 i niskie p99 |
-| `v4.5.2` | Izolacja `workspace_id` w MCP | Wspólna kanonizacja ścieżek i testy Multi-OS | Spójna autoryzacja hook–MCP |
-| `v4.6.0` | Inwentaryzacja `cg budget --mcp` | Pasywny odczyt domyślnie, aktywne `--probe` opt-in | Brak efektów ubocznych przy audycie |
-| `v4.7.0` | Artefakty Evidence Engine | Zapisywać `CapabilityAttestationKey` w raportach | Gotowy wsad pod reguły `v4.8.0` |
+| `v4.5.2` | UTF-8 validation in `slice` and `grep` | Validate UTF-8 on spool write | Eliminates false `integrity_mismatch` |
+| `v4.5.2` | Release scope and JSON lock | Split Receipt into `v4.5.3`, hash outside lock | Fast P0 fix and low p99 latency |
+| `v4.5.2` | MCP `workspace_id` isolation | Shared path canonicalization and Multi-OS tests | Consistent hook–MCP authorization |
+| `v4.6.0` | `cg budget --mcp` inventory | Passive read by default, active `--probe` opt-in | Zero side effects during audit |
+| `v4.7.0` | Evidence Engine artifacts | Record `CapabilityAttestationKey` in reports | Ready input for `v4.8.0` rules |
 
-Po dopisaniu do dokumentu walidacji UTF-8 przed zapisem spoola, kanonizacji ścieżek `workspace_id` pod Multi-OS oraz pasywnego domyślnego trybu `cg budget --mcp`, roadmapę oznaczono jako **Frozen** z doprecyzowaniem dwóch poniższych zastrzeżeń architektonicznych.
+After incorporating pre-spool UTF-8 validation, Multi-OS `workspace_id` path canonicalization, and passive default `cg budget --mcp` behavior, the roadmap was marked **Frozen** with the two architectural reservations clarified below.
 
-### Decyzja: akceptuję korekty, z dwoma zastrzeżeniami architektonicznymi
+### Decision: Accepting Adjustments with Two Architectural Reservations
 
-Roadmapę Context-Guard od `v4.5.2` do `v5.0.0` uznano za gotową do **Architectural Freeze**. Wszystkie pięć proponowanych korekt ma uzasadnienie techniczne i poprawia wykonalność planu; szczególnie trafne jest wydzielenie `v4.5.2` jako szybkiego wydania naprawczego, bez uzależniania poprawek integralności od budowy nowej telemetrii.
+The Context-Guard roadmap from `v4.5.2` to `v5.0.0` was approved for **Architectural Freeze**. All five proposed adjustments have sound technical justification and improve execution feasibility; in particular, splitting `v4.5.2` as a focused bugfix release decouples integrity fixes from building new telemetry.
 
-Dwa zastrzeżenia doprecyzowane w kontraktach technicznych:
+Two reservations clarified in the technical contracts:
 
-1. `ContextReceiptV1` nie może być jedynym źródłem prawdy, jeśli jest zapisywany jako best-effort JSONL. Najpierw potrzebny jest trwały, deduplikowalny rejestr zdarzeń albo formalna migracja istniejącego Outcomes v4.
-2. Izolacja workspace musi mieć wiarygodne źródło tożsamości projektu. Sama współdzielona funkcja `realpath()` nie rozwiązuje problemu globalnego serwera MCP, który nie wie, z którego projektu pochodzi wywołanie.
+1. `ContextReceiptV1` cannot serve as the sole source of truth if persisted as best-effort JSONL. A durable, deduplicatable event store or formal migration of existing Outcomes v4 is required first.
+2. Workspace isolation must rely on a trustworthy project identity source. A shared `realpath()` function alone does not solve the case of a global MCP server that does not know which project originated a call.
 
-#### Zaktualizowana kolejność wydań
+#### Updated Release Sequence
 
-| Wersja | Ostateczny zakres | Kryterium zamknięcia |
+| Version | Final Scope | Exit Criterion |
 | :--- | :--- | :--- |
-| `4.5.2` | Integralność recovery, tombstone, izolacja workspace, limity payloadów | Bezpieczne odczyty, GC i Multi-OS |
-| `4.5.3` | `ContextReceiptV1`, korekta regretu, korelacja recovery | Spójna semantyka zdarzeń bez regresji Outcomes v4 |
-| `4.6.0` | Preamble & MCP Advisor: pasywny audyt, opcjonalne `--probe` | Zero efektów ubocznych w trybie domyślnym |
-| `4.7.0` | Evidence Engine: offline replay i stopniowe live A/B | Wiarygodne wyniki i pełne metadane środowiska |
-| `4.8.0` | Capability Negotiation i konserwatywny Governor | Brak aktywacji na niezweryfikowanych możliwościach |
-| `4.9.0` | Explainability, hardening, opcjonalny eksport OTel | Odtwarzalne decyzje i odporność operacyjna |
-| `5.0.0` | Stabilizacja Policy API, schematów i kompatybilności | Stabilny publiczny kontrakt |
+| `4.5.2` | Recovery integrity, tombstones, workspace isolation, payload limits | Safe reads, GC, and Multi-OS parity |
+| `4.5.3` | `ContextReceiptV1`, regret adjustment, recovery correlation | Consistent event semantics without Outcomes v4 regressions |
+| `4.6.0` | Preamble & MCP Advisor: passive audit, optional `--probe` | Zero side effects in default mode |
+| `4.7.0` | Evidence Engine: offline replay and staged live A/B | Credible results and complete environment metadata |
+| `4.8.0` | Capability Negotiation and conservative Governor | No activation on unverified capabilities |
+| `4.9.0` | Explainability, hardening, optional OTel export | Reproducible decisions and operational resilience |
+| `5.0.0` | Policy API, schema, and compatibility stabilization | Stable public contract |
 
-#### 1. `v4.5.2` — dokładny kontrakt techniczny
+#### 1. `v4.5.2` — exact technical contract
 
-* **UTF-8: walidacja przed spoolowaniem:** Jeżeli `slice` i `grep` są operacjami tekstowymi, nie powinny przyjmować zasobu, którego nie potrafią później poprawnie odtworzyć. Pełna obsługa zasobów binarnych nie wchodzi do `4.5.2`, ponieważ wymagałaby odrębnego interfejsu odzyskiwania zamiast istniejących operacji tekstowych. Jeśli harness przekazuje do hooka już zdekodowany string, Context-Guard nie ma możliwości odtworzenia pierwotnego strumienia bajtów — gwarancja integralności obejmuje dokładnie tę reprezentację, którą faktycznie otrzymał.
+* **UTF-8 validation before spooling:** Because `slice` and `grep` are text operations, they must not accept resources they cannot faithfully reconstruct later. Full binary resource support is out of scope for `4.5.2` because it would require a dedicated recovery interface rather than existing text operations. If a harness passes an already-decoded string to the hook, Context-Guard cannot reconstruct the original upstream byte stream — the integrity guarantee covers the exact representation it actually received.
 
-| Sytuacja | Zachowanie |
+| Condition | Behavior |
 | :--- | :--- |
-| Źródłowe bajty nie są poprawnym UTF-8 | Passthrough, bez spoolowania |
-| Rozmiar przekracza `max_spool_entry_bytes` | Passthrough |
-| `SHA-256` lub długość nie zgadzają się podczas recovery | `integrity_mismatch` |
-| `SHA-256` jest poprawny, ale zapisany tekst nie spełnia kontraktu kodowania | `decode_error` lub `format_error` |
-| Upstream dostarczył już tekst z podstawionymi znakami | Nie deklarować integralności oryginalnych bajtów upstream |
+| Source bytes are not valid UTF-8 | Passthrough without spooling |
+| Size exceeds `max_spool_entry_bytes` | Passthrough |
+| `SHA-256` or length mismatch during recovery | `integrity_mismatch` |
+| `SHA-256` matches, but stored text violates encoding contract | `decode_error` or `format_error` |
+| Upstream already delivered text with replacement characters | Do not claim integrity of raw upstream bytes |
 
-* **Hashowanie poza lockiem, bez wyścigu z GC:**
-  1. Pod krótką blokadą odczytać stan manifestu, wersję zasobu, oczekiwany hash i długość oraz otworzyć uchwyt do payloadu.
-  2. Zwolnić blokadę. Odczytać bajty z otwartego uchwytu i sprawdzić długość, `SHA-256` oraz kodowanie.
-  3. Zwrócić wyłącznie zweryfikowaną zawartość. GC musi respektować rozpoczęte odczyty lub bezpiecznie odroczyć fizyczne usunięcie pliku (na Windows otwarty uchwyt może uniemożliwić `unlink()`, więc GC pozostawia operację do ponowienia; na POSIX otwarty deskryptor nadal wskazuje dane po usunięciu nazwy pliku). Do tego dochodzi `max_spool_entry_bytes` przed rozpoczęciem spoolowania.
+* **Off-lock hashing, zero GC race:**
+  1. Under a short lock, read manifest state, asset version, expected hash and length, and open a handle to the payload file.
+  2. Release the lock. Read bytes from the open handle and verify length, `SHA-256`, and encoding.
+  3. Return only verified contents. GC must respect in-flight reads or safely defer physical deletion (on Windows an open handle may prevent `unlink()`, so GC leaves the entry for retry; on POSIX an open file descriptor continues reading data after directory unlink). Combine this with `max_spool_entry_bytes` enforced before spooling starts.
 
-#### 2. Workspace isolation — jeden dodatkowy warunek krytyczny
+#### 2. Workspace isolation — one additional critical condition
 
-Wspólna kanonizacja po obu stronach jest konieczna: `realpath()` rozwiązuje dowiązania symboliczne, a `normcase()` normalizuje wielkość liter na Windows. Na macOS `normcase()` nie zmienia wielkości liter mimo potencjalnie case-insensitive systemu plików, dlatego przy porównaniach istniejących katalogów należy wykorzystywać rzeczywistą tożsamość obiektu przez `os.path.samefile()`. Ponieważ w nowszych wersjach protokołu MCP (`2026-07-28+`) `roots/list` jest oznaczane jako deprecated i same `roots` stanowią informację o projekcie, a nie mechanizm kontroli dostępu, obowiązuje następujący model:
+Shared canonicalization on both sides is necessary: `realpath()` resolves symlinks, and `normcase()` normalizes drive/path casing on Windows. On macOS, `normcase()` does not alter case despite potentially case-insensitive filesystems, so comparisons between existing directories must verify true filesystem object identity via `os.path.samefile()`. Because newer MCP protocol versions (`2026-07-28+`) deprecate `roots/list`, and `roots` themselves provide project metadata rather than an access-control boundary, the following model applies:
 
-| Scenariusz | Decyzja |
+| Scenario | Decision |
 | :--- | :--- |
-| Serwer MCP uruchomiony z wiarygodnym, przypiętym workspace | Dostęp tylko do jego zasobów |
-| Multi-root z jednoznacznie ustalonym zakresem konkretnego wywołania | Dostęp do odpowiedniego workspace |
-| Globalny serwer bez informacji o pochodzeniu wywołania | Odmowa zamiast fallbacku do `global` |
-| Tryb `global` świadomie wybrany przez użytkownika | Dostęp zgodny z konfiguracją |
+| MCP server launched with a trustworthy, pinned workspace | Access scoped strictly to its assets |
+| Multi-root server with unambiguously resolved per-call scope | Access to the corresponding workspace |
+| Global server without call origin identity | Deny rather than falling back to `global` |
+| `global` mode explicitly chosen by the user | Access per explicit configuration |
 
-#### 3. `v4.5.3` — `ContextReceipt` a istniejący Outcomes v4
+#### 3. `v4.5.3` — `ContextReceipt` vs. existing Outcomes v4
 
-Docelowa zasada „surowe zdarzenia są źródłem prawdy, Outcomes są widokiem zagregowanym” wymaga etapowej migracji i nie może opierać się na opcjonalnym JSONL jako autorytatywnym rejestrze:
+The target principle "raw events are the source of truth; Outcomes are an aggregated view" requires staged migration and cannot rely on optional JSONL as an authoritative ledger:
 
-| Etap | Źródło prawdy | Rola Context Receipt |
+| Stage | Source of Truth | Context Receipt Role |
 | :--- | :--- | :--- |
-| `v4.5.2` | Obecny manifest i Outcomes v4 | Bez nowego kontraktu |
-| `v4.5.3` | Obecne trwałe rejestry, wspólna semantyka `event_id` | Ujednolicony format zdarzeń i diagnostyczny zapis |
-| `v4.7.0` | Trwały, deduplikowalny rejestr zdarzeń albo mechanizm równoważny | Podstawa deterministycznej agregacji Outcomes i offline replay |
+| `v4.5.2` | Existing manifest and Outcomes v4 | No new contract |
+| `v4.5.3` | Existing durable stores, shared `event_id` semantics | Unified event format and diagnostic log |
+| `v4.7.0` | Durable, deduplicatable event log or equivalent mechanism | Basis for deterministic Outcomes aggregation and offline replay |
 
-W `4.5.3` zdarzenie jest tworzone logicznie tylko raz, a następnie przekazywane do rejestrów (bez niezależnej interpretacji tej samej interwencji w dwóch modułach). Awaria zapisu pomocniczego JSONL nie może powodować utraty danych recovery, a przy rekonstrukcji Outcomes należy raportować kompletność danych.
+In `4.5.3`, a logical event is created once and dispatched to stores (avoiding independent re-interpretation of the same intervention across two modules). A failure writing auxiliary JSONL must never lose recovery data, and Outcomes reconstruction must report data completeness.
 
-#### 4. `v4.6` i `v4.7` — dwie korekty zamrożone od razu
+#### 4. `v4.6` and `v4.7` — two adjustments frozen immediately
 
-* **Preamble Advisor (pasywny domyślnie):** `cg budget --mcp` analizuje konfiguracje, znane schematy, transkrypty i lokalne dane bez uruchamiania procesów zewnętrznych; `--probe` jest oddzielną, jawną diagnostyką z możliwymi efektami ubocznymi.
-* **Evidence Engine (identyfikowalność środowiska):** Eksperymenty live i offline zapisują co najmniej `harness_id`, `harness_build_id`, `adapter_version`, `hook_config_fingerprint`, `context_guard_version`, `model_id` oraz użyte capabilities i poziom ich dowodu; sama obecność `CapabilityAttestationKey` nie oznacza `runtime_verified`.
+* **Preamble Advisor (passive by default):** `cg budget --mcp` analyzes configs, known schemas, transcripts, and local data without launching external processes; `--probe` is a separate, explicit diagnostic with potential side effects.
+* **Evidence Engine (environment traceability):** Live and offline experiments record at least `harness_id`, `harness_build_id`, `adapter_version`, `hook_config_fingerprint`, `context_guard_version`, `model_id`, and the required capabilities plus their evidence level; the mere presence of `CapabilityAttestationKey` does not prove `runtime_verified`.
 
-#### Ostateczny status Architectural Freeze
+#### Final Architectural Freeze status
 
-| Decyzja | Status |
+| Decision | Status |
 | :--- | :--- |
-| Podział `v4.5.2` / `v4.5.3` | Zatwierdzony |
-| UTF-8 przed spoolowaniem | Zatwierdzony |
-| `max_spool_entry_bytes` + hash poza lockiem | Zatwierdzony z wymaganiem stabilnego uchwytu |
-| Wspólna kanonizacja workspace | Zatwierdzona; wymaga wiarygodnej identyfikacji wywołującego MCP |
-| Pasywny `cg budget --mcp` | Zatwierdzony |
-| Capability metadata w Evidence Engine | Zatwierdzone |
-| `ContextReceipt` jako przyszłe źródło agregacji Outcomes | Zatwierdzone kierunkowo; migracja wymaga trwałego rejestru |
+| `v4.5.2` / `v4.5.3` split | Approved |
+| UTF-8 validation before spooling | Approved |
+| `max_spool_entry_bytes` + off-lock hashing | Approved with stable-handle requirement |
+| Shared workspace canonicalization | Approved; requires trustworthy MCP caller identity |
+| Passive `cg budget --mcp` | Approved |
+| Capability metadata in Evidence Engine | Approved |
+| `ContextReceipt` as future source for Outcomes aggregation | Directionally approved; migration requires durable log |
 
-Dokument umieszczono w korzeniu repozytorium jako [ROADMAP.md](ROADMAP.md) (ze względu na regułę higieny wydania blokującą katalog `docs/`). Dalsza praca opiera się na poniższym zamrożonym kontrakcie wydawniczym.
+The document is placed at the repository root as [ROADMAP.md](ROADMAP.md) (due to the release-hygiene rule disallowing a `docs/` directory). Ongoing work follows the frozen release contract below.
 
 ---
 
-## Część II — Ostateczna roadmapa rozwoju `v4.5.2`–`v5.0.0`
+## Part II — Final Development Roadmap `v4.5.2`–`v5.0.0`
 
-### 1. Kierunek produktu
+### 1. Product Direction
 
-Context-Guard ewoluuje z zestawu optymalizacji tokenów do lokalnej warstwy **Trust + Evidence + Adaptation**, odpowiedzialnej za bezpieczne przekształcanie kontekstu agentów, odzyskiwanie informacji, uczciwy pomiar efektów oraz dobór strategii w granicach możliwości konkretnego harnessu.
+Context-Guard is evolving from a collection of token optimizations into a local **Trust + Evidence + Adaptation** layer responsible for safely transforming agent context, recovering full information, measuring impact honestly, and selecting strategies within each harness's verified capabilities.
 
-* **Trust:** transformacja nie może niejawnie odebrać agentowi dostępu do potrzebnych danych w zadeklarowanym okresie retencji. Integralność, izolacja i zachowanie w przypadku awarii mają pierwszeństwo przed oszczędnością.
-* **Evidence:** oddzielamy zmniejszenie rozmiaru outputu, rzeczywisty billing, efekt cache, dodatkowe tury i ukończenie zadania. Korelacja nie jest dowodem przyczynowym.
-* **Adaptation:** aktywacja optymalizacji jest deterministyczna, ograniczona zweryfikowanymi capabilities; twarde błędy prowadzą do bezpiecznego fallbacku.
+* **Trust:** transformation must never silently deprive an agent of needed data within the declared retention window. Integrity, isolation, and failure-mode safety take precedence over savings.
+* **Evidence:** separate output-size reduction, real billing cost, cache effects, extra turns, and task completion. Correlation is not causal proof.
+* **Adaptation:** optimization activation is deterministic and bounded by verified capabilities; hard failures lead to safe fallback.
 
-**Nie wchodzą do strategii:** kolejna duża biblioteka filtrów CLI, własny kompresor ML, obowiązkowa usługa cloud, domyślna zdalna telemetria, nowy system pamięci agentów ani rozbudowany SDK dla nieistniejących jeszcze autorów rozszerzeń.
+**Explicit non-goals:** yet another large CLI filter library, a bespoke ML compressor, a mandatory cloud service, default remote telemetry, a new agent memory system, or a sprawling SDK for nonexistent third-party extension authors.
 
-### 2. Stan bazowy i ograniczenia
+### 2. Baseline State and Constraints
 
-W `v4.5.1` istnieją już Policy API v1, Read Ledger, Outcomes v4, Reversible Output Spool (`slice` / `grep` / `list` / `gc`), integracje z harnessami, shadow mode i podstawy replay/benchmark. Nie budujemy tych modułów od nowa.
+In `v4.5.1`, Policy API v1, Read Ledger, Outcomes v4, Reversible Output Spool (`slice` / `grep` / `list` / `gc`), harness integrations, shadow mode, and replay/benchmark foundations already exist. We do not rebuild these modules from scratch.
 
-W każdej wersji obowiązują:
+Every release upholds these invariants:
 
-* **Correctness before compression:** brak bezpiecznej ścieżki odzyskania oznacza passthrough.
-* **Local-first:** dane i polityki pozostają lokalne; pełne payloady nie trafiają domyślnie do telemetrii.
-* **Harness-bounded claims:** gwarancja odnosi się wyłącznie do obserwowalnej granicy konkretnego klienta.
-* **Backward compatibility:** chronimy Policy API v1, Read Ledger, istniejące instalacje i migracje.
-* **Measured / estimated / unavailable:** brak danych nie oznacza zera oszczędności ani zera błędów.
-* **Release gates:** Contract, Reliability, Evidence i pełne Multi-OS CI; nie publikujemy tagu przed ich przejściem.
-* **Budżety repozytorium:** utrzymać wymagania Python 3.9+, limity LOC/topologii i istniejące repozytoryjne bramki; nową logikę spoola wydzielać do odpowiednich modułów, zamiast rozbudowywać pliki hooków.
+* **Correctness before compression:** without a safe recovery path, passthrough applies.
+* **Local-first:** data and policies stay local; raw payloads never go to telemetry by default.
+* **Harness-bounded claims:** guarantees hold strictly at the observable boundary of the specific client.
+* **Backward compatibility:** protect Policy API v1, Read Ledger, existing installs, and migrations.
+* **Measured / estimated / unavailable:** missing data means neither zero savings nor zero errors.
+* **Release gates:** Contract, Reliability, Evidence, and full Multi-OS CI; never push a release tag before all gates pass.
+* **Repository budgets:** uphold Python 3.9+ compatibility, LOC/topology ceilings, and existing repository gates; extract new spool logic into dedicated modules rather than bloating hook entrypoints.
 
-### 3. Zamrożona sekwencja wydań
+### 3. Frozen Release Sequence
 
-| Wydanie | Główny cel | Co dostarcza | Warunek przejścia |
+| Release | Primary Goal | Deliverables | Gate Condition |
 | :--- | :--- | :--- | :--- |
-| `v4.5.2` | Spool Reliability | Integralność bajtowa, bezpieczne GC, tombstone, workspace isolation, limity payloadów | Siedem invariantów i pięć grup testów na Multi-OS |
-| `v4.5.3` | ContextReceipt & Outcome Semantics | Receipt V1, korekta `suspected` regretu, korelacja recovery | Brak podwójnego liczenia i regresji Outcomes v4 |
-| `v4.6.0` | Preamble & MCP Budget Advisor | Pasywny audyt, rekomendacje, opcjonalny `--probe` | Brak efektów ubocznych w trybie domyślnym |
-| `v4.7.0` | Evidence Engine | Offline replay, kontrolowany live A/B, metryki kosztu i jakości | Odtwarzalna metodologia z jawną niepewnością |
-| `v4.8.0` | Capability-Aware Governor | Runtime capability attestation, `active` / `shadow` / `passthrough`, circuit breaker | Brak decyzji wykraczających poza potwierdzone możliwości |
-| `v4.9.0` | Explainability & Hardening | `cg explain`, retencja, diagnostyka, opcjonalny OTel export | Odporność operacyjna i audytowalność |
-| `v5.0.0` | Stable Reliability Platform | Stabilne kontrakty, CLI i macierz kompatybilności | Bezpieczne migracje, udokumentowane gwarancje |
+| `v4.5.2` | Spool Reliability | Byte integrity, safe GC, tombstones, workspace isolation, payload limits | Seven invariants and five Multi-OS test groups |
+| `v4.5.3` | ContextReceipt & Outcome Semantics | Receipt V1, `suspected` regret correction, recovery correlation | Zero double-counting and zero Outcomes v4 regressions |
+| `v4.6.0` | Preamble & MCP Budget Advisor | Passive audit, recommendations, optional `--probe` | Zero side effects in default mode |
+| `v4.7.0` | Evidence Engine | Offline replay, controlled live A/B, cost & quality metrics | Reproducible methodology with explicit uncertainty |
+| `v4.8.0` | Capability-Aware Governor | Runtime capability attestation, `active` / `shadow` / `passthrough`, circuit breaker | Zero decisions exceeding attested capabilities |
+| `v4.9.0` | Explainability & Hardening | `cg explain`, retention, diagnostics, optional OTel export | Operational resilience and auditability |
+| `v5.0.0` | Stable Reliability Platform | Stable contracts, CLI, and compatibility matrix | Safe migrations, documented guarantees |
 
-Nie zakładamy dat kalendarzowych. Kolejne wersje są zależne od bramek jakości, nie od terminarza.
+No calendar dates are committed. Releases advance by passing quality gates rather than hitting calendar deadlines.
 
-### 4. `v4.5.2` — szczegółowy kontrakt wydania (P0/P1)
+### 4. `v4.5.2` — Detailed Release Contract (P0/P1)
 
-**Cel:** uszczelnić istniejący spool; bez zmian strukturalnych w Read Ledger i Outcomes v4. Nowy Context Receipt i reklasyfikacja regretu docelowo rozdzielone od poprawek P0.
+**Goal:** harden the existing spool with zero structural changes to Read Ledger or Outcomes v4. New Context Receipt work and regret reclassification remain separated from P0 fixes.
 
-#### 4.1. Zapis i odczyt danych
+#### 4.1. Reading and Writing Data
 
-* Przy wejściu `str`: `.encode("utf-8", errors="strict")`; przy surowych bajtach: walidacja `.decode("utf-8", errors="strict")`. Samotne surogaty i niepoprawne kodowanie kierują na passthrough bez utworzenia zasobu.
-* Sprawdzać limit konfiguracyjny `max_spool_entry_bytes` przed kosztowną transformacją. Przekroczenie limitu kieruje na passthrough. Domyślna wartość jest parametrem do ustalenia testami, nie obietnicą architektoniczną.
-* Payload jest write-once dla unikalnego `spool_id`: zapis pliku tymczasowego, weryfikacja, `os.replace()` na tym samym filesystemie, następnie zatwierdzenie manifestu w stanie `available`.
-* Skróconą odpowiedź wolno wyemitować dopiero po pozytywnym zatwierdzeniu payloadu i manifestu. Wcześniejsza awaria oznacza przekazanie oryginalnej odpowiedzi bez podmiany.
-* `slice` / `grep` przed zwróceniem jakiegokolwiek fragmentu porównują pełny `total_bytes` i `content_sha256`, a następnie dekodują całość tekstu ściśle jako UTF-8. Cięcie następuje na granicach pełnych znaków lub linii; offsety bajtowe są półotwarte `[start, end)`.
-* Błąd rozmiaru/hash: `integrity_mismatch`; poprawne bajty, ale niezgodny format/UTF-8 (stan nieosiągalny przy prawidłowym zapisie): `format_error`, nie fałszywy `integrity_mismatch`. Brak pliku przy `available`: `unexpectedly_missing`.
-* `source_hash` dotyczy dokładnych bajtów otrzymanych przez Context-Guard, nie obiecuje, że upstream nie uciął odpowiedzi wcześniej.
+* On `str` input: `.encode("utf-8", errors="strict")`; on raw bytes: validate `.decode("utf-8", errors="strict")`. Lone surrogates and invalid byte sequences trigger passthrough without creating a spool entry.
+* Enforce configurable `max_spool_entry_bytes` before expensive transformation. Exceeding the limit triggers passthrough. The default value is test-calibrated rather than an architectural promise.
+* Payloads are write-once per unique `spool_id`: write temp file, verify, `os.replace()` on the same filesystem, then commit manifest in `available` state.
+* Compacted output may only be emitted after both payload and manifest commit succeed. Earlier failure emits the untouched original output.
+* Before returning any slice, `slice` / `grep` verify full `total_bytes` and `content_sha256`, then strictly UTF-8 decode the full payload. Slicing respects full character or line boundaries; byte offsets are half-open `[start, end)`.
+* Size/hash failure yields `integrity_mismatch`; valid bytes failing format/UTF-8 contract (unreachable after valid writes) yield `format_error` rather than false `integrity_mismatch`. Missing file in `available` state yields `unexpectedly_missing`.
+* `source_hash` covers the exact bytes received by Context-Guard; it does not promise upstream did not truncate output earlier.
 
-#### 4.2. Blokady, GC i spójność
+#### 4.2. Locks, GC, and Consistency
 
-**Protokół odczytu:**
+**Read protocol:**
 
-1. Pod krótkim `_spool_lock` pobrać stan i metadane, sprawdzić dostęp oraz otworzyć uchwyt do niezmiennego pliku.
-2. Zwolnić blokadę; z otwartego uchwytu odczytać całe dane, porównać rozmiar, `SHA-256` i UTF-8.
-3. Zwrócić wyłącznie zweryfikowane dane; bezpiecznie zamknąć uchwyt. Odczyt rozpoczęty przed zmianą stanu na `evicting` może dokończyć operację.
+1. Under brief `_spool_lock`, read state and metadata, authorize access, and open a file handle to the immutable payload.
+2. Release the lock; read full bytes from the open handle, verify length, `SHA-256`, and UTF-8.
+3. Return only verified data and close the handle safely. Reads opened before state flips to `evicting` may complete.
 
-**Protokół GC:**
+**GC protocol:**
 
-1. Pod `_spool_lock` atomowo zatwierdzić `evicting` z przyczyną `ttl_expired`, `max_entries_lru` albo `max_bytes_lru`.
-2. Po zwolnieniu blokady wykonać `os.unlink()` poza sekcją krytyczną.
-3. Po skutecznym usunięciu atomowo zatwierdzić `evicted` (tombstone). Przy `PermissionError` na Windows pozostawić `evicting` i ponowić później.
-4. Następne odczyty widzące `evicting` lub `evicted` zwracają `evicted` z przyczyną, nie `unexpectedly_missing`.
-5. Po awarii/restarcie GC domyka nieukończone eksmisje i sprząta osierocone payloady. Tombstone’y mają ograniczony liczbowo i czasowo rejestr; orientacyjnie `128` wpisów i `7–14` dni, parametry do walidacji w specyfikacji.
+1. Under `_spool_lock`, atomically transition to `evicting` with reason `ttl_expired`, `max_entries_lru`, or `max_bytes_lru`.
+2. Release the lock and execute `os.unlink()` outside the critical section.
+3. After successful removal, atomically transition to `evicted` (tombstone). On Windows `PermissionError`, retain `evicting` and retry later.
+4. Subsequent reads seeing `evicting` or `evicted` return `evicted` with reason, not `unexpectedly_missing`.
+5. After crash/restart, GC finalizes incomplete evictions and cleans orphaned payloads. Tombstones live in a count- and time-bounded registry (roughly `128` entries and `7–14` days, finalized in spec).
 
-Nie wykonywać `SHA-256` ani `os.unlink()` pod `_spool_lock`. Poza sekcją krytyczną są też długotrwałe dekodowanie i formatowanie. Nie zakładać, że `os.replace()` samo w sobie zapewnia pełną trwałość po awarii zasilania; jeśli taką gwarancję deklarujemy, specyfikacja musi określić synchronizację pliku/katalogu.
+Never compute `SHA-256` or execute `os.unlink()` under `_spool_lock`. Heavy decoding and formatting also stay outside the critical section. Never assume `os.replace()` alone guarantees power-loss durability; any durability claim requires explicit file/directory sync semantics in spec.
 
-**Stany:** `preparing` (wyłącznie wewnętrzny, nigdy nieudostępniany), `available`, `evicting`, `evicted`, `corrupt`. Przejścia zasobu po zatwierdzeniu `available` są monotoniczne; nigdy nie używać ponownie `spool_id`.
+**States:** `preparing` (strictly internal, never exposed), `available`, `evicting`, `evicted`, `corrupt`. Post-`available` state transitions are monotonic; never reuse a `spool_id`.
 
-#### 4.3. Izolacja workspace i MCP
+#### 4.3. Workspace and MCP Isolation
 
-**Tryby:** `workspace` (domyślny), `session` (wymaga wiarygodnego identyfikatora), `global` (jawny opt-in).
+**Modes:** `workspace` (default), `session` (requires trustworthy identifier), `global` (explicit opt-in).
 
-* Hook zapisuje zasób z tożsamością wiarygodnie ustalonego korzenia workspace; nie wywodzi jej z argumentu dostarczonego przez model.
-* Serwer MCP `workspace` uruchamia się z przypiętym `--workspace-root` / `--workspace`; katalog jest rozwiązywany podczas startu bez wywoływania `os.getcwd()`. Bez potwierdzonej tożsamości workspace operacje `slice`, `grep`, `list` odmawiają dostępu i nie mogą autoryzować się korzeniami przekazanymi w argumentach wywołania przez model.
-* Przechowywać `workspace_id` i kanoniczny root. Weryfikować rzeczywistą tożsamość istniejących katalogów przez `os.path.samefile()`; nie polegać wyłącznie na identyczności napisów ścieżek.
-* Testować dowiązania, Windows drive-letter casing, macOS case-insensitive, usunięte/przeniesione rooty i multi-root. W razie braku wiarygodnej identyfikacji stosować odmowę, nie fallback do `global`.
-* To logiczna izolacja projektów tego samego użytkownika, nie sandbox przeciwko lokalnemu procesowi o tych samych uprawnieniach. Manifest z bezwzględnymi ścieżkami musi mieć ograniczone uprawnienia i nie być eksportowany domyślnie.
+* Hooks write entries tagged with a reliably resolved workspace root; never trust a root supplied in model arguments.
+* The MCP `workspace` server starts with pinned `--workspace-root` / `--workspace`; the directory resolves at startup without calling `os.getcwd()`. Without confirmed workspace identity, `slice`, `grep`, and `list` deny access and must never authorize using model-supplied root arguments.
+* Persist both `workspace_id` and canonical root. Verify real directory identity via `os.path.samefile()` rather than string equality alone.
+* Test symlinks, Windows drive-letter casing, macOS case-insensitivity, deleted/moved roots, and multi-root setups. Missing trustworthy identity always fails closed — never falls back to `global`.
+* This provides logical project isolation for the same OS user, not a sandbox against co-privileged local processes. Manifests containing absolute paths require restrictive file permissions and must never be exported by default.
 
-#### 4.4. Siedem niezmienników blokujących tag
+#### 4.4. Seven Tag-Blocking Invariants
 
-* **INV-1 — Passthrough przed mutacją:** nie emitować skrótu przed walidacją rozmiaru/UTF-8 i zatwierdzeniem zasobu jako `available`.
-* **INV-2 — Pełna weryfikacja:** każdy odzyskany fragment musi pochodzić z całości pliku zweryfikowanej długością, `SHA-256` i ścisłym UTF-8.
-* **INV-3 — Krótka blokada:** hashowanie i fizyczny `unlink` nie odbywają się pod `_spool_lock`.
-* **INV-4 — Monotoniczne stany:** `available` → `evicting` → `evicted` albo przejście do `corrupt`; brak powrotu do `available` i recyklingu identyfikatorów.
-* **INV-5 — Eksmisja ≠ korupcja:** `unexpectedly_missing` wyłącznie dla manifestu `available`; dla eksmisji zwracamy jej przyczynę.
-* **INV-6 — Fail-closed workspace:** brak potwierdzonego rootu lub odmienne `samefile()` oznacza odmowę, nigdy ukryty tryb globalny.
-* **INV-7 — Nienaruszalne Outcomes v4:** brak strukturalnych zmian w Outcomes v4 i Read Ledger w `v4.5.2`.
+* **INV-1 — Passthrough before mutation:** never emit a summary before size/UTF-8 validation and committing `available` state.
+* **INV-2 — Full verification:** every recovered slice comes from a complete file verified by length, `SHA-256`, and strict UTF-8.
+* **INV-3 — Short lock:** hashing and physical `unlink` never execute under `_spool_lock`.
+* **INV-4 — Monotonic states:** `available` → `evicting` → `evicted` or transition to `corrupt`; no return to `available` and no ID recycling.
+* **INV-5 — Eviction ≠ corruption:** `unexpectedly_missing` only applies when manifest says `available`; evictions return their explicit reason.
+* **INV-6 — Fail-closed workspace:** missing verified root or mismatched `samefile()` results in denial, never silent global access.
+* **INV-7 — Untouched Outcomes v4:** zero structural changes to Outcomes v4 and Read Ledger in `v4.5.2`.
 
-#### 4.5. Macierz zachowań
+#### 4.5. Behavior Matrix
 
-| Manifest | Payload | `slice` / `grep` | Kolejny GC | Klasyfikacja |
+| Manifest | Payload | `slice` / `grep` | Subsequent GC | Classification |
 | :--- | :--- | :--- | :--- | :--- |
-| `available` | poprawny hash i rozmiar | zwróć dane | TTL/LRU według polityki | `OK` |
-| `available` | błędny hash/rozmiar | `integrity_mismatch` | oznacz `corrupt` | `reliability failure` |
-| `available` | brak | `unexpectedly_missing` | oznacz `corrupt` | `reliability failure` |
-| `evicting` | istnieje lub zablokowany | `evicted` + `reason` | ponów `unlink` | utrata retencji, bez corruption |
-| `evicted` | brak | `evicted` + `reason` | retencja tombstone | utrata retencji, bez corruption |
-| `corrupt` | dowolny | odmowa recovery | kwarantanna/sprzątanie według polityki | `reliability failure` |
+| `available` | valid hash and size | return data | TTL/LRU per policy | `OK` |
+| `available` | invalid hash/size | `integrity_mismatch` | mark `corrupt` | `reliability failure` |
+| `available` | missing | `unexpectedly_missing` | mark `corrupt` | `reliability failure` |
+| `evicting` | present or locked | `evicted` + `reason` | retry `unlink` | retention loss, not corruption |
+| `evicted` | missing | `evicted` + `reason` | tombstone retention | retention loss, not corruption |
+| `corrupt` | any | deny recovery | quarantine/cleanup per policy | `reliability failure` |
 
-#### 4.6. Pięć grup testów blokujących wydanie
+#### 4.6. Five Release-Blocking Test Groups
 
-1. **Bajty i UTF-8:** bit flip, dodatkowy bajt, CP1250 niebędące UTF-8, samotny surogat, limit `max_spool_entry_bytes + 1`, wielobajtowe znaki i granice `[start,end)`. Niepoprawne dane wejściowe: passthrough; uszkodzenie zapisanych bajtów: odmowa recovery.
-2. **Reader/GC race:** bariera po otwarciu uchwytu; równoległe `evicting`; czytelnik kończy, nowe odczyty odmawiają; wariant POSIX oraz Windows `PermissionError`, retry po zamknięciu uchwytu.
-3. **Crash i błędy zapisu:** `ENOSPC`, brak uprawnień i awaria manifestu wymuszają oryginalny wynik; restart po `evicting` domyka eksmisję i nie tworzy fałszywej korupcji.
-4. **MCP/workspace Multi-OS:** projekt A nie czyta B przez `slice`/`grep`/`list`; brak identyfikatora workspace fail-closed; symlinki, różna pisownia ścieżki, multi-root i usunięty root.
-5. **Hot-path contention:** sztucznie wolny SHA na dużym payloadzie nie zatrzymuje `list()` ani małego recovery na blokadzie; p95/p99 mierzone, próg testowy oparty na pomiarach CI, nie arbitralnej obietnicy czasu.
+1. **Bytes and UTF-8:** bit flip, extra byte, non-UTF-8 CP1250 bytes, lone surrogate, `max_spool_entry_bytes + 1` ceiling, multibyte characters, and `[start,end)` boundaries. Invalid input triggers passthrough; corrupted stored bytes trigger recovery denial.
+2. **Reader/GC race:** barrier after handle open; concurrent `evicting`; active reader completes while new reads deny; both POSIX behavior and Windows `PermissionError` with retry after handle close.
+3. **Crash and write failures:** `ENOSPC`, permission errors, and manifest failures force raw output emission; restart after `evicting` completes eviction without false corruption.
+4. **Multi-OS MCP/workspace:** project A cannot read project B via `slice`/`grep`/`list`; missing workspace ID fails closed; symlinks, casing variants, multi-root, and deleted roots.
+5. **Hot-path contention:** artificially slow SHA on a large payload does not block `list()` or small recoveries on lock; measure p95/p99 with CI-grounded thresholds rather than arbitrary wall-clock promises.
 
-**Release gate `v4.5.2`:** `INV-1`–`INV-7`, wszystkie pięć grup testów, pełna macierz Multi-OS, brak regresji instalacji/deinstalacji. Nie łączyć tego wydania z przeprojektowaniem telemetryki.
+**Release gate `v4.5.2`:** `INV-1`–`INV-7`, all five test groups, full Multi-OS matrix, zero install/uninstall regressions. Do not bundle telemetry redesign into this release.
 
-### 5. `v4.5.3` — `ContextReceiptV1` i semantyka Outcomes
+### 5. `v4.5.3` — `ContextReceiptV1` and Outcome Semantics
 
-**Cel:** jeden kontrakt zdarzeń bez wymuszania migracji wszystkich dotychczasowych rejestrów.
+**Goal:** establish a single event contract without forcing immediate migration across all legacy stores.
 
-* `ContextReceiptV1`: `schema_version`, `event_id`, `event_type`, `parent_event_id`, `session_id`, `tool_call_id`, `spool_id`, opcjonalne `turn_key` i `turn_correlation`, `ts_ms`, `hook_duration_ms`, `harness`, `intervention`, `mode`, `status`, `source_hash`, rozmiary, odzyskane przedziały `[start,end)` oraz `delivery_evidence` i `upstream_truncation`.
-* `turn_correlation` przyjmuje co najmniej `harness_native`, `transcript_derived`, `unobserved`. Nie wyliczać `recovery_model_turns` jako wartości zmierzonej, gdy korelacja jest nieobserwowalna.
-* Rozróżnić `replacement_emitted` od `delivery_verified`. Samo wywołanie `slice` / `grep` potwierdza użycie identyfikatora, nie dostarczenie pierwotnej podmiany modelowi.
-* `repeat_after_spool`, `verbose_override`, `reread_trimmed_range` otrzymują `regret=suspected` z `evidence=observed`. Samo celowane recovery nie jest regretem; awaria integralności należy do `reliability_failure`.
-* Metryki cyklu życia zasobu: `recovery_calls`, `recovery_model_turns` (gdy obserwowalne), `unique_recovered_bytes`, `total_recovered_bytes`, `recovery_amplification`, osobno koszt i awarie. Wielokrotne recovery sugeruje fragmentację, nie automatyczną winę optymalizacji.
-* **Wersja przejściowa:** Outcomes v4 pozostaje trwałym źródłem operacyjnych agregatów; diagnostyczne, rotowane JSONL nie staje się automatycznie autorytatywnym event logiem. Jeden logiczny event jest tworzony raz i otrzymuje stabilny identyfikator; downstream deduplikuje. Braki w receipcie oznaczamy jako `incomplete`, nie jako zero.
-* Dopiero gdy istnieje kompletny, trwały i deduplikowalny rejestr wraz z migracją, można wyprowadzać Outcomes deterministycznie wyłącznie ze zdarzeń. Nie wymuszać tej migracji w `v4.5.3`.
+* `ContextReceiptV1`: `schema_version`, `event_id`, `event_type`, `parent_event_id`, `session_id`, `tool_call_id`, `spool_id`, optional `turn_key` and `turn_correlation`, `ts_ms`, `hook_duration_ms`, `harness`, `intervention`, `mode`, `status`, `source_hash`, byte sizes, recovered `[start,end)` ranges, plus `delivery_evidence` and `upstream_truncation`.
+* `turn_correlation` accepts at least `harness_native`, `transcript_derived`, and `unobserved`. Never report `recovery_model_turns` as measured when correlation is unobserved.
+* Distinguish `replacement_emitted` from `delivery_verified`. A subsequent `slice` / `grep` call proves the handle was used, not that the original replacement was delivered to the model.
+* `repeat_after_spool`, `verbose_override`, and `reread_trimmed_range` receive `regret=suspected` with `evidence=observed`. Targeted recovery alone is not regret; integrity failure belongs to `reliability_failure`.
+* Resource lifecycle metrics: `recovery_calls`, `recovery_model_turns` (when observable), `unique_recovered_bytes`, `total_recovered_bytes`, `recovery_amplification`, with cost and failures tracked separately. Repeated recovery suggests chunk fragmentation, not automatic optimization blame.
+* **Transitional design:** Outcomes v4 stays the durable operational aggregate store; diagnostic rotated JSONL does not automatically become an authoritative event log. One logical event is created once with a stable ID; downstream deduplicates. Missing receipt data is marked `incomplete`, never zero.
+* Only once a complete, durable, deduplicatable event log with migration exists can Outcomes be derived solely and deterministically from raw events. Do not force that migration in `v4.5.3`.
 
-**Release gate:** deterministyczne testy deduplikacji i korelacji, brak double count, kompatybilność historycznych Outcomes, prawidłowe klasyfikatory i brak obowiązkowego zapisu surowych promptów.
+**Release gate:** deterministic deduplication and correlation tests, zero double-counting, historical Outcomes compatibility, accurate classifiers, and zero mandatory persistence of raw prompts.
 
 ### 6. `v4.6.0` — Preamble & MCP Budget Advisor
 
-**Cel:** bezpieczna funkcja widoczna dla użytkownika, działająca domyślnie tylko do odczytu.
+**Goal:** deliver a safe, user-facing feature that operates strictly read-only by default.
 
-* Komendy docelowe: `cg budget --preamble`, `cg budget --mcp`, `cg budget --recommendations`.
-* Źródła domyślne: konfiguracje, lokalne instrukcje, transkrypty i istniejące cache definicji schematów; nie uruchamiać serwerów MCP i nie wykonywać `tools/list` w zwykłym `cg budget`.
-* Brakujące schematy i liczniki cache raportować `unavailable`. Szacunki tokenów i kosztów wyraźnie oznaczać `estimated`.
-* `--probe` stanowi osobny, jawny tryb, z timeoutem, limitami zasobów, identyfikacją badanych serwerów i ostrzeżeniem, że nawet `tools/list` może uruchomić proces lub połączenie sieciowe.
-* Analiza nakładania się schematów i narzędzi; ostrożne rekomendacje profili na start sesji, bez automatycznej zmiany zestawu MCP i bez deklarowanych „gwarantowanych oszczędności”.
+* Target commands: `cg budget --preamble`, `cg budget --mcp`, `cg budget --recommendations`.
+* Default sources: configs, local instruction files, transcripts, and existing schema definition caches; never spawn MCP servers or issue `tools/list` during standard `cg budget`.
+* Missing schemas and cache counters report `unavailable`. Token and cost estimates must be explicitly labeled `estimated`.
+* `--probe` is a separate explicit mode with timeouts, resource bounds, identification of probed servers, and clear warnings that even `tools/list` may start processes or network connections.
+* Analyze schema/tool overlaps and provide conservative startup profile recommendations without auto-mutating MCP sets or claiming "guaranteed savings".
 
-**Release gate:** domyślny audyt nie wywołuje zewnętrznych procesów ani sieci i niczego nie modyfikuje; dane `measured`/`estimated`/`unavailable` są rozdzielone.
+**Release gate:** default audit triggers zero external processes or network traffic and mutates nothing; `measured` / `estimated` / `unavailable` fields remain cleanly separated.
 
 ### 7. `v4.7.0` — Evidence Engine
 
-**Cel:** ustalić koszt i wpływ na jakość pełnego zadania, a nie wyłącznie procent zredukowanych tokenów.
+**Goal:** measure cost and end-to-end task quality impact rather than raw token-reduction percentages alone.
 
-* **Offline Replay:** deterministyczna kontrola transformacji, integralności, latencji i kontraktów z rekordów referencyjnych; nie udawać, że replikuje trajektorię modelu.
-* **Small Live Pilot:** orientacyjnie `6 zadań × 2 konfiguracje × 3 powtórzenia = 36 przebiegów`; szybka bramka wykrywania oczywistych regresji, nie dowód przewagi statystycznej.
-* **Release Evaluation:** orientacyjnie `12–15 zadań × 3 konfiguracje × 2 powtórzenia = 72–90 przebiegów/harness`; baseline, Context-Guard, Context-Guard + RTK. Rozszerzać próbę tylko według budżetu i niepewności.
-* **Metryka główna:** `Cost per Passed Run` = całkowity koszt wszystkich przebiegów / liczba sukcesów, wraz z przypadkiem braku sukcesów jako `undefined`. Obok `Pass Rate`, koszt sparowany na wspólnych sukcesach (jawnie warunkowy), liczba tur, latencja, cache read/write/fresh input, TTL, fragmentacja recovery i potwierdzone `reliability_failures`.
-* Nie wyłączać endogenicznych TTL cache misses i kosztów nieudanych prób z głównego wyniku A/B. Odróżniać zakłócenia zewnętrzne.
-* Eksperymenty muszą mieć izolowane workspace, przypięte wersje CLI i modeli, te same limity, kryteria zaliczenia oraz oznaczoną niepewność.
-* Każdy artefakt zapisuje: `harness_id`, `harness_build_id`, `adapter_version`, `hook_config_fingerprint`, `context_guard_version`, `model_id`, wymagane capabilities i poziomy ich dowodu. Sama obecność `CapabilityAttestationKey` nie dowodzi `runtime_verified`.
-* Cursor CLI dopuszczać po testach zgodności wymaganych kontraktów; brak cache telemetry wyklucza precyzyjne rozliczenie cache, nie wszystkie porównania.
+* **Offline Replay:** deterministic verification of transformations, integrity, latency, and contracts against reference records; never pretend replay reproduces live model trajectories.
+* **Small Live Pilot:** roughly `6 tasks × 2 configs × 3 repeats = 36 runs`; a fast regression gate for obvious failures, not statistical proof.
+* **Release Evaluation:** roughly `12–15 tasks × 3 configs × 2 repeats = 72–90 runs/harness`; baseline, Context-Guard, and Context-Guard + RTK. Scale sample size strictly per budget and observed uncertainty.
+* **Primary metric:** `Cost per Passed Run` = total cost of all runs / passed run count (explicitly `undefined` at zero passes), alongside `Pass Rate`, paired cost on shared passes (explicitly conditional), turns, latency, cache read/write/fresh input tokens, TTL misses, recovery fragmentation, and confirmed `reliability_failures`.
+* Never exclude endogenous TTL cache misses or failed-attempt costs from the headline A/B metric. Separate external noise clearly.
+* Experiments require isolated workspaces, pinned CLI and model versions, identical budgets, pass criteria, and reported uncertainty bounds.
+* Every artifact records: `harness_id`, `harness_build_id`, `adapter_version`, `hook_config_fingerprint`, `context_guard_version`, `model_id`, required capabilities, and their evidence levels. Presence of `CapabilityAttestationKey` alone never proves `runtime_verified`.
+* Admit Cursor CLI after contract conformance tests; missing cache telemetry excludes fine-grained cache attribution without blocking all comparisons.
 
-**Release gate:** odtwarzalne raporty, ujawnione niepowodzenia, brak nieuprawnionych twierdzeń przyczynowych, kompletność metadanych.
+**Release gate:** reproducible reports, disclosed failures, zero unsupported causal claims, complete metadata.
 
 ### 8. `v4.8.0` — Capability-Aware Adaptive Governor
 
-**Cel:** deterministycznie wybierać `active`, `shadow` lub `passthrough` dla optymalizatorów.
+**Goal:** deterministically select `active`, `shadow`, or `passthrough` for optimizers.
 
-* `CapabilityContractV1` rozróżnia `unsupported`, `provider_supported`, `harness_exposed`, `runtime_verified`.
-* Atestacja wiąże `(harness_id, harness_build_id, adapter_version, hook_config_fingerprint, capability_id)` i dowód weryfikacji. Zmiana builda, adaptera, istotnej konfiguracji albo nieznany payload degraduje dostępne gwarancje.
-* Nie wywodzić wsparcia harnessu z samego wsparcia API modelu. Dynamiczna modyfikacja listy narzędzi wymaga weryfikacji rzeczywistego klienta, nie tylko dostawcy API.
-* Circuit breaker aktywuje się dla twardych błędów integralności i utraty gwarancji, nie dla samego `suspected_regret` czy chunk-thrashingu.
-* Histereza: po potwierdzonej awarii ponowna aktywacja dopiero po testach lub decyzji operatora. Governor nigdy nie obniża ochrony security policy.
+* `CapabilityContractV1` distinguishes `unsupported`, `provider_supported`, `harness_exposed`, and `runtime_verified`.
+* Attestation binds `(harness_id, harness_build_id, adapter_version, hook_config_fingerprint, capability_id)` plus verification evidence. Changes to build, adapter, relevant config, or unknown payloads invalidate prior guarantees.
+* Never infer harness support from model API capabilities alone. Dynamic tool-list mutation requires verification against the actual client rather than only the upstream provider.
+* Circuit breaker trips on hard integrity failures and guarantee loss, never merely on `suspected_regret` or chunk thrashing.
+* Hysteresis: after a confirmed failure, re-enable only after passing verification tests or explicit operator action. The Governor never lowers security policy enforcement.
 
-**Release gate:** parity tests z konfiguracją statyczną, replay decyzji, testy aktualizacji harnessów i fail-safe downgrade; aktywację domyślną uzależnić od wyników Evidence Engine.
+**Release gate:** parity tests against static config, decision replay, harness-upgrade invalidation tests, and fail-safe downgrade; gate default activation on Evidence Engine results.
 
 ### 9. `v4.9.0` — Explainability & Operational Hardening
 
-**Cel:** użytkownik może wyjaśnić konkretną interwencję i zweryfikować dostępność danych.
+**Goal:** allow operators to explain any specific intervention and audit telemetry completeness.
 
-* `cg explain <event-id>`; diagnostyka lifecycle `spool_id`, aktualnego stanu, przyczyn eksmisji i poziomu dowodu dostarczenia.
-* Eksport kompatybilnych zdarzeń do OTel wyłącznie poza hot path (`cg export --otel`), bez obowiązkowej ciężkiej biblioteki w hookach.
-* Testy zmian wersji harnessu, sesji wznawianych, retencji, awarii dysku, uprawnień i współbieżności.
-* Porównać JSON+lock, SQLite WAL i segmentowane JSONL tylko jeśli pomiary wykażą ograniczenia istniejącego backendu. Żadnej automatycznej migracji Read Ledgera.
+* `cg explain <event-id>`; diagnostics covering `spool_id` lifecycle, current state, eviction reasons, and delivery-evidence tier.
+* Export compatible events to OTel strictly off the hot path (`cg export --otel`), with zero mandatory heavy dependencies inside hooks.
+* Test harness upgrades, resumed sessions, retention boundaries, disk failures, permission errors, and concurrency.
+* Benchmark JSON + lock vs. SQLite WAL and segmented JSONL only if measurements expose limits of the existing backend. Zero unrequested Read Ledger migrations.
 
-**Release gate:** wyjaśnialność bez wycieku surowych promptów, mierzone p50/p95/p99, odtwarzalne zachowanie i bezpieczne migracje.
+**Release gate:** explainability without raw prompt leakage, measured p50/p95/p99 latency, reproducible behavior, and safe migrations.
 
 ### 10. `v5.0.0` — Stable Context Reliability Platform
 
-**Cel:** stabilizacja publicznych kontraktów i ergonomii; nie dodawanie funkcji dla numeru wydania.
+**Goal:** stabilize public contracts and ergonomics rather than shipping features to justify a major version number.
 
-* Spójne CLI: `doctor`, `budget`, `explain`, `eval`.
-* Stabilne Policy API i pozostałe kontrakty, wersjonowanie schematów, polityka deprecacji i zgodne migracje.
-* Publiczna macierz możliwości i ograniczeń Claude Code, Cursor, Codex, Antigravity.
-* Conformance suite adapterów i podstawowych policy packów; pełny SDK dopiero przy rzeczywistym popycie.
-* Brak obowiązku tworzenia Policy API v2, jeśli v1 wystarcza.
+* Cohesive CLI: `doctor`, `budget`, `explain`, `eval`.
+* Stable Policy API and core contracts, schema versioning, deprecation policy, and backward-compatible migrations.
+* Published capability and limitation matrix across Claude Code, Cursor, Codex, and Antigravity.
+* Adapter and baseline policy-pack conformance suite; full external SDK only if real demand warrants it.
+* No mandate to invent Policy API v2 if v1 satisfies all requirements.
 
-**Release gate:** zielone CI, udokumentowane gwarancje, migracje i rollback, raport dowodów skuteczności wraz z ograniczeniami.
+**Release gate:** green Multi-OS CI, documented guarantees, migrations and rollback paths, and published effectiveness evidence including limitations.
 
-### 11. Kontrakty przekrojowe
+### 11. Cross-Cutting Contracts
 
-| Kontrakt | Miejsce pierwszego użycia | Invariant |
+| Contract | First Introduced | Invariant |
 | :--- | :--- | :--- |
-| `SpoolLifecycleV1` | `v4.5.2` | Bez utraty danych w zadeklarowanym okresie; planowa eksmisja nie jest korupcją |
-| `WorkspaceAccessV1` | `v4.5.2` | Wiarygodny root procesu MCP; brak niejawnego `global` access |
-| `ContextReceiptV1` | `v4.5.3` | Korelacja i dowód; surowe dane poza ledgerem |
-| `OutcomeSemanticsV1` | `v4.5.3` | `suspected ≠ confirmed`; brakująca telemetria `≠ zero` |
-| `EvidenceContractV1` | `v4.7.0` | Pełny koszt prób na sukces; jawna niepewność |
-| `CapabilityContractV1` | Metadane w `v4.7.0`; runtime w `v4.8.0` | Zmiana builda/adaptera unieważnia atestację |
+| `SpoolLifecycleV1` | `v4.5.2` | Zero data loss within declared retention; planned eviction is not corruption |
+| `WorkspaceAccessV1` | `v4.5.2` | Trustworthy MCP process root; zero implicit `global` access |
+| `ContextReceiptV1` | `v4.5.3` | Correlation and proof; raw data remains outside ledger |
+| `OutcomeSemanticsV1` | `v4.5.3` | `suspected ≠ confirmed`; missing telemetry `≠ zero` |
+| `EvidenceContractV1` | `v4.7.0` | Full cost of attempts per pass; explicit uncertainty |
+| `CapabilityContractV1` | Metadata in `v4.7.0`; runtime in `v4.8.0` | Build/adapter changes invalidate attestation |
 
-### 12. Plan przekazania do implementacji (najbliższy krok)
+### 12. Implementation Hand-Off Plan (Next Step)
 
-* **Milestone A — spec-first, `v4.5.2` / domknięcie przed `v4.6.0`:**
-  1. Zamrozić publiczne/operacyjne kody błędów, stany manifestu, zasady uprawnień i semantykę półotwartych zakresów.
-  2. Dopisać pięć grup testów kontraktowych: encoding/hash, GC races, crash, workspace/MCP i contention.
-  3. Wdrożyć zapis write-once, limit payloadu i fail-safe passthrough (z walidacją UTF-8 przed spoolowaniem).
-  4. Wdrożyć weryfikowany odczyt z otwarciem uchwytu pod krótką blokadą, a obliczaniem SHA poza nią.
-  5. Wdrożyć `evicting` → `evicted`, tombstone i restart reconciliation.
-  6. Wdrożyć przypięcie korzenia workspace, wspólną kanonizację, `samefile()` i odmowę przy braku tożsamości.
-  7. Uruchomić pełne Multi-OS CI, testy migracji/rollbacku i benchmark latencji; dopiero wtedy tag.
-* **Milestone B — `v4.5.3`:** Context Receipt, korekta regretu, korelacja recovery, walidacja idempotencji i kompletności zdarzeń.
-* **Milestone C — `v4.6.0` i dalej:** realizować zakresy wydań według tabeli w sekcji 3, bez ponownego otwierania strategii.
+* **Milestone A — spec-first, `v4.5.2` / closeout prior to `v4.6.0`:**
+  1. Freeze public/operational error codes, manifest states, permission rules, and half-open range semantics.
+  2. Add five contract test groups: encoding/hash, GC races, crash recovery, workspace/MCP isolation, and lock contention.
+  3. Implement write-once persistence, payload size cap, and fail-safe passthrough (with pre-spool UTF-8 validation).
+  4. Implement verified reads opening payload handles under short locks while hashing off-lock.
+  5. Implement `evicting` → `evicted`, tombstones, and restart reconciliation.
+  6. Implement pinned workspace root resolution, shared canonicalization, `samefile()`, and fail-closed denial on missing identity.
+  7. Pass full Multi-OS CI, migration/rollback checks, and latency benchmarks before tagging.
+* **Milestone B — `v4.5.3`:** Context Receipt, regret refinement, recovery correlation, event idempotency, and completeness reporting.
+* **Milestone C — `v4.6.0` onward:** execute release scopes per Section 3 without reopening settled strategy.
 
-### Zasady kontroli zmian
+### Change Control Rules
 
-Status **ARCHITECTURAL FREEZE** zamraża kolejność i zakres funkcjonalny wydań oraz invariants. Nie zamraża wartości progów, backendu czy szczegółów adapterów, jeżeli testy ujawnią realne ograniczenie.
+Status **ARCHITECTURAL FREEZE** locks release ordering, functional scopes, and core invariants. It does not freeze numeric thresholds, backend storage formats, or adapter internals if empirical testing uncovers constraints.
 
-Zmiana zamrożonego kontraktu wymaga:
+Modifying a frozen contract requires:
 
-1. Konkretnego nieprzechodzącego testu lub nowego dowodu.
-2. Oceny zgodności wstecznej.
-3. Aktualizacji [ROADMAP.md](ROADMAP.md).
-4. Ponownego przejścia **Contract Gate**.
+1. A concrete failing test or new empirical evidence.
+2. Backward-compatibility assessment.
+3. Updating [ROADMAP.md](ROADMAP.md).
+4. Re-passing the **Contract Gate**.
 
-**Decyzja końcowa:** priorytetem na styku `v4.5.2`/`v4.5.3` jest pełne domknięcie niezmienników integralności, nieblokującego hashowania/GC i izolacji `samefile()` przed przejściem do prac nad `v4.6.0` (`Preamble & MCP Budget Advisor`).
+**Final decision:** the top priority at the `v4.5.2`/`v4.5.3` boundary was full closure of integrity invariants, non-blocking hashing/GC, and `samefile()` workspace isolation before starting `v4.6.0` (`Preamble & MCP Budget Advisor`).
