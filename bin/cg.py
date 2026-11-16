@@ -18,6 +18,7 @@ Usage: cg <command> [args...]
 Commands:
   budget     Audit preamble, MCP server, and recommendation budgets
   doctor     Run cross-OS environment and harness self-diagnostics
+  eval       Run Evidence Engine offline replay, plans, and campaign gates
   status     Show token savings, outcomes, and usage reports
   spool      Inspect, search, GC, or serve reversible output spools
   outline    Generate a structural outline for source files
@@ -37,7 +38,7 @@ def _read_plugin_version() -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Dispatch `cg` subcommands (`budget`, `doctor`, `status`, `spool`, `outline`)."""
+    """Dispatch `cg` subcommands (`budget`, `doctor`, `eval`, `status`, `spool`, `outline`)."""
     args = list(sys.argv[1:] if argv is None else argv)
     if not args or args[0] in ("-h", "--help"):
         print(_HELP_TEXT, end="")
@@ -55,6 +56,10 @@ def main(argv: list[str] | None = None) -> int:
         from bin.cg_status import main as status_main
 
         return int(status_main(["--doctor", *rest]))
+    if cmd == "eval":
+        from bin.cg_eval import main as eval_main
+
+        return int(eval_main(rest))
     if cmd == "status":
         from bin.cg_status import main as status_main
 

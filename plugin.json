@@ -1,9 +1,9 @@
 {
   "name": "context-guard",
   "displayName": "Context-Guard",
-  "version": "4.6.0",
+  "version": "4.7.0",
   "license": "MIT",
-  "description": "Zero-prompt Policy API v1 host and token-optimization plugin for Antigravity, Claude Code, Cursor, and Codex: Read Ledger v2 overlap trimming, reversible output spooling & MCP recovery, MCP/transcript outlining, policy_packs, Outcomes v4, shadow/replay, and preamble/MCP budget advisor.",
+  "description": "Zero-prompt Policy API v1 and token-optimization plugin for Antigravity, Claude Code, Cursor, and Codex: Read Ledger v2, reversible output spooling & MCP recovery, outlining, policy_packs, Outcomes v4, preamble/MCP budget advisor, and Evidence Engine replay/eval.",
   "logo": "assets/logo.svg",
   "author": {
     "name": "Advox",

@@ -30,10 +30,13 @@ CG_SHIM_NAME = "cg"
 CG_SHIM_MARKER = "# context-guard:cg"
 BUDGET_SHIM_NAME = "cg-budget"
 BUDGET_SHIM_MARKER = "# context-guard:cg-budget"
+EVAL_SHIM_NAME = "cg-eval"
+EVAL_SHIM_MARKER = "# context-guard:cg-eval"
 _EXTRA_SHIMS: tuple[tuple[str, str, str, str], ...] = (
     ("cg_spool_shim", SPOOL_SHIM_NAME, SPOOL_SHIM_MARKER, "cg_spool.py"),
     ("cg_shim", CG_SHIM_NAME, CG_SHIM_MARKER, "cg.py"),
     ("cg_budget_shim", BUDGET_SHIM_NAME, BUDGET_SHIM_MARKER, "cg_budget.py"),
+    ("cg_eval_shim", EVAL_SHIM_NAME, EVAL_SHIM_MARKER, "cg_eval.py"),
 )
 IS_WINDOWS: bool = os.name == "nt"
 DEFAULT_SHIM_BIN_DIR = Path.home() / ".local" / "bin"

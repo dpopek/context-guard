@@ -53,3 +53,12 @@ If Context-Guard is cloned outside `~/.gemini/config/plugins/context-guard`, run
    - Strictly read-only 4-harness audit cleanly separating `measured`, `estimated`, and `unavailable` figures (never emitting `0` when schemas or usage telemetry are absent).
    - Always-on instruction, memory-index, and skill bytes, duplicate skills, MCP tool overlaps, and non-mutating `minimal-core` / `full-integrations` profiles (note prompt-cache `cache_read` caveats).
    - Use opt-in `--mcp --probe --probe-timeout 3` only when live local stdio `tools/list` schema probing is explicitly requested.
+
+6. **Evidence Engine (`cg eval`):**
+   ```bash
+   python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg.py" eval --offline-replay
+   python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg.py" eval --cursor-conformance
+   ```
+   Review:
+   - Deterministic `EvidenceContractV1` offline replay (zero network or live LLM spawns), `CapabilityAttestationKey` provenance, and Cursor CLI conformance (`excluded_missing_telemetry` cache handling).
+   - Use `--pilot --plan`, `--release --plan`, or `--ledger-verify` to plan isolated campaigns or verify durable `evidence_events.json` Outcomes v4 derivation.

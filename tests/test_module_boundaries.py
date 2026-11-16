@@ -1,4 +1,4 @@
-"""Modules in hooks/, bin/, policies/, integrations/, and spool/ talk to each other through public names only."""
+"""Modules in hooks/, bin/, policies/, integrations/, spool/, and evidence/ talk to each other through public names only."""
 from __future__ import annotations
 
 import ast
@@ -10,7 +10,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 _OPERATOR_HOME = Path.home()
-_PROD_PACKAGES = ("hooks", "bin", "policies", "integrations", "spool")
+_PROD_PACKAGES = ("hooks", "bin", "policies", "integrations", "spool", "evidence")
 GENERIC_REPO_BASENAMES: frozenset[str] = frozenset({
     "project", "backend", "frontend", "production", "stage", "test", "upgradetest",
     "maintenance", "image", "docker", "native", "meta", "charts", "ci-cd",
@@ -225,6 +225,11 @@ def test_zero_import_cycles_across_hooks_and_bin() -> None:
                 d for d in deps if d in forbidden_spool_deps or d == "bin" or d.startswith("bin.")
             )
             assert bad == [], f"{mod_name} must not import {bad}"
+        if mod_name.split(".")[0] in ("hooks", "spool", "policies", "integrations"):
+            bad_evidence = sorted(
+                d for d in deps if d == "evidence" or d.startswith("evidence.")
+            )
+            assert bad_evidence == [], f"{mod_name} must not import {bad_evidence}"
 
 
 def test_hooks_total_loc_ceiling() -> None:
@@ -431,7 +436,7 @@ def test_outline_loc_ceiling_and_zero_hardcoded_user_paths() -> None:
     )
 
     dynamic_terms = _load_operator_private_terms()
-    for folder in ("bin", "hooks", "policies", "integrations", "spool", "rules", "skills", "tests", "vscode-extension"):
+    for folder in ("bin", "hooks", "policies", "integrations", "spool", "evidence", "rules", "skills", "tests", "vscode-extension"):
         is_tests = folder == "tests"
         for src_file in sorted((ROOT / folder).rglob("*")):
             if not src_file.is_file() or src_file.suffix not in (".py", ".md", ".json", ".js"):

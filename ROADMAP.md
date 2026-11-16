@@ -7,7 +7,7 @@
 **Document purpose:** authoring specifications, TDD plans, issues, and acceptance criteria for upcoming releases
 
 > [!NOTE]
-> **Repository state in `v4.6.0`:** Following the closure of the Architectural Freeze (`INV-1`–`INV-7`) in `v4.5.3`, `v4.6.0` delivered the **Preamble & MCP Budget Advisor**: passive, read-only `cg budget` auditing (`--preamble`, `--mcp`, `--recommendations`) for Antigravity, Claude Code, Cursor, and Codex with explicit `measured` / `estimated` / `unavailable` separation, secret and home-path redaction, duplicate and MCP tool overlap detection, cautious session profiles (`minimal-core`, `full-integrations`), explicit opt-in `--probe` stdio `tools/list` inspection, and a unified `cg` dispatcher (with `cg` and `cg-budget` shims), opening the gate for `v4.7.0` work.
+> **Repository state in `v4.7.0`:** Following the `v4.5.3` Architectural Freeze (`INV-1`–`INV-7`) and the `v4.6.0` Preamble & MCP Budget Advisor (`cg budget`), `v4.7.0` delivered the **Evidence Engine** (`evidence/`, `bin/cg_eval.py`, `cg eval`, and `cg-eval` shim): `EvidenceContractV1` and `CapabilityAttestationKey` metadata, a durable deduplicated `evidence_events.json` ledger with deterministic Outcomes v4 derivation (`unavailable`/`incomplete` separation), the Cursor CLI conformance gate (`--cursor-conformance`), causal `Cost per Passed Run` metrics (including TTL cache misses and failed attempts, with Wilson 95% and task-clustered bootstrap intervals), isolated `--offline-replay`, and `--pilot` / `--release` (`6x2x3` / `12-15x3x2`) campaign controls, opening the gate for `v4.8.0` (**Capability-Aware Adaptive Governor**).
 
 ---
 

@@ -34,7 +34,7 @@ from bin.harness_status import (  # noqa: E402
 from bin.instruction_block import (  # noqa: E402
     BUDGET_SHIM_MARKER, BUDGET_SHIM_NAME, CG_SHIM_MARKER, CG_SHIM_NAME,
     DEFAULT_INSTRUCTION_FILES, DEFAULT_SHIM_BIN_DIR, SPOOL_SHIM_MARKER, SPOOL_SHIM_NAME,
-    install_outline_pull, shim_installed, uninstall_outline_pull,
+    EVAL_SHIM_MARKER, EVAL_SHIM_NAME, install_outline_pull, shim_installed, uninstall_outline_pull,
 )
 from bin.migration_guard import RollbackJournal, StagedPackTransaction, preflight_migration_check  # noqa: E402
 from hooks.config import cached_raw_config_status, clear_config_cache, load_runtime_config, probe_claude_cli_version, resolve_user_config_path  # noqa: E402
@@ -619,7 +619,7 @@ def install_all(
         if j_arg is not None:
             eff_bin = shim_bin_dir or (DEFAULT_SHIM_BIN_DIR if use_defaults else None)
             if eff_bin is not None:
-                for name in ("cg-outline", SPOOL_SHIM_NAME, CG_SHIM_NAME, BUDGET_SHIM_NAME):
+                for name in ("cg-outline", SPOOL_SHIM_NAME, CG_SHIM_NAME, BUDGET_SHIM_NAME, EVAL_SHIM_NAME):
                     j_arg.record_file_backup(eff_bin / name)
             eff_inst = instruction_files if instruction_files is not None else (DEFAULT_INSTRUCTION_FILES if use_defaults else ())
             for inst_path in eff_inst:
@@ -722,6 +722,7 @@ def check_status(
     status["cg_spool_shim"] = shim_installed(eff_bin, shim_name=SPOOL_SHIM_NAME, marker=SPOOL_SHIM_MARKER)
     status["cg_shim"] = shim_installed(eff_bin, shim_name=CG_SHIM_NAME, marker=CG_SHIM_MARKER)
     status["cg_budget_shim"] = shim_installed(eff_bin, shim_name=BUDGET_SHIM_NAME, marker=BUDGET_SHIM_MARKER)
+    status["cg_eval_shim"] = shim_installed(eff_bin, shim_name=EVAL_SHIM_NAME, marker=EVAL_SHIM_MARKER)
     status["cursor_spool_mcp"] = _cursor_spool_mcp_installed(_resolve_cursor_mcp_path(eff_cu, cursor_mcp_path))
     return status
 

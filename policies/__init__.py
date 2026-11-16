@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 from policies.api import (
+    ADAPTER_CONTRACT_VERSION,
     ALL_SECURITY_SCOPES,
+    EVIDENCE_SCHEMA_VERSION,
     HARNESS_OUTPUT_CAPABILITIES,
     POLICY_API_VERSION,
+    VALID_CAPABILITY_EVIDENCE_LEVELS,
+    VALID_EVAL_TIERS,
     VALID_POLICY_KINDS,
     VALID_POLICY_MODES,
+    VALID_RUN_OUTCOME_CLASSES,
+    CapabilityAttestationKey,
+    CapabilityRequirementV1,
+    EvidenceContractV1,
+    EvidenceEnvironmentMetadataV1,
     HarnessOutputCapabilities,
     InstallerHookSpec,
     PolicyContext,
@@ -19,7 +28,13 @@ from policies.api import (
 )
 
 __all__ = [
+    "ADAPTER_CONTRACT_VERSION",
     "ALL_SECURITY_SCOPES",
+    "CapabilityAttestationKey",
+    "CapabilityRequirementV1",
+    "EVIDENCE_SCHEMA_VERSION",
+    "EvidenceContractV1",
+    "EvidenceEnvironmentMetadataV1",
     "HARNESS_OUTPUT_CAPABILITIES",
     "HarnessOutputCapabilities",
     "InstallerHookSpec",
@@ -30,6 +45,9 @@ __all__ = [
     "PolicyPostContext",
     "RuntimeCapabilities",
     "SpoolContractV1",
+    "VALID_CAPABILITY_EVIDENCE_LEVELS",
+    "VALID_EVAL_TIERS",
     "VALID_POLICY_KINDS",
     "VALID_POLICY_MODES",
+    "VALID_RUN_OUTCOME_CLASSES",
 ]

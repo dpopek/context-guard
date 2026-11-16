@@ -5,6 +5,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 
 ## [Unreleased]
 
+## [4.7.0] - 2026-11-16
+
+### Added
+- **Evidence contracts (`policies/api.py`, `policies/__init__.py`):** Exported `EvidenceContractV1` and `CapabilityAttestationKey`.
+- **Durable ledger (`evidence/ledger.py`):** Added `evidence_events.json` dedup, Outcomes v4 derivation, and Cursor conformance gate.
+- **Evidence metrics (`evidence/metrics.py`):** Added `Cost per Passed Run`, noise guard, Wilson/bootstrap CIs, and matrix planner.
+- **Campaign runner (`evidence/runner.py`):** Added isolated offline replay, control checks, and workspace-isolated execution.
+- **Eval CLI (`bin/cg_eval.py`, `bin/cg.py`):** Added `cg eval` / `cg-eval` (`--offline-replay`, `--pilot`, `--release`).
+
+### Changed
+- **Shims & installer (`instruction_block.py`, `install_harnesses.py`):** Wired `cg-eval` shim into install, backup, and status.
+- **CI & docs (`pyproject.toml`, `README.md`, `ROADMAP.md`, `SKILL.md`):** Enabled `evidence/` checks and synced `v4.7.0` docs.
+
 ## [4.6.0] - 2026-11-16
 
 ### Added

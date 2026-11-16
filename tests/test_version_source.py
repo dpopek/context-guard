@@ -48,6 +48,7 @@ def test_no_version_literal_outside_the_manifests() -> None:
         *ROOT.glob("policies/*.py"),
         *ROOT.glob("integrations/*.py"),
         *ROOT.glob("spool/*.py"),
+        *ROOT.glob("evidence/*.py"),
         *ROOT.glob("tests/*.py"),
         *ROOT.glob("vscode-extension/*.js"),
     ]
@@ -71,7 +72,15 @@ def test_readme_version_modules_flags_and_config_stay_in_sync() -> None:
 
     production_modules = sorted(
         path.name
-        for pattern in ("hooks/*.py", "bin/*.py", "policies/*.py", "integrations/*.py", "spool/*.py", "vscode-extension/*.js")
+        for pattern in (
+            "hooks/*.py",
+            "bin/*.py",
+            "policies/*.py",
+            "integrations/*.py",
+            "spool/*.py",
+            "evidence/*.py",
+            "vscode-extension/*.js",
+        )
         for path in ROOT.glob(pattern)
         if path.name != "__init__.py"
     )

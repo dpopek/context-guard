@@ -186,9 +186,88 @@ class PolicyPackManifest:
     inspect_config: Callable[[Mapping[str, Any]], list[str]] | None = None
 
 
+EVIDENCE_SCHEMA_VERSION: int = 1
+ADAPTER_CONTRACT_VERSION: str = "harness_adapter_v1"
+VALID_CAPABILITY_EVIDENCE_LEVELS: tuple[str, ...] = (
+    "unsupported",
+    "provider_supported",
+    "harness_exposed",
+    "runtime_verified",
+)
+VALID_EVAL_TIERS: tuple[str, ...] = (
+    "offline_replay",
+    "small_live_pilot",
+    "release_evaluation",
+)
+VALID_RUN_OUTCOME_CLASSES: tuple[str, ...] = (
+    "passed",
+    "failed_attempt",
+    "external_noise",
+)
+
+
+@dataclass(frozen=True)
+class CapabilityAttestationKey:
+    """Attestation tuple binding capability claims to exact harness, build, adapter, and hook config."""
+
+    harness_id: str
+    harness_build_id: str
+    adapter_version: str
+    hook_config_fingerprint: str
+    capability_id: str
+
+
+class CapabilityRequirementV1(TypedDict):
+    """Required capability record with explicit evidence level; key presence never implies runtime_verified."""
+
+    capability_id: str
+    evidence_level: str
+    attestation_key: dict[str, str]
+    verification_source: str
+    runtime_verified: bool
+
+
+class EvidenceEnvironmentMetadataV1(TypedDict):
+    """Mandatory environment and capability provenance attached to every Evidence Engine artifact."""
+
+    harness_id: str
+    harness_build_id: str
+    adapter_version: str
+    hook_config_fingerprint: str
+    context_guard_version: str
+    model_id: str
+    attestation_key_implies_runtime_verified: bool
+    required_capabilities: list[CapabilityRequirementV1]
+
+
+class EvidenceContractV1(TypedDict):
+    """Schema v1 evidence report produced by offline replay, small live pilot, and release evaluation."""
+
+    schema_version: int
+    campaign_id: str
+    tier: str
+    generated_at: str
+    statistical_proof: bool
+    trajectory_claim: str
+    environment: EvidenceEnvironmentMetadataV1
+    arms: list[str]
+    budget_contract: dict[str, Any]
+    arm_summaries: dict[str, dict[str, Any]]
+    paired_comparisons: list[dict[str, Any]]
+    disclosed_failures: list[dict[str, Any]]
+    uncertainty_bounds: dict[str, Any]
+    gate_verdict: dict[str, Any]
+
+
 __all__ = [
+    "ADAPTER_CONTRACT_VERSION",
     "ALL_SECURITY_SCOPES",
+    "CapabilityAttestationKey",
+    "CapabilityRequirementV1",
     "ContextReceiptV1",
+    "EVIDENCE_SCHEMA_VERSION",
+    "EvidenceContractV1",
+    "EvidenceEnvironmentMetadataV1",
     "HARNESS_OUTPUT_CAPABILITIES",
     "HarnessOutputCapabilities",
     "InstallerHookSpec",
@@ -200,7 +279,10 @@ __all__ = [
     "RECEIPT_SCHEMA_VERSION",
     "RuntimeCapabilities",
     "SpoolContractV1",
+    "VALID_CAPABILITY_EVIDENCE_LEVELS",
+    "VALID_EVAL_TIERS",
     "VALID_POLICY_KINDS",
     "VALID_POLICY_MODES",
+    "VALID_RUN_OUTCOME_CLASSES",
     "VALID_TURN_CORRELATIONS",
 ]
