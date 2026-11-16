@@ -2,8 +2,22 @@
 
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
+import stat
+
 import policies.api as api
 from policies.api import ContextReceiptV1, RECEIPT_SCHEMA_VERSION
+from spool.receipts import (
+    RECEIPTS_KEEP_ROWS,
+    RECEIPTS_MAX_BYTES,
+    append_receipt,
+    build_receipt,
+    find_created_receipt,
+    persist_spool_delivery_verification,
+    summarize_receipts,
+)
 
 
 def test_context_receipt_v1_schema_contract() -> None:
@@ -39,3 +53,158 @@ def test_context_receipt_v1_schema_contract() -> None:
         raw_val = ann[key]
         actual = raw_val if isinstance(raw_val, str) else getattr(raw_val, "__forward_arg__", repr(raw_val))
         assert actual == expected
+
+
+def test_receipts_rotate_at_limit_and_summarize_counts(tmp_path: Path) -> None:
+    """Verify 0o600 creation, symlink refusal, atomic 512 KiB rotation, and 7-key summary."""
+    rcpt_path = tmp_path / "spool" / "receipts.jsonl"
+    first = build_receipt(
+        event_type="spool_created",
+        harness="claude",
+        session_id="s-0000",
+        workspace_id="ws_0123456789abcdef",
+        turn_key="s-0000:step:1",
+        call_id="call-0000",
+        spool_id="sp_000000000000",
+        line_span=(0, 220),
+        byte_span=(0, 14000),
+        delivery_evidence="replacement_emitted",
+        spool_id_referenced=False,
+        timestamp="2026-11-16T00:00:00Z",
+    )
+    assert append_receipt(first, receipts_path=rcpt_path) is True
+    assert rcpt_path.is_file()
+    if os.name != "nt":
+        assert stat.S_IMODE(rcpt_path.stat().st_mode) == 0o600
+
+    # Pre-seed valid rows just past RECEIPTS_MAX_BYTES so the next append_receipt triggers rotation.
+    seed_lines: list[str] = []
+    idx = 1
+    total_b = rcpt_path.stat().st_size
+    while total_b <= RECEIPTS_MAX_BYTES:
+        row = build_receipt(
+            event_type="spool_recovery",
+            harness="claude",
+            session_id=f"s-{idx:04d}",
+            workspace_id="ws_0123456789abcdef",
+            turn_key=f"s-{idx:04d}:step:1",
+            call_id=f"call-{idx:04d}",
+            spool_id=f"sp_{idx:012x}",
+            line_span=(0, 220),
+            byte_span=(0, 14000),
+            delivery_evidence="unverified",
+            spool_id_referenced=True,
+            timestamp=f"2026-11-16T00:{(idx // 60) % 60:02d}:{idx % 60:02d}Z",
+        )
+        encoded = json.dumps(dict(row), separators=(",", ":"), sort_keys=True) + "\n"
+        seed_lines.append(encoded)
+        total_b += len(encoded.encode("utf-8"))
+        idx += 1
+    with open(rcpt_path, "ab") as fh:
+        fh.write("".join(seed_lines).encode("utf-8"))
+
+    extra = build_receipt(
+        event_type="spool_integrity_failure",
+        harness="cli",
+        session_id="s-fail",
+        workspace_id="ws_0123456789abcdef",
+        turn_key="",
+        call_id="",
+        spool_id="sp_ffffffffffff",
+        line_span=(0, 0),
+        byte_span=(0, 128),
+        delivery_evidence="unverified",
+        spool_id_referenced=True,
+        failure_kind="reliability_failure",
+        reason="integrity_mismatch",
+        timestamp="2026-11-16T23:59:59Z",
+    )
+    assert append_receipt(extra, receipts_path=rcpt_path) is True
+
+    rows = [json.loads(line) for line in rcpt_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(rows) == RECEIPTS_KEEP_ROWS
+    assert rows[-1]["receipt_id"] == extra["receipt_id"]
+    summary = summarize_receipts(rcpt_path)
+    assert set(summary.keys()) == {
+        "receipt_count",
+        "created_count",
+        "delivery_verified_count",
+        "recovery_count",
+        "integrity_failures",
+        "last_failure_ts",
+        "last_event_ts",
+    }
+    assert summary["receipt_count"] == RECEIPTS_KEEP_ROWS
+    assert summary["integrity_failures"] == 1
+    assert summary["last_failure_ts"] == "2026-11-16T23:59:59Z"
+    assert summary["last_event_ts"] == "2026-11-16T23:59:59Z"
+
+    if os.name != "nt":
+        sym_path = tmp_path / "sym_receipts.jsonl"
+        target = tmp_path / "target.jsonl"
+        target.write_text("", encoding="utf-8")
+        sym_path.symlink_to(target)
+        assert append_receipt(extra, receipts_path=sym_path) is False
+
+
+def test_persist_spool_delivery_verification_matches_created_and_deduplicates(tmp_path: Path) -> None:
+    """Verify PostToolBatch verification links parent spool_created, ignores spoofs, and deduplicates."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    spool_dir = tmp_path / "spool"
+    rcpt_path = spool_dir / "receipts.jsonl"
+    from spool.receipts import resolve_workspace_identity
+
+    ws_id, _, err = resolve_workspace_identity(repo)
+    assert err is None
+    created = build_receipt(
+        event_type="spool_created",
+        harness="claude",
+        session_id="sess-1",
+        workspace_id=ws_id,
+        turn_key="sess-1:step:2",
+        call_id="call-1",
+        spool_id="sp_0123456789ab",
+        line_span=(0, 240),
+        byte_span=(0, 18000),
+        delivery_evidence="replacement_emitted",
+        spool_id_referenced=False,
+    )
+    assert append_receipt(created, receipts_path=rcpt_path) is True
+    found = find_created_receipt("sp_0123456789ab", session_id="sess-1", receipts_path=rcpt_path)
+    assert found is not None and found["receipt_id"] == created["receipt_id"]
+
+    batch_payload = {
+        "session_id": "sess-1",
+        "cwd": str(repo),
+        "tool_calls": [
+            {
+                "tool_use_id": "call-1",
+                "tool_response": "[CONTEXT-GUARD OUTPUT SPOOL: sp_0123456789ab | 240 lines, 18000 B | sha256=abc]",
+            },
+            {
+                "tool_use_id": "call-spoof",
+                "tool_response": "[CONTEXT-GUARD OUTPUT SPOOL: sp_deadbeefcafe | 10 lines, 100 B | sha256=bad]",
+            },
+        ],
+    }
+    added_1 = persist_spool_delivery_verification(
+        batch_payload,
+        harness="claude",
+        session_id="sess-1",
+        workspace_root=repo,
+        spool_dir=spool_dir,
+    )
+    added_2 = persist_spool_delivery_verification(
+        batch_payload,
+        harness="claude",
+        session_id="sess-1",
+        workspace_root=repo,
+        spool_dir=spool_dir,
+    )
+    assert added_1 == 1
+    assert added_2 == 0
+    summary = summarize_receipts(rcpt_path)
+    assert summary["created_count"] == 1
+    assert summary["delivery_verified_count"] == 1

@@ -1,8 +1,8 @@
 # Context-Guard (v4.5.1)
 
-Zero-prompt policy host, Read Ledger v2 (`range_trim`), reversible output spooling, machine-artifact unwrapper, and multi-harness telemetry plugin for **Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex** (`macOS`, `Linux`, `Windows`).
+Zero-prompt policy host, Read Ledger v2 (`range_trim`), reversible output spooling, artifact unwrapper, and telemetry plugin for **Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex** (`macOS`, `Linux`, `Windows`).
 
-Pure Python 3.9+ stdlib hooks combining `cg-outline <path>` (21 extensions, optional `tree-sitter-language-pack`), Read Ledger v2 trimming, `cg-spool` recovery, Policy API v1 packs, Outcomes Schema v4, and `--replay` / `--benchmark` checks.
+Pure Python 3.9+ stdlib hooks: `cg-outline <path>` (21 extensions, optional `tree-sitter-language-pack`), Read Ledger v2 trimming, `cg-spool` recovery, Policy API v1 packs, Outcomes v4, and `--replay` / `--benchmark`.
 
 ---
 
@@ -60,11 +60,11 @@ Trims noisy test/grep boilerplate without overriding explicit user flags (`-v`/`
 - Scans `transcript*.jsonl` (`O(delta)`), emitting `AUTO-COMPACT SENSOR` (`>= 80` steps or `512 KB`) and `AUTO-COMPACT HARD STOP` (`>= 200` steps or `1024 KB`).
 - Splits `claude (cli)`/`(desktop)` (`mcp:ccd_*`) and `codex (cli)`/`(desktop)`, scores `Recent (10)` preamble hygiene, and computes 30-day `sunset_verdict` in `--usage`.
 
-### 5. Reversible Output Spooling & Multi-Step Regret (`spool/store.py`, `spool/mcp_server.py`)
+### 5. Reversible Output Spooling & Multi-Step Regret (`spool/store.py`, `spool/receipts.py`, `spool/mcp_server.py`)
 - **Opt-In Spooling:** `"output_spool": "active"` swaps huge Claude (`Bash`/`mcp__*`) & Cursor (`MCP:*`/`mcp__*`) outputs (`>= 12,288` B or `200` lines, saving `>= 2,048` B) for `<= 3,072` B summaries.
-- **Storage & Shadow:** Stores `sp_<12hex>.txt` (`25`/`15` head/tail lines; `24h` TTL, `64` entries, `32 MB` cap); `"shadow"` logs `shadow_spools` without disk blobs.
+- **Storage & Shadow:** Stores `sp_<12hex>.txt` (`25`/`15` head/tail lines; `24h` TTL, `64` entries, `32 MB` cap) plus `receipts.jsonl`; `"shadow"` logs `shadow_spools` without disk blobs.
 - **Recovery CLI & MCP:** Inspect via `cg-spool` (`slice`, `grep`, `list`, `gc`, `mcp`) or stdio MCP (`cg_spool_slice`, `cg_spool_grep`, `cg_spool_list`); `"cursor_spool_mcp": "active"` syncs `~/.cursor/mcp.json`.
-- **Multi-Step Regret (`hooks/outcomes.py`):** Tracks `output_spool` recovery/repeat regret, `cli_rewrite` verbose-override regret, and `range_trim` overlap/shell-bypass regret (reconciled on edits).
+- **Multi-Step Regret (`hooks/outcomes.py`):** Tracks `output_spool` recovery/repeat, `cli_rewrite` verbose-override, and `range_trim` overlap/bypass regret (reconciled on edits).
 
 ---
 
@@ -72,13 +72,14 @@ Trims noisy test/grep boilerplate without overriding explicit user flags (`-v`/`
 
 Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`:
 - **Zero Import Cycles & Slim Footprint:** `Tarjan SCC == 0`; every `.py <= 800` LOC; `hooks/*.py` total `< 6,800` LOC.
-- **Lock Ordering:** Independent non-truncating file locks + atomic `os.replace` across `.context_guard_state.lock`, `stats.lock`, `outcomes.lock`, `token_usage.lock`, `update.lock`, and `update_refresh.lock`.
+- **Lock Ordering:** Independent non-truncating locks + `os.replace` across `.context_guard_state.lock`, `stats.lock`, `outcomes.lock`, `token_usage.lock`, `receipts.lock`, `update.lock`, and `update_refresh.lock`.
 
 | Module | Layer | Responsibility |
 | :--- | :--- | :--- |
-| `policies/api.py` | Policy API | `POLICY_API_VERSION = 1` dataclasses (`PolicyPackManifest`, `PolicyContext`, `PolicyDecision`, `InstallerHookSpec`, `SpoolContractV1`). |
-| `policies/loader.py` | Policy API | Zero-TOCTOU pack directory, `file_hashes`, and `tree_sha256` verifier + in-memory byte loader. |
+| `policies/api.py` | Policy API | `POLICY_API_VERSION = 1` contracts (`PolicyPackManifest`, `PolicyContext`, `PolicyDecision`, `InstallerHookSpec`, `SpoolContractV1`, `ContextReceiptV1`). |
+| `policies/loader.py` | Policy API | Verified pack directory, `file_hashes`, and `tree_sha256` in-memory byte loader. |
 | `integrations/atlassian_twg.py` | Integration | Opt-in CLI rewriter and JSON stdout summarizer (`"atlassian_twg": "active"`). |
+| `spool/receipts.py` | Output Spool | Workspace root canonicalization, `check_unsafe_link`, isolation config, and bounded `receipts.jsonl` ledger. |
 | `spool/store.py` | Output Spool | Content-addressed spool storage, head/tail summaries, `slice`/`grep`/`list`/`gc`, and pre-tool follow-up classifier. |
 | `spool/mcp_server.py` | Output Spool | Dual-framed (`Content-Length` + NDJSON) stdio MCP server (`cg_spool_*`) and atomic `.cursor/mcp.json` sync. |
 | `hooks/policy_engine.py` | Hook Core | Evaluates verified packs, Pass-2 fallbacks, and lifecycle dispatch. |
@@ -86,19 +87,19 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 | `hooks/pre_invocation.py` | Hook Entry | Antigravity incremental `O(delta)` transcript scanner, session hooks, and auto-compact sensor. |
 | `hooks/pre_compact.py` | Hook Entry | `PreCompact` / `preCompact` read-cache, `shadow_spools`, and `policy_state` reset hook. |
 | `hooks/post_tool_use.py` | Hook Entry | `PostToolUse` / `postToolUse` output spooling, `range_trim` confirmation, and `on_tool_completed`. |
-| `hooks/session_end.py` | Hook Entry | `SessionEnd` hook clearing `pending_reads`, closing open windows, and emitting session-end events. |
+| `hooks/session_end.py` | Hook Entry | Clears `pending_reads`, closes open windows, and emits session-end events. |
 | `hooks/harness_adapter.py` | Normalization | Normalizes tool payloads (`Read`, `Bash`, `exec_command`, `apply_patch`), permission modes, and verdicts. |
 | `hooks/read_planner.py` | Core Engine | Silent `range_trim` overlap trimmer, slice caps, and machine-artifact outline planner. |
-| `hooks/shell_parser.py` | Core Engine | Guardrailed quiet CLI flag rewriter, `cg-outline` detector, and shell-read analyzer. |
+| `hooks/shell_parser.py` | Core Engine | Quiet CLI flag rewriter, `cg-outline` detector, and shell-read analyzer. |
 | `hooks/session_lifecycle.py` | State & Cache | Checkpoint compaction (`apply_compaction_boundary`) and rewind (`prune_state_on_rewind`) pruning. |
 | `hooks/state_store.py` | State & Cache | State dir resolution (`resolve_state_dir`), subagent isolation, and locked JSON persistence. |
-| `hooks/file_io.py` | State & Cache | Streaming 64 KB `SHA-256` hashing (`10 MB` stat fallback), line counter, and `tail -n` reader. |
-| `hooks/config.py` | State & Cache | Stat-keyed universal loader for `~/.config/context-guard/config.json`. |
-| `hooks/outline.py` | Outliners | Structural AST/regex/tree-sitter code outliner across 21 file extensions (`<= 2 MB`). |
+| `hooks/file_io.py` | State & Cache | Streaming 64 KB `SHA-256` hashing (`10 MB` fallback), line counter, and `tail -n` reader. |
+| `hooks/config.py` | State & Cache | Stat-keyed loader for `~/.config/context-guard/config.json`. |
+| `hooks/outline.py` | Outliners | AST/regex/tree-sitter code outliner across 21 extensions (`<= 2 MB`). |
 | `hooks/markup_outliners.py` | Outliners | Outliners for `.phtml`, `.vue`, `.xml`, `.md`/`.mdx`, `.diff`/`.patch`, `.json`, `.yaml`. |
 | `hooks/json_outliners.py` | Outliners | Unwrappers/summarizers for MCP JSON envelopes, tabular rows, and `transcript*.jsonl`. |
 | `hooks/telemetry.py` | Telemetry | Atomic savings ledger (`telemetry/stats.json`), slice estimator, daily rollup, and `telemetry/shadow.json`. |
-| `hooks/outcomes.py` | Telemetry | `O(1)` Outcomes Schema v4 ledger (`outcomes.json`) tracking `output_spool`, `cli_rewrite`, and `range_trim` correlation. |
+| `hooks/outcomes.py` | Telemetry | `O(1)` Outcomes Schema v4 ledger (`outcomes.json`) for `output_spool`, `cli_rewrite`, and `range_trim` correlation. |
 | `hooks/shell_output.py` | Telemetry | Extracts shell stdout/stderr, classifies command families, and updates `stats.json`. |
 | `hooks/model_identity.py` | Telemetry | Resolves canonical model slugs (Antigravity, Claude, Codex) and `model_labels` overrides. |
 | `bin/cg_status.py` | CLI & UI | Status CLI (`--short`, `--claude-hud`, `--markdown`, `--json`, `--outcomes`, `--usage`, `--doctor`, `--replay`, `--benchmark`, `--public-json`). |
@@ -110,7 +111,7 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 | `bin/harness_status.py` | CLI & UI | Cycle-free status verifier and matcher merger across Claude Code, Cursor, and Codex configs. |
 | `bin/outline.py` | CLI & UI | CLI wrapper around `hooks/outline.py` (`cg-outline`). |
 | `bin/instruction_block.py` | CLI & UI | `cg-outline` + `cg-spool` shims and instruction-file rule block. |
-| `bin/update_check.py` | CLI & UI | Non-blocking `origin` release tag checker (`update.json` / `install.json`, `--force`). |
+| `bin/update_check.py` | CLI & UI | Non-blocking `origin` tag checker (`update.json` / `install.json`, `--force`). |
 | `bin/token_usage.py` | CLI & UI | Incremental session log reader (`token_usage.json` v3) with model carry-over across all 4 harnesses. |
 | `bin/transcript_parsers.py` | CLI & UI | Stateless record parsers and UTC day normalizer for Claude, Codex, Antigravity, and Cursor logs. |
 | `bin/preamble_attribution.py` | CLI & UI | Measures always-on instruction files, separates CLI/Desktop apps, and computes `sunset_verdict`. |
@@ -118,10 +119,10 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 | `bin/outcomes_report.py` | CLI & UI | Formats Schema v4 follow-up outcomes and `"Estimated Cost Impact (non-counterfactual)"` (`1/k` step share). |
 | `bin/tariffs.py` | CLI & UI | Bundled model token tariff tables (`TARIFF_EFFECTIVE_DATE`) for non-counterfactual cost estimates. |
 | `vscode-extension/extension.js` | IDE Extension | Status bar pill, 4s pulse, report panel, `update.lock` backoff, and one-click updater. |
-| `vscode-extension/view_model.js` | IDE Extension | Pure telemetry normalization, v4.x insights summarization, SemVer validation, and CSP. |
+| `vscode-extension/view_model.js` | IDE Extension | Telemetry normalization, v4.x insights summarization, SemVer validation, and CSP. |
 | `vscode-extension/updater.js` | IDE Extension | Self-update runner with dirty precheck, `git reset --keep` rollback, `plugin_root.json` resolver, and `probeDoctor`. |
 | `vscode-extension/renderers.js` | IDE Extension | Escaped tooltip Markdown, sidebar SVG donut HTML, and dashboard report views. |
-| `vscode-extension/cost_insights.js` | IDE Extension | Summarizes and formats bounded non-counterfactual cost estimates and model attribution insights. |
+| `vscode-extension/cost_insights.js` | IDE Extension | Formats bounded non-counterfactual cost estimates and model insights. |
 
 ---
 
@@ -144,9 +145,9 @@ python3 "$CG_DIR/bin/install_harnesses.py" --install --pack-source /path/to/poli
 python3 "$CG_DIR/bin/install_harnesses.py" --uninstall
 ```
 
-- **Staged pack migration:** Stage packs via companion `install_pack.py --stage` or `install_harnesses.py --install --pack-source <dir>`.
+- **Staged pack migration:** Stage packs via `install_pack.py --stage` or `install_harnesses.py --install --pack-source <dir>`.
 - **Antigravity users:** clone into `~/.gemini/config/plugins/context-guard` so Antigravity loads it as a plugin.
-- **Moving the checkout:** re-run `--install` after moving or re-cloning; `CONTEXT_GUARD_HOME` overrides the checkout path at runtime.
+- **Moving the checkout:** re-run `--install` after moving; `CONTEXT_GUARD_HOME` overrides the checkout path at runtime.
 
 ---
 

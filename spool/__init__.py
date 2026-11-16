@@ -3,6 +3,25 @@
 from __future__ import annotations
 
 from spool.mcp_server import serve_stdio, sync_cursor_spool_mcp
+from spool.receipts import (
+    RECEIPTS_FILENAME,
+    RECEIPTS_KEEP_ROWS,
+    RECEIPTS_LOCK_FILENAME,
+    RECEIPTS_MAX_BYTES,
+    VALID_SPOOL_ISOLATIONS,
+    append_receipt,
+    atomic_write_bytes,
+    build_receipt,
+    check_unsafe_link,
+    compute_scope_key,
+    compute_scoped_spool_id,
+    find_created_receipt,
+    persist_spool_delivery_verification,
+    read_spool_isolation_config,
+    receipts_path_for,
+    resolve_workspace_identity,
+    summarize_receipts,
+)
 from spool.store import (
     build_post_tool_spool_response,
     classify_pre_tool_spool_followup,
@@ -18,17 +37,34 @@ from spool.store import (
 )
 
 __all__ = [
+    "RECEIPTS_FILENAME",
+    "RECEIPTS_KEEP_ROWS",
+    "RECEIPTS_LOCK_FILENAME",
+    "RECEIPTS_MAX_BYTES",
+    "VALID_SPOOL_ISOLATIONS",
+    "append_receipt",
+    "atomic_write_bytes",
     "build_post_tool_spool_response",
+    "build_receipt",
+    "check_unsafe_link",
     "classify_pre_tool_spool_followup",
     "compute_command_signature",
+    "compute_scope_key",
+    "compute_scoped_spool_id",
+    "find_created_receipt",
     "gc_spools",
     "grep_spool",
     "inspect_spool_health",
     "is_verbose_override_command",
     "list_spools",
+    "persist_spool_delivery_verification",
+    "read_spool_isolation_config",
+    "receipts_path_for",
     "resolve_spool_dir",
+    "resolve_workspace_identity",
     "serve_stdio",
     "slice_spool",
     "spool_tool_output",
+    "summarize_receipts",
     "sync_cursor_spool_mcp",
 ]
