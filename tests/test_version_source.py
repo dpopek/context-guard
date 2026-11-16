@@ -113,6 +113,12 @@ def test_readme_and_plugin_description_conciseness_budgets() -> None:
     assert len(ext_readme_bytes) <= 6_500, (
         f"vscode-extension/README.md exceeds 6.5 KB conciseness budget ({len(ext_readme_bytes)} B)"
     )
+    readme_crlf_len = len(readme_bytes.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+    ext_readme_crlf_len = len(ext_readme_bytes.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+    assert readme_crlf_len <= 18_000, f"README.md exceeds 18 KB under Windows CRLF ({readme_crlf_len} B)"
+    assert ext_readme_crlf_len <= 6_500, (
+        f"vscode-extension/README.md exceeds 6.5 KB under Windows CRLF ({ext_readme_crlf_len} B)"
+    )
 
     for doc_path in (readme_path, ext_readme_path):
         long_bullets = [
