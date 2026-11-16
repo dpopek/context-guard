@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from bin.migration_guard import RollbackJournal
-from spool.mcp_server import serve_stdio, sync_cursor_spool_mcp
+from spool.mcp_server import is_cursor_spool_mcp_configured, serve_stdio, sync_cursor_spool_mcp
 from spool.store import spool_tool_output
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -42,7 +42,7 @@ def parse_lsp_stream(raw: bytes) -> list[dict[str, Any]]:
     return frames
 
 
-def seed_sample_spool(spool_dir: Path) -> str:
+def seed_sample_spool(spool_dir: Path, workspace_root: Path | None = None) -> str:
     """Create a deterministic spooled output entry and return its spool_id."""
     lines = [f"entry-{i:04d} " + ("d" * 70) for i in range(1, 221)]
     lines[119] = "entry-0120 ALERT_TOKEN " + ("d" * 60)
@@ -52,6 +52,7 @@ def seed_sample_spool(spool_dir: Path) -> str:
         call_id="mcp-c1",
         harness="cursor",
         tool_name="MCP:demo:logs",
+        workspace_root=workspace_root or REPO_ROOT,
         spool_dir=spool_dir,
         now_ts=1_700_000_500.0,
     )
@@ -82,7 +83,7 @@ def test_mcp_server_ndjson_initialize_ping_list_call_and_errors(tmp_path: Path) 
     in_buf = io.BytesIO(b"\n".join(requests) + b"\n")
     out_buf = io.BytesIO()
 
-    rc = serve_stdio(spool_dir=spool_dir, stdin=in_buf, stdout=out_buf, plugin_root=REPO_ROOT)
+    rc = serve_stdio(spool_dir=spool_dir, stdin=in_buf, stdout=out_buf, plugin_root=REPO_ROOT, workspace_root=REPO_ROOT)
     assert rc == 0
     replies = [json.loads(line.decode("utf-8")) for line in out_buf.getvalue().splitlines() if line.strip()]
     assert len(replies) == 12
@@ -123,6 +124,7 @@ def test_mcp_server_ndjson_initialize_ping_list_call_and_errors(tmp_path: Path) 
         stdin=io.BytesIO(json.dumps({"jsonrpc": "2.0", "id": 99, "method": "initialize"}).encode("utf-8") + b"\n"),
         stdout=alt_out,
         plugin_root=alt_root,
+        workspace_root=REPO_ROOT,
     ) == 0
     assert json.loads(alt_out.getvalue().decode("utf-8"))["result"]["serverInfo"]["version"] == "9.8.7"
 
@@ -142,7 +144,7 @@ def test_mcp_server_content_length_framing_matches_input_mode_and_notifications(
         ]
     )
     out_buf = io.BytesIO()
-    rc = serve_stdio(spool_dir=spool_dir, stdin=io.BytesIO(raw_in), stdout=out_buf, plugin_root=REPO_ROOT)
+    rc = serve_stdio(spool_dir=spool_dir, stdin=io.BytesIO(raw_in), stdout=out_buf, plugin_root=REPO_ROOT, workspace_root=REPO_ROOT)
     assert rc == 0
 
     frames = parse_lsp_stream(out_buf.getvalue())
@@ -168,7 +170,7 @@ def test_mcp_server_subprocess_eof_and_tool_execution_errors(tmp_path: Path) -> 
     ) + b"\n"
 
     proc = subprocess.run(
-        [sys.executable, str(REPO_ROOT / "bin" / "cg_spool.py"), "mcp", "--spool-dir", str(spool_dir)],
+        [sys.executable, str(REPO_ROOT / "bin" / "cg_spool.py"), "mcp", "--spool-dir", str(spool_dir), "--workspace", str(REPO_ROOT)],
         cwd=str(REPO_ROOT),
         input=payload,
         capture_output=True,
@@ -214,10 +216,12 @@ def test_sync_cursor_spool_mcp_preserves_foreign_servers_and_never_creates_empty
     assert updated["mcpServers"]["foreign-srv"] == {"command": "node", "args": ["index.js"]}
     assert updated["mcpServers"]["context-guard-spool"] == {
         "command": "python3",
-        "args": [str((REPO_ROOT / "bin" / "cg_spool.py").resolve()), "mcp"],
+        "args": [str((REPO_ROOT / "bin" / "cg_spool.py").resolve()), "mcp", "--workspace", "${workspaceFolder}"],
     }
+    assert is_cursor_spool_mcp_configured(mcp_path) is True
 
     assert sync_cursor_spool_mcp(mcp_path, REPO_ROOT, enabled=False) == "removed"
+    assert is_cursor_spool_mcp_configured(mcp_path) is False
     after_remove = json.loads(mcp_path.read_text(encoding="utf-8"))
     assert "context-guard-spool" not in after_remove["mcpServers"]
     assert after_remove["mcpServers"]["foreign-srv"] == {"command": "node", "args": ["index.js"]}

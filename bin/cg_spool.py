@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -13,8 +14,15 @@ _PLUGIN_ROOT = str(Path(__file__).resolve().parent.parent)
 if _PLUGIN_ROOT not in sys.path:
     sys.path.insert(0, _PLUGIN_ROOT)
 
+from hooks.telemetry import record_reliability_failure  # noqa: E402
 from spool.mcp_server import serve_stdio  # noqa: E402
 from spool.store import gc_spools, grep_spool, list_spools, slice_spool  # noqa: E402
+
+
+def _add_scope_args(subparser: argparse.ArgumentParser, *, with_session: bool = True) -> None:
+    subparser.add_argument("--workspace", default=None)
+    if with_session:
+        subparser.add_argument("--session", default=None)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -27,6 +35,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_slice.add_argument("--limit", type=int, default=120)
     p_slice.add_argument("--end", type=int, default=None)
     p_slice.add_argument("--spool-dir", default=None)
+    _add_scope_args(p_slice)
     p_slice.add_argument("--json", action="store_true")
 
     p_grep = sub.add_parser("grep", help="Search a spool with a regex pattern.")
@@ -37,11 +46,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_grep.add_argument("--max-matches", type=int, default=50)
     p_grep.add_argument("--context", type=int, default=0)
     p_grep.add_argument("--spool-dir", default=None)
+    _add_scope_args(p_grep)
     p_grep.add_argument("--json", action="store_true")
 
     p_list = sub.add_parser("list", help="List spooled outputs newest-first.")
-    p_list.add_argument("--session", default=None)
     p_list.add_argument("--spool-dir", default=None)
+    _add_scope_args(p_list)
     p_list.add_argument("--json", action="store_true")
 
     p_gc = sub.add_parser("gc", help="Garbage-collect expired or LRU spools.")
@@ -49,10 +59,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_gc.add_argument("--max-entries", type=int, default=None)
     p_gc.add_argument("--max-bytes", type=int, default=None)
     p_gc.add_argument("--spool-dir", default=None)
+    _add_scope_args(p_gc)
     p_gc.add_argument("--json", action="store_true")
 
     p_mcp = sub.add_parser("mcp", help="Run the stdio JSON-RPC 2.0 MCP spool server.")
     p_mcp.add_argument("--spool-dir", default=None)
+    _add_scope_args(p_mcp)
     return parser
 
 
@@ -91,6 +103,20 @@ def _emit_result(cmd: str, res: dict[str, Any], as_json: bool) -> int:
     return 0
 
 
+def _resolve_cli_workspace(ns: argparse.Namespace) -> str:
+    if getattr(ns, "workspace", None) is not None:
+        return str(ns.workspace)
+    env_ws = os.environ.get("CONTEXT_GUARD_WORKSPACE_ROOT")
+    return env_ws if (env_ws is not None and env_ws.strip()) else os.getcwd()
+
+
+def _resolve_cli_session(ns: argparse.Namespace) -> str | None:
+    if getattr(ns, "session", None) is not None:
+        return str(ns.session)
+    env_s = os.environ.get("CONTEXT_GUARD_SESSION_ID")
+    return env_s if (env_s is not None and env_s.strip()) else None
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint for `cg-spool` subcommands (`slice`, `grep`, `list`, `gc`, `mcp`)."""
     raw_argv = list(sys.argv[1:] if argv is None else argv)
@@ -107,10 +133,16 @@ def main(argv: list[str] | None = None) -> int:
 
     eff_dir = Path(ns.spool_dir).expanduser() if getattr(ns, "spool_dir", None) else None
     cmd = str(ns.command)
+    eff_sess = _resolve_cli_session(ns)
     if cmd == "mcp":
-        return serve_stdio(spool_dir=eff_dir)
+        ws_arg = ns.workspace if ns.workspace is not None else os.environ.get("CONTEXT_GUARD_WORKSPACE_ROOT")
+        return serve_stdio(spool_dir=eff_dir, workspace_root=ws_arg, session_id=eff_sess)
     if cmd == "slice":
-        res = slice_spool(ns.spool_id, start_line=ns.start, limit=ns.limit, end_line=ns.end, spool_dir=eff_dir)
+        res = slice_spool(
+            ns.spool_id, start_line=ns.start, limit=ns.limit, end_line=ns.end,
+            workspace_root=_resolve_cli_workspace(ns), session_id=eff_sess,
+            harness="cli", on_reliability_failure=record_reliability_failure, spool_dir=eff_dir,
+        )
         return _emit_result(cmd, res, bool(ns.json))
     if cmd == "grep":
         pattern = ns.pattern_flag if ns.pattern_flag is not None else ns.pattern_pos
@@ -119,11 +151,15 @@ def main(argv: list[str] | None = None) -> int:
             return _emit_result(cmd, err_res, bool(ns.json))
         res = grep_spool(
             ns.spool_id, pattern, ignore_case=bool(ns.ignore_case),
-            max_matches=ns.max_matches, context_lines=ns.context, spool_dir=eff_dir,
+            max_matches=ns.max_matches, context_lines=ns.context,
+            workspace_root=_resolve_cli_workspace(ns), session_id=eff_sess,
+            harness="cli", on_reliability_failure=record_reliability_failure, spool_dir=eff_dir,
         )
         return _emit_result(cmd, res, bool(ns.json))
     if cmd == "list":
-        res = list_spools(session_id=ns.session, spool_dir=eff_dir)
+        res = list_spools(
+            session_id=eff_sess, workspace_root=_resolve_cli_workspace(ns), spool_dir=eff_dir,
+        )
         return _emit_result(cmd, res, bool(ns.json))
     if cmd == "gc":
         gc_kwargs: dict[str, Any] = {"spool_dir": eff_dir}

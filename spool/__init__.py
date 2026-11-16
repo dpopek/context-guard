@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from spool.mcp_server import serve_stdio, sync_cursor_spool_mcp
+from spool.mcp_server import is_cursor_spool_mcp_configured, serve_stdio, sync_cursor_spool_mcp
 from spool.receipts import (
     RECEIPTS_FILENAME,
     RECEIPTS_KEEP_ROWS,
@@ -55,6 +55,7 @@ __all__ = [
     "gc_spools",
     "grep_spool",
     "inspect_spool_health",
+    "is_cursor_spool_mcp_configured",
     "is_verbose_override_command",
     "list_spools",
     "persist_spool_delivery_verification",

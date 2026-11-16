@@ -3,16 +3,24 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import json
 import os
 from pathlib import Path
 import re
+import threading
+from typing import Any
 
+import pytest
+
+from spool.mcp_server import is_cursor_spool_mcp_configured, serve_stdio, sync_cursor_spool_mcp
 from spool.receipts import (
     compute_scope_key,
     compute_scoped_spool_id,
     read_spool_isolation_config,
     resolve_workspace_identity,
 )
+from spool.store import spool_tool_output
 
 
 def test_resolve_workspace_identity_git_root_worktree_home_anchor_template_and_multi_root(
@@ -129,3 +137,211 @@ def test_compute_scoped_spool_id_separates_domains() -> None:
     assert len(set(ids)) == 4
     assert compute_scope_key("workspace", workspace_id="") == ("", "workspace_unresolved")
     assert compute_scope_key("session", session_id="") == ("", "session_unresolved")
+
+
+def _big_spool_text(tag: str) -> str:
+    return "\n".join(f"{tag}-{i:04d} " + ("x" * 64) for i in range(1, 221)) + "\n"
+
+
+def _rpc_ndjson(reqs: list[dict[str, Any]], **serve_kw: Any) -> list[dict[str, Any]]:
+    in_buf = io.BytesIO(b"\n".join(json.dumps(r).encode("utf-8") for r in reqs) + b"\n")
+    out_buf = io.BytesIO()
+    assert serve_stdio(stdin=in_buf, stdout=out_buf, **serve_kw) == 0
+    return [json.loads(ln.decode("utf-8")) for ln in out_buf.getvalue().splitlines() if ln.strip()]
+
+
+def test_workspace_isolation_blocks_cross_project_slice_grep_and_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Block cross-workspace slice/grep/list, ignore workspace* args, and forbid os.getcwd inside serve_stdio."""
+    proj_a, proj_b = tmp_path / "proj_a", tmp_path / "proj_b"
+    (proj_a / ".git").mkdir(parents=True)
+    (proj_b / ".git").mkdir(parents=True)
+    spool_dir = tmp_path / "spool"
+
+    res_a = spool_tool_output(
+        _big_spool_text("ALPHA"), session_id="s-a", call_id="c-a", harness="cursor",
+        tool_name="MCP:a:run", workspace_root=proj_a, spool_dir=spool_dir, now_ts=1_700_000_000.0,
+    )
+    assert res_a is not None
+    sid_a = res_a[0].spool_id
+
+    def _forbid_cwd() -> str:
+        raise AssertionError("serve_stdio must never call os.getcwd")
+
+    monkeypatch.setattr(os, "getcwd", _forbid_cwd)
+    replies = _rpc_ndjson(
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "cg_spool_list", "arguments": {"workspace_root": str(proj_a)}}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "cg_spool_slice", "arguments": {"spool_id": sid_a, "workspace_root": str(proj_a), "workspace_id": "ws_0000000000000000"}}},
+            {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "cg_spool_grep", "arguments": {"spool_id": sid_a, "pattern": "ALPHA", "workspace": str(proj_a)}}},
+        ],
+        spool_dir=spool_dir,
+        workspace_root=proj_b,
+        isolation="workspace",
+    )
+    assert [r["id"] for r in replies] == [1, 2, 3, 4]
+    list_res = json.loads(replies[1]["result"]["content"][0]["text"])
+    assert replies[1]["result"]["isError"] is False and list_res["count"] == 0
+    for idx in (2, 3):
+        assert replies[idx]["result"]["isError"] is True
+        assert json.loads(replies[idx]["result"]["content"][0]["text"])["error"] == "workspace_mismatch"
+
+
+def test_mcp_multi_root_roots_list_returns_workspace_ambiguous_and_single_root_succeeds(
+    tmp_path: Path,
+) -> None:
+    """Exercise interactive roots/list handshake, FIFO replay during WaitingRootsResp, ambiguous & single roots."""
+    repo_a, repo_b = tmp_path / "repo_a", tmp_path / "repo_b"
+    (repo_a / ".git").mkdir(parents=True)
+    (repo_b / ".git").mkdir(parents=True)
+    spool_dir = tmp_path / "spool"
+    res_a = spool_tool_output(
+        _big_spool_text("ROOTA"), session_id="s-r", call_id="c-r", harness="cursor",
+        tool_name="MCP:r:run", workspace_root=repo_a, spool_dir=spool_dir, now_ts=1_700_000_010.0,
+    )
+    assert res_a is not None
+    sid_a = res_a[0].spool_id
+
+    c2s_r, c2s_w = os.pipe()
+    s2c_r, s2c_w = os.pipe()
+    in_fh, out_fh = os.fdopen(c2s_r, "rb"), os.fdopen(s2c_w, "wb")
+    client_w, client_r = os.fdopen(c2s_w, "wb"), os.fdopen(s2c_r, "rb")
+    t = threading.Thread(
+        target=lambda: serve_stdio(spool_dir=spool_dir, stdin=in_fh, stdout=out_fh, isolation="workspace"),
+        daemon=True,
+    )
+    t.start()
+
+    def _send(obj: dict[str, Any]) -> None:
+        client_w.write((json.dumps(obj) + "\n").encode("utf-8"))
+        client_w.flush()
+
+    def _recv() -> dict[str, Any]:
+        return json.loads(client_r.readline().decode("utf-8"))
+
+    _send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {"roots": {"listChanged": True}}}})
+    assert _recv()["id"] == 1
+    _send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "cg_spool_list", "arguments": {}}})
+    req_roots = _recv()
+    assert req_roots["method"] == "roots/list" and str(req_roots["id"]).startswith("cg-roots-")
+    # Interleave ping & second tools/call while WaitingRootsResp awaits roots/list response
+    _send({"jsonrpc": "2.0", "id": 3, "method": "ping"})
+    _send({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "cg_spool_slice", "arguments": {"spool_id": sid_a}}})
+    _send({"jsonrpc": "2.0", "id": req_roots["id"], "result": {"roots": [{"uri": repo_a.as_uri()}, {"uri": repo_b.as_uri()}]}})
+    replayed = [_recv(), _recv(), _recv()]
+    assert [r["id"] for r in replayed] == [2, 3, 4]
+    assert replayed[0]["result"]["isError"] is True
+    assert json.loads(replayed[0]["result"]["content"][0]["text"])["error"] == "workspace_ambiguous"
+    assert replayed[1]["result"] == {}
+    assert json.loads(replayed[2]["result"]["content"][0]["text"])["error"] == "workspace_ambiguous"
+
+    # Invalidate cached roots and answer with a single root -> slice succeeds
+    _send({"jsonrpc": "2.0", "method": "notifications/roots/list_changed"})
+    _send({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "cg_spool_slice", "arguments": {"spool_id": sid_a, "limit": 2}}})
+    req_roots_2 = _recv()
+    assert req_roots_2["method"] == "roots/list"
+    _send({"jsonrpc": "2.0", "id": req_roots_2["id"], "result": {"roots": [{"uri": repo_a.as_uri()}]}})
+    ok_reply = _recv()
+    assert ok_reply["id"] == 5 and ok_reply["result"]["isError"] is False
+    assert "ROOTA-0001" in json.loads(ok_reply["result"]["content"][0]["text"])["content"]
+    client_w.close()
+    t.join(timeout=5)
+    for fh in (client_r, in_fh, out_fh):
+        fh.close()
+    assert not t.is_alive()
+
+
+def test_mcp_missing_workspace_or_literal_template_fails_closed_without_global_fallback(
+    tmp_path: Path,
+) -> None:
+    """Missing --workspace, literal ${workspaceFolder}, and unanswerable roots/list fail closed as workspace_unresolved."""
+    repo = tmp_path / "repo_u"
+    (repo / ".git").mkdir(parents=True)
+    spool_dir = tmp_path / "spool"
+    res = spool_tool_output(
+        _big_spool_text("UNRES"), session_id="s-u", call_id="c-u", harness="cursor",
+        tool_name="MCP:u:run", workspace_root=repo, spool_dir=spool_dir, now_ts=1_700_000_020.0,
+    )
+    assert res is not None
+    sid = res[0].spool_id
+
+    for ws in (None, "${workspaceFolder}"):
+        replies = _rpc_ndjson(
+            [{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "cg_spool_slice", "arguments": {"spool_id": sid}}}],
+            spool_dir=spool_dir, workspace_root=ws, isolation="workspace",
+        )
+        assert replies[0]["result"]["isError"] is True
+        assert json.loads(replies[0]["result"]["content"][0]["text"])["error"] == "workspace_unresolved"
+
+    # Client advertises capabilities.roots but sends EOF before answering roots/list -> no fallback to --workspace
+    eof_replies = _rpc_ndjson(
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {"roots": {}}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "cg_spool_list", "arguments": {}}},
+        ],
+        spool_dir=spool_dir, workspace_root=repo, isolation="workspace",
+    )
+    tool_rep = next(r for r in eof_replies if r.get("id") == 2)
+    assert tool_rep["result"]["isError"] is True
+    assert json.loads(tool_rep["result"]["content"][0]["text"])["error"] == "workspace_unresolved"
+
+
+def test_session_and_global_isolation_modes_and_roots_list_changed_invalidation(
+    tmp_path: Path,
+) -> None:
+    """Enforce session isolation, ignore spoofed session_id in list, permit global mode, and validate Cursor mcp.json."""
+    repo = tmp_path / "repo_sg"
+    (repo / ".git").mkdir(parents=True)
+    spool_dir = tmp_path / "spool"
+
+    res_s1 = spool_tool_output(
+        _big_spool_text("S1"), session_id="sess-1", call_id="c1", harness="cursor",
+        tool_name="MCP:sg:run", workspace_root=repo, isolation="session", spool_dir=spool_dir, now_ts=1_700_000_030.0,
+    )
+    res_g = spool_tool_output(
+        _big_spool_text("GLOB"), session_id="sess-g", call_id="c2", harness="cursor",
+        tool_name="MCP:sg:run", workspace_root=repo, isolation="global", spool_dir=spool_dir, now_ts=1_700_000_031.0,
+    )
+    assert res_s1 is not None and res_g is not None
+    sid_1, sid_g = res_s1[0].spool_id, res_g[0].spool_id
+
+    # In session mode, sess-2 cannot read sess-1 spool and spoofed session_id="sess-1" in list args is ignored
+    s2_replies = _rpc_ndjson(
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "cg_spool_list", "arguments": {"session_id": "sess-1"}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "cg_spool_slice", "arguments": {"spool_id": sid_1}}},
+        ],
+        spool_dir=spool_dir, workspace_root=repo, session_id="sess-2", isolation="session",
+    )
+    assert json.loads(s2_replies[0]["result"]["content"][0]["text"])["count"] == 0
+    assert s2_replies[1]["result"]["isError"] is True
+    assert json.loads(s2_replies[1]["result"]["content"][0]["text"])["error"] == "session_mismatch"
+
+    # Global mode shares access without workspace_root
+    g_replies = _rpc_ndjson(
+        [{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "cg_spool_slice", "arguments": {"spool_id": sid_g, "limit": 2}}}],
+        spool_dir=spool_dir, isolation="global",
+    )
+    assert g_replies[0]["result"]["isError"] is False
+    assert "GLOB-0001" in json.loads(g_replies[0]["result"]["content"][0]["text"])["content"]
+
+    mcp_path = tmp_path / "cursor" / "mcp.json"
+    mcp_path.parent.mkdir(parents=True)
+    mcp_path.write_text(json.dumps({"mcpServers": {"context-guard-spool": {"command": "python3", "args": ["bin/cg_spool.py", "mcp"]}}}), encoding="utf-8")
+    assert is_cursor_spool_mcp_configured(mcp_path) is False
+    sync_cursor_spool_mcp(mcp_path, Path(__file__).resolve().parent.parent, enabled=True, py_executable="python3")
+    assert is_cursor_spool_mcp_configured(mcp_path) is True
+
+    # CLI --workspace, --session, and on_reliability_failure integration + mcp zero-getcwd guarantee
+    from bin import cg_spool
+    from hooks import telemetry
+
+    (other_repo := tmp_path / "other_cli_repo").mkdir()
+    (other_repo / ".git").mkdir()
+    assert cg_spool.main(["slice", sid_1, "--workspace", str(other_repo), "--session", "sess-1", "--spool-dir", str(spool_dir), "--json"]) == 1
+    assert cg_spool.main(["list", "--workspace", str(repo), "--session", "sess-1", "--spool-dir", str(spool_dir), "--json"]) == 0
+    (spool_dir / f"{sid_1}.txt").write_bytes(b"\xff\xfe\x80")
+    assert cg_spool.main(["slice", sid_1, "--workspace", str(repo), "--session", "sess-1", "--spool-dir", str(spool_dir), "--json"]) == 1
+    assert telemetry.load_telemetry_stats()["events"]["reliability_failures"] == 1
