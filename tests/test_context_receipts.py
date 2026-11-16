@@ -208,3 +208,80 @@ def test_persist_spool_delivery_verification_matches_created_and_deduplicates(tm
     summary = summarize_receipts(rcpt_path)
     assert summary["created_count"] == 1
     assert summary["delivery_verified_count"] == 1
+
+
+def test_spool_recovery_receipts_exact_half_open_spans_and_never_mint_delivery_verified(
+    tmp_path: Path,
+) -> None:
+    """Verify spool_created + slice/grep spool_recovery half-open spans without minting delivery_verified."""
+    from spool.store import grep_spool, slice_spool, spool_tool_output
+
+    repo = tmp_path / "repo_spans"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    spool_dir = tmp_path / "spool"
+
+    lines = [f"ł-{idx:03d} " + ("z" * 64) for idx in range(1, 221)]
+    lines[9] = "needle alpha " + ("y" * 60)
+    lines[11] = "needle beta " + ("y" * 60)
+    text = "\n".join(lines) + "\n"
+    raw_bytes = text.encode("utf-8")
+
+    res = spool_tool_output(
+        text,
+        session_id="sess-span",
+        call_id="call-span",
+        harness="claude",
+        tool_name="Bash",
+        workspace_root=repo,
+        turn_key="sess-span:step:1",
+        upstream_truncation=True,
+        spool_dir=spool_dir,
+        now_ts=1_700_000_000.0,
+    )
+    assert res is not None
+    sid = res[0].spool_id
+
+    # Slice lines 10..12 (1-based) -> half-open 0-based [9, 12)
+    sl = slice_spool(sid, start_line=10, limit=3, workspace_root=repo, spool_dir=spool_dir, now_ts=1_700_000_005.0)
+    assert sl["ok"] is True
+    # Empty out-of-bounds slice -> [0, 0)
+    sl_empty = slice_spool(sid, start_line=500, limit=10, workspace_root=repo, spool_dir=spool_dir, now_ts=1_700_000_006.0)
+    assert sl_empty["ok"] is True and sl_empty["returned_lines"] == 0
+    # Grep with context=1 covering lines 10 & 12 (0-based 9 & 11) -> [8, 13)
+    gr = grep_spool(sid, "needle", context_lines=1, workspace_root=repo, spool_dir=spool_dir, now_ts=1_700_000_007.0)
+    assert gr["ok"] is True and gr["match_count"] == 2
+    # Grep with 0 matches -> [0, 0)
+    gr_empty = grep_spool(sid, "NO_SUCH_MATCH", workspace_root=repo, spool_dir=spool_dir, now_ts=1_700_000_008.0)
+    assert gr_empty["ok"] is True and gr_empty["match_count"] == 0
+
+    rows = [json.loads(line) for line in (spool_dir / "receipts.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(rows) == 5
+    created = rows[0]
+    assert created["event_type"] == "spool_created"
+    assert created["parent_event_id"] is None
+    assert created["line_span"] == [0, 220]
+    assert created["byte_span"] == [0, len(raw_bytes)]
+    assert created["upstream_truncation"] is True
+    assert created["delivery_evidence"] == "replacement_emitted"
+    assert created["spool_id_referenced"] is False
+
+    expected_b9_start = sum(len(lines[k].encode("utf-8")) + 1 for k in range(9))
+    expected_b9_end = expected_b9_start + len("\n".join(lines[9:12]).encode("utf-8"))
+    expected_b8_start = sum(len(lines[k].encode("utf-8")) + 1 for k in range(8))
+    expected_b13_end = sum(len(lines[k].encode("utf-8")) + 1 for k in range(12)) + len(lines[12].encode("utf-8"))
+
+    rec_slice, rec_empty, rec_grep, rec_grep_empty = rows[1], rows[2], rows[3], rows[4]
+    for rec in (rec_slice, rec_empty, rec_grep, rec_grep_empty):
+        assert rec["event_type"] == "spool_recovery"
+        assert rec["parent_event_id"] == created["receipt_id"]
+        assert rec["delivery_evidence"] == "unverified"
+        assert rec["spool_id_referenced"] is True
+    assert rec_slice["line_span"] == [9, 12]
+    assert rec_slice["byte_span"] == [expected_b9_start, expected_b9_end]
+    assert rec_empty["line_span"] == [0, 0] and rec_empty["byte_span"] == [0, 0]
+    assert rec_grep["line_span"] == [8, 13]
+    assert rec_grep["byte_span"] == [expected_b8_start, expected_b13_end]
+    assert rec_grep_empty["line_span"] == [0, 0] and rec_grep_empty["byte_span"] == [0, 0]
+
+    assert summarize_receipts(spool_dir / "receipts.jsonl")["delivery_verified_count"] == 0
