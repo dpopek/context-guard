@@ -58,7 +58,8 @@ If Context-Guard is cloned outside `~/.gemini/config/plugins/context-guard`, run
    ```bash
    python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg.py" eval --offline-replay
    python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg.py" eval --cursor-conformance
+   python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg.py" eval --governor-check
    ```
    Review:
-   - Deterministic `EvidenceContractV1` offline replay (zero network or live LLM spawns), `CapabilityAttestationKey` provenance, and Cursor CLI conformance (`excluded_missing_telemetry` cache handling).
+   - Deterministic `EvidenceContractV1` offline replay (zero network or live LLM spawns), `CapabilityAttestationKey` provenance, Cursor CLI conformance (`excluded_missing_telemetry` cache handling), and 8-gate Adaptive Governor verification (`--governor-check`).
    - Use `--pilot --plan`, `--release --plan`, or `--ledger-verify` to plan isolated campaigns or verify durable `evidence_events.json` Outcomes v4 derivation.

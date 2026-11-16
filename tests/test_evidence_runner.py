@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 from typing import Any, Mapping
@@ -21,9 +22,11 @@ from evidence.runner import (
     run_offline_evidence_replay,
     verify_campaign_controls,
 )
-from hooks import outcomes
+from hooks import config as hooks_config, outcomes, post_tool_use
 from policies.api import EVIDENCE_SCHEMA_VERSION, EvidenceContractV1
+from policies.governor import is_optimizer_tripped, reset_circuit_breaker
 from spool import receipts as spool_receipts
+from spool.store import slice_spool
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 
@@ -128,7 +131,10 @@ def test_offline_evidence_replay_is_isolated_deterministic_and_non_causal(tmp_pa
         "spool_and_slice_ok": True,
         "durable_ledger_ok": True,
         "cursor_conformance_ok": True,
+        "governor_replay_ok": True,
     }
+    assert rep_a["gate_verdict"]["governor_replay"]["ok"] is True
+    assert rep_a["gate_verdict"]["governor_replay"]["checks_passed"] == 8
     assert rep_a["gate_verdict"]["ledger_outcomes"]["completeness"] == "complete"
     assert rep_a["gate_verdict"]["ledger_outcomes"]["totals"]["created"] >= 1
     assert rep_a["gate_verdict"]["ledger_outcomes"]["totals"]["recoveries"] >= 1
@@ -484,3 +490,70 @@ def test_cg_eval_markdown_renderer_covers_reports_plans_and_gates() -> None:
     plan_md = cg_eval.render_evidence_markdown(plan)
     assert "# Context-Guard Evaluation Plan (`small_live_pilot`)" in plan_md
     assert "36` isolated runs" in plan_md
+
+
+def test_cg_eval_governor_check_cli_json_and_markdown(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cg.main(["eval", "--governor-check", "--json"]) == 0
+    gov_json = json.loads(capsys.readouterr().out)
+    assert gov_json["ok"] is True and gov_json["checks_passed"] == 8 and gov_json["checks_total"] == 8
+    assert all(gov_json["gates"].values())
+
+    assert cg_eval.main(["--governor-check", "--markdown"]) == 0
+    gov_md = capsys.readouterr().out
+    assert "# Context-Guard Adaptive Governor Replay Check" in gov_md
+    assert "PASS" in gov_md and "8/8" in gov_md and "security_never_lowered" in gov_md
+
+    assert cg_eval.main(["--governor-check", "--plan", "--json"]) == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "invalid_arguments"
+    assert cg_eval.main(["--governor-check", "--runs-file", str(tmp_path / "r.json"), "--json"]) == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "invalid_arguments"
+
+
+def test_spool_integrity_failure_trips_governor_breaker_and_recovers_with_hysteresis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg_path = Path(os.environ["CONTEXT_GUARD_CONFIG_PATH"])
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(json.dumps({"optimizers": {"output_spool": "active"}}), encoding="utf-8")
+    hooks_config.clear_config_cache()
+
+    ws = tmp_path / "ws"
+    state_dir = tmp_path / "state"
+    spool_dir = state_dir / "spool"
+    ws.mkdir(parents=True)
+    state_dir.mkdir(parents=True)
+    monkeypatch.setenv("CONTEXT_GUARD_SPOOL_DIR", str(spool_dir))
+
+    def _bash_payload(call_id: str, fill: str) -> dict[str, Any]:
+        body = "\n".join(f"row_{i:04d}: " + (fill * 72) for i in range(240)) + "\n"
+        return {
+            "tool_name": "Bash", "tool_input": {"command": f"pytest -{call_id}"},
+            "tool_response": {"stdout": body, "stderr": ""}, "session_id": "sess_gov",
+            "tool_use_id": call_id, "cwd": str(ws),
+        }
+
+    res1 = post_tool_use.handle_post_tool_use("claude", _bash_payload("call_1", "a"), state_dir=str(state_dir))
+    out1 = str((res1.get("hookSpecificOutput") or {}).get("updatedToolOutput") or "")
+    m = re.search(r"sp_[0-9a-f]{12}", out1)
+    assert m is not None
+    sid = m.group(0)
+
+    (spool_dir / f"{sid}.txt").write_text("tampered\n", encoding="utf-8")
+    sl = slice_spool(sid, workspace_root=ws, session_id="sess_gov", harness="claude", spool_dir=spool_dir)
+    assert sl["ok"] is False and sl["error"] == "integrity_mismatch"
+    assert is_optimizer_tripped("output_spool", state_dir=state_dir) is True
+
+    assert post_tool_use.handle_post_tool_use("claude", _bash_payload("call_2", "b"), state_dir=str(state_dir)) == {}
+
+    bad_reset = reset_circuit_breaker("output_spool", state_dir=spool_dir)
+    assert bad_reset["ok"] is False and bad_reset["error"] == "hysteresis_requires_verification_or_operator_reset"
+    assert post_tool_use.handle_post_tool_use("claude", _bash_payload("call_3", "c"), state_dir=str(state_dir)) == {}
+
+    good_reset = reset_circuit_breaker(
+        "output_spool", state_dir=spool_dir, verification_passed=True, verification_evidence="client_spool_probe_ok",
+    )
+    assert good_reset["ok"] is True and is_optimizer_tripped("output_spool", state_dir=state_dir) is False
+    res4 = post_tool_use.handle_post_tool_use("claude", _bash_payload("call_4", "d"), state_dir=str(state_dir))
+    assert "hookSpecificOutput" in res4

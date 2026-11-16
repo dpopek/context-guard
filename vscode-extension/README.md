@@ -6,7 +6,7 @@ Live token savings telemetry, status bar indicator, SVG donut ring side panel, a
 
 ## Overview
 
-**Context-Guard (v4.7.0)** is a zero-prompt Policy API v1 host, verified Read Ledger v2 (`range_trim`), reversible output spooler, preamble/MCP budget advisor, Evidence Engine, and multi-harness telemetry plugin for **Google Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex CLI/App** using pure Python 3.9+ stdlib hooks.
+**Context-Guard (v4.8.0)** is a zero-prompt Policy API v1 host, verified Read Ledger v2 (`range_trim`), reversible output spooler, preamble/MCP budget advisor, Evidence Engine, Adaptive Governor, and multi-harness telemetry plugin for **Google Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex CLI/App** using pure Python 3.9+ stdlib hooks.
 
 This companion IDE extension reads `telemetry/stats.json`, `token_usage.json`, `outcomes.json` (Outcomes Schema v4), and `update.json` from your installed Context-Guard checkout (auto-refreshing missing or stale `token_usage.json` via `cg_status.py --usage`) to surface token savings and v4.5 insights in your editor.
 
@@ -43,6 +43,7 @@ This companion IDE extension reads `telemetry/stats.json`, `token_usage.json`, `
 - **Guardrailed Quiet CLI Rewrites:** Trims noisy test/grep boilerplate (`pytest -q`, `git status -sb`, `cargo test -q`, `vitest`, `grep`, opt-in integrations) without overriding explicit user flags.
 - **Verified Policy API v1 (`PreToolUse`):** Evaluates external `policy_packs` pinned by `file_hashes` and `tree_sha256` in memory, with Pass-2 security checks and Stage-2 scoped fail-closed fallbacks.
 - **Two-Stage Auto-Compact Sensor & Preamble Attribution:** Tracks transcript steps (`O(delta)`) in Antigravity, resets caches on compaction, measures shell bytes, and splits CLI vs Desktop preamble overhead.
+- **Adaptive Governor (`policies/governor.py`):** Selects `active`/`shadow`/`passthrough` within attested harness capabilities, preserves security packs, and trips hysteresis breakers only on hard integrity failures.
 
 ---
 
@@ -64,6 +65,7 @@ CG_DIR="${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}"
 # Unified CLI: passive preamble/MCP budget audit, Evidence Engine replay, doctor, status, spool, and outline
 python3 "$CG_DIR/bin/cg.py" budget --preamble --mcp --recommendations
 python3 "$CG_DIR/bin/cg.py" eval --offline-replay
+python3 "$CG_DIR/bin/cg.py" eval --governor-check
 python3 "$CG_DIR/bin/cg.py" doctor
 
 # Short summary, Claude HUD, full Markdown report, or raw JSON

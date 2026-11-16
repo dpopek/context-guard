@@ -373,6 +373,8 @@ def build_post_tool_spool_response(
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Build PostToolUse spool replacement or shadow projection `(hook_response, meta)`."""
     if mode not in ("active", "shadow"): return {}, None
+    from policies.governor import is_optimizer_tripped
+    if is_optimizer_tripped("output_spool", state_dir=spool_dir or resolve_spool_dir()): return {}, None
     tc = payload.get("toolCall")
     tool_name = str(payload.get("tool_name") or (tc.get("name") if isinstance(tc, Mapping) else "") or "")
     raw_in: Mapping[str, Any] = payload["tool_input"] if isinstance(payload.get("tool_input"), Mapping) else (tc["args"] if isinstance(tc, Mapping) and isinstance(tc.get("args"), Mapping) else {})
@@ -504,6 +506,8 @@ def _touch_and_load_lines(
             receipts_path=eff_rcpt,
         )
         if on_reliability_failure is not None: on_reliability_failure()
+        from policies.governor import record_governor_signal
+        record_governor_signal("output_spool", fail_reason, state_dir=eff_dir, harness=harness, session_id=entry_sess)
         return [], obs_bytes, entry_ws, entry_sess, "", {"ok": False, "error": fail_reason}
     _update_available_entry_locked(eff_dir, spool_id, {"last_accessed_at": eff_now})
     return lines, obs_bytes, entry_ws, entry_sess, str(exp_sha or ""), None

@@ -32,6 +32,7 @@ from hooks.shell_parser import (command_uses_rtk, extract_outline_pull_targets, 
                                 is_bounded_shell_read, is_outline_pull, rewrite_quiet_cli_flags)
 from hooks.state_store import (advance_session_step, emit_json_and_sanitize_stdio, locked_state,  # noqa: E402
                                resolve_state_dir, run_telemetry_safely, state_file_in, warn)
+from policies.governor import apply_runtime_governor  # noqa: E402
 from spool.store import (classify_pre_tool_spool_followup, compute_command_signature,  # noqa: E402
                          is_verbose_override_command, resolve_spool_dir)
 
@@ -39,10 +40,7 @@ _ORIG_VERIFY_P2 = verify_security_policies_post_transform
 _SELF_CLI_RE = re.compile(r"(?<![A-Za-z0-9_-])(?:cg-spool(?:\.(?:exe|cmd|bat))?|cg_spool\.py)(?![A-Za-z0-9_-])", re.I)
 _SELF_MCP_LEAVES = frozenset(("cg_spool_slice", "cg_spool_grep", "cg_spool_list"))
 
-STATIC_POLICY_INTERNAL_DENY_REASON = (
-    "CONTEXT-GUARD POLICY ENGINE INTERNAL ERROR (fail-closed): "
-    "Unable to evaluate active security policies; call blocked."
-)
+STATIC_POLICY_INTERNAL_DENY_REASON = "CONTEXT-GUARD POLICY ENGINE INTERNAL ERROR (fail-closed): Unable to evaluate active security policies; call blocked."
 
 def _static_harness_deny_output(harness: str, reason: str) -> dict[str, Any]:
     if harness == "antigravity": return {"decision": "deny", "reason": reason}
@@ -78,9 +76,7 @@ def _format_deny_safely(dec: dict[str, Any], norm: NormalizedToolCall, fallback:
     except Exception:
         return _static_harness_deny_output(norm.harness, str(dec.get("reason") or fallback))
 
-def _memoize_session_model(
-    state_dir_path: Path, norm: NormalizedToolCall, transcript_path: str | None, step_hint: int = 1,
-) -> str:
+def _memoize_session_model(state_dir_path: Path, norm: NormalizedToolCall, transcript_path: str | None, step_hint: int = 1) -> str:
     try:
         with locked_state(state_dir_path) as txn:
             prev = (txn.state.get("model"), txn.state.get("model_step"))
@@ -89,15 +85,11 @@ def _memoize_session_model(
             eff_step = step_hint if step_hint > 0 else max(1, auto_seq)
             if norm.harness != "antigravity" and step_hint <= 0 and auto_seq == 0:
                 txn.state["auto_step_seq"], txn.dirty = eff_step, True
-            model = model_identity.memoize_model(
-                norm.harness, norm.session_id, transcript_path, txn.state, eff_step, state_dir=state_dir_path,
-            )
+            model = model_identity.memoize_model(norm.harness, norm.session_id, transcript_path, txn.state, eff_step, state_dir=state_dir_path)
             if (txn.state.get("model"), txn.state.get("model_step")) != prev:
                 txn.dirty = True
     except OSError:
-        return model_identity.detect_model(
-            norm.harness, norm.session_id, transcript_path, state_dir=state_dir_path,
-        )
+        return model_identity.detect_model(norm.harness, norm.session_id, transcript_path, state_dir=state_dir_path)
     return model
 
 def _handle_file_mutation(state_dir_path: Path, raw_paths: str | tuple[str, ...], shadow_path: Path | None = None) -> dict[str, Any]:
@@ -141,9 +133,7 @@ def _apply_spool_followup(sess_id: str, norm: NormalizedToolCall, step_idx: int,
                           evidence=str(fu.get("evidence") or "observed"), ledger_path=outcomes_path)
     return True
 
-def evaluate_hook(
-    payload: dict[str, Any], state_dir: str | None = None, cli_harness: str | None = None,
-) -> dict[str, Any]:
+def evaluate_hook(payload: dict[str, Any], state_dir: str | None = None, cli_harness: str | None = None) -> dict[str, Any]:
     """Evaluate PreToolUse hook payload across Antigravity, Claude Code, Cursor, and Codex."""
     runtime_cfg = config.load_runtime_config()
     try:
@@ -166,10 +156,9 @@ def evaluate_hook(
         return {"decision": "allow"}
     try:
         state_dir_path = resolve_state_dir(payload, state_dir)
+        runtime_cfg = apply_runtime_governor(runtime_cfg, orig_norm.harness, state_dir=state_dir_path, payload=payload)
         snapshot = _snapshot_session_state(state_dir_path)
-        block_dec, eval_records, norm, pack_ow = apply_policy_packs_with_records(
-            orig_norm, runtime_cfg, state_dir_path=state_dir_path, session_state_snapshot=snapshot,
-        )
+        block_dec, eval_records, norm, pack_ow = apply_policy_packs_with_records(orig_norm, runtime_cfg, state_dir_path=state_dir_path, session_state_snapshot=snapshot)
         if block_dec is not None:
             saved_ok = run_pre_decision_hooks(eval_records)
             trig = eval_records[-1][2] if eval_records else None

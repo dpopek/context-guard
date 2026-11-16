@@ -21,16 +21,15 @@ from hooks.outcomes import (dispatch_direct_outcome, ledger_path_for, open_outco
 from hooks.shell_output import classify_family, measure  # noqa: E402
 from hooks.telemetry import record_shell_output, record_telemetry_event, warn  # noqa: E402
 from policies.api import PolicyPostContext  # noqa: E402
+from policies.governor import apply_runtime_governor  # noqa: E402
 from spool import receipts as spool_receipts, store as spool_store  # noqa: E402
 
 _SHELL_TOOLS = {"claude": frozenset(("Bash",)), "codex": frozenset(("Bash", "shell", "exec_command", "exec")),
                 "cursor": frozenset(("Shell", "run_terminal_cmd"))}
 _READ_TOOLS = frozenset(("Read", "NotebookRead", "read_file", "view_file"))
-_MUTATION_TOOLS = frozenset((
-    "Edit", "MultiEdit", "Write", "NotebookEdit", "StrReplace", "MultiStrReplace", "EditFile",
-    "WriteFile", "Delete", "DeleteFile", "apply_patch", "edit_file", "write_file",
-    "replace_file_content", "multi_replace_file_content", "write_to_file",
-))
+_MUTATION_TOOLS = frozenset(("Edit", "MultiEdit", "Write", "NotebookEdit", "StrReplace", "MultiStrReplace", "EditFile",
+                             "WriteFile", "Delete", "DeleteFile", "apply_patch", "edit_file", "write_file",
+                             "replace_file_content", "multi_replace_file_content", "write_to_file"))
 _PATH_KEYS = ("file_path", "notebook_path", "path", "relative_workspace_path",
               "Path", "AbsolutePath", "TargetFile", "filePath")
 _EXIT_RE = re.compile(r"^Exit code -?\d+$")
@@ -136,10 +135,8 @@ def _resolve_read_tier(
 ) -> tuple[int, bool]:
     """Return `(tier_or_provisional, is_final)` for a pending read."""
     resp = raw if isinstance((raw := payload.get("tool_response")), dict) else {}
-    has_err = is_failure or bool(
-        payload.get("is_error") or payload.get("error") or resp.get("is_error") or resp.get("error")
-        or str(payload.get("status") or "").lower() in ("error", "failed", "failure")
-    )
+    has_err = is_failure or bool(payload.get("is_error") or payload.get("error") or resp.get("is_error") or resp.get("error")
+                                 or str(payload.get("status") or "").lower() in ("error", "failed", "failure"))
     if has_err or payload.get("truncated") or resp.get("truncated") or pending.get("synthetic_id"):
         return 0, True
     if int(pending.get("byte_offset") or 0) != 0:
@@ -172,10 +169,7 @@ def _tool_name(payload: dict[str, Any]) -> str:
 
 def _extract_item_call_id(item: dict[str, Any]) -> str:
     tc = raw if isinstance((raw := item.get("toolCall")), dict) else {}
-    return str(
-        next((item[k] for k in ("tool_use_id", "call_id", "tool_call_id", "callId") if item.get(k)), "")
-        or tc.get("id") or tc.get("callId") or ""
-    )
+    return str(next((item[k] for k in ("tool_use_id", "call_id", "tool_call_id", "callId") if item.get(k)), "") or tc.get("id") or tc.get("callId") or "")
 
 def _apply_read_confirmation(
     harness: str, payload: dict[str, Any], state_dir_path: Path, cfg: dict[str, Any],
@@ -285,10 +279,8 @@ def _advance_spool_step_and_model(harness: str, sess_id: str, payload: dict[str,
 def _warn_hook_error(exc: BaseException, context: str) -> None:
     state_store.run_telemetry_safely(lambda: warn(f"shell output hook failed: {type(exc).__name__}"), context=context)
 
-def handle_post_tool_use(
-    harness: str, payload: dict[str, Any], stats_path: Path | None = None, *,
-    state_dir: str | Path | None = None, event_name: str | None = None,
-) -> dict[str, Any]:
+def handle_post_tool_use(harness: str, payload: dict[str, Any], stats_path: Path | None = None, *,
+                         state_dir: str | Path | None = None, event_name: str | None = None) -> dict[str, Any]:
     """Record shell telemetry, read confirmations (`PostToolUse`/`PostToolBatch`/`Failure`), and hooks."""
     try:
         t0 = time.perf_counter()
@@ -298,6 +290,7 @@ def handle_post_tool_use(
             record_shell_output(harness, classify_family(call.command), measure(call.output, harness) if call.output is not None else None, call.outcome, sp)
         cfg = config.load_runtime_config()
         sdir = state_store.resolve_state_dir(payload, sd_str := (str(state_dir) if state_dir is not None else None))
+        cfg = apply_runtime_governor(cfg, harness, state_dir=sdir, payload=payload)
         sh_path, out_p = telemetry.shadow_path_for(sd_str), ledger_path_for(sd_str)
         sess_id = str(payload.get("session_id") or payload.get("conversation_id") or payload.get("conversationId") or "default")
         cid, out_mode = _extract_item_call_id(payload), str((cfg.get("optimizers") or {}).get("output_spool") or "off")
@@ -316,8 +309,7 @@ def handle_post_tool_use(
         else:
             spool_resp, spool_meta = {}, None
             if ev == "PostToolBatch":
-                spool_receipts.persist_spool_delivery_verification(
-                    payload, harness=harness, session_id=sess_id, workspace_root=payload.get("cwd"), workspace_roots=ws_roots, spool_dir=eff_spool_dir)
+                spool_receipts.persist_spool_delivery_verification(payload, harness=harness, session_id=sess_id, workspace_root=payload.get("cwd"), workspace_roots=ws_roots, spool_dir=eff_spool_dir)
         mut_paths = _apply_mutation_invalidation(payload, sdir, sh_path) if ev == "PostToolUse" else []
         trims = _apply_read_confirmation(harness, payload, sdir, cfg, sp, eff_event=ev, shadow_path=sh_path, outcomes_path=out_p)
         step_idx, mod = _advance_spool_step_and_model(harness, sess_id, payload, sdir) if (out_mode == "active" and spool_meta is not None) else (0, "unknown")

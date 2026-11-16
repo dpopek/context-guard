@@ -5,6 +5,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 
 ## [Unreleased]
 
+## [4.8.0] - 2026-11-16
+
+### Added
+- **Governor contracts (`policies/api.py`):** Exported `CapabilityContractV1`, `CircuitBreakerStateV1`, and `GovernorContractV1`.
+- **Adaptive Governor (`policies/governor.py`):** Added capability attestation, fingerprint invalidation, and hysteresis breakers.
+- **Governor CLI (`bin/cg_eval.py`, `ci.yml`):** Added `cg eval --governor-check` JSON/Markdown check and Multi-OS CI smoke step.
+
+### Changed
+- **Hook & spool wiring (`pre_tool_use.py`, `post_tool_use.py`, `spool/store.py`):** Wired governor modes and integrity breaker trips.
+- **Evidence & docs (`evidence/runner.py`, `README.md`, `ROADMAP.md`):** Added `governor_replay_ok` check and synced `v4.8.0` docs.
+
 ## [4.7.0] - 2026-11-16
 
 ### Added

@@ -259,18 +259,102 @@ class EvidenceContractV1(TypedDict):
     gate_verdict: dict[str, Any]
 
 
+CAPABILITY_CONTRACT_SCHEMA_VERSION: int = 1
+GOVERNOR_SCHEMA_VERSION: int = 1
+VALID_GOVERNOR_MODES: tuple[str, ...] = ("active", "shadow", "passthrough")
+VALID_BREAKER_STATES: tuple[str, ...] = ("closed", "open", "half_open")
+HARD_INTEGRITY_FAILURE_REASONS: tuple[str, ...] = (
+    "integrity_mismatch", "unexpectedly_missing", "corrupt",
+    "format_error", "guarantee_loss", "attestation_invalidated", "unknown_payload",
+)
+NON_TRIPPING_SIGNALS: tuple[str, ...] = (
+    "suspected_regret", "repeat_after_spool", "verbose_override",
+    "reread_trimmed_range", "chunk_thrashing", "high_recovery_amplification",
+    "ttl_expired", "max_entries_lru", "max_bytes_lru",
+)
+
+
+class CapabilityContractV1(TypedDict):
+    """Runtime capability verification contract bound to a CapabilityAttestationKey."""
+
+    schema_version: int
+    capability_id: str
+    evidence_level: str
+    attestation_key: dict[str, str]
+    verification_evidence: str | None
+    verified_at: str | None
+    runtime_verified: bool
+    provider_only_rejected: bool
+    invalidated_reason: str | None
+
+
+class CircuitBreakerStateV1(TypedDict):
+    """Per-optimizer hysteresis circuit breaker state persisted in governor_state.json."""
+
+    optimizer_id: str
+    state: str
+    tripped: bool
+    trip_reason: str | None
+    trip_count: int
+    tripped_at: str | None
+    last_verified_at: str | None
+    ignored_signals: int
+    requires_verification_or_operator_reset: bool
+
+
+class OptimizerDecisionV1(TypedDict):
+    """Deterministic governor decision for one optimizer against verified capabilities."""
+
+    optimizer_id: str
+    configured_mode: str
+    selected_mode: str
+    effective_config_mode: str
+    reason: str
+    required_capabilities: list[str]
+    min_evidence_level: str
+    observed_evidence_level: str
+    breaker_state: str
+    downgraded: bool
+
+
+class GovernorContractV1(TypedDict):
+    """Schema v1 full governor evaluation contract covering capabilities, breakers, and decisions."""
+
+    schema_version: int
+    evaluated_at: str
+    harness_id: str
+    harness_build_id: str
+    adapter_version: str
+    hook_config_fingerprint: str
+    payload_known: bool
+    evidence_gate_passed: bool
+    security_enforcement_lowered: bool
+    capabilities: dict[str, CapabilityContractV1]
+    circuit_breakers: dict[str, CircuitBreakerStateV1]
+    decisions: dict[str, OptimizerDecisionV1]
+    effective_optimizers: dict[str, str]
+
+
 __all__ = [
     "ADAPTER_CONTRACT_VERSION",
     "ALL_SECURITY_SCOPES",
+    "CAPABILITY_CONTRACT_SCHEMA_VERSION",
     "CapabilityAttestationKey",
+    "CapabilityContractV1",
     "CapabilityRequirementV1",
+    "CircuitBreakerStateV1",
     "ContextReceiptV1",
     "EVIDENCE_SCHEMA_VERSION",
     "EvidenceContractV1",
     "EvidenceEnvironmentMetadataV1",
+    "GOVERNOR_SCHEMA_VERSION",
+    "GovernorContractV1",
+    "HARD_INTEGRITY_FAILURE_REASONS",
     "HARNESS_OUTPUT_CAPABILITIES",
     "HarnessOutputCapabilities",
     "InstallerHookSpec",
+    "NON_TRIPPING_SIGNALS",
+    "OptimizerDecisionV1",
     "POLICY_API_VERSION",
     "PolicyContext",
     "PolicyDecision",
@@ -279,8 +363,10 @@ __all__ = [
     "RECEIPT_SCHEMA_VERSION",
     "RuntimeCapabilities",
     "SpoolContractV1",
+    "VALID_BREAKER_STATES",
     "VALID_CAPABILITY_EVIDENCE_LEVELS",
     "VALID_EVAL_TIERS",
+    "VALID_GOVERNOR_MODES",
     "VALID_POLICY_KINDS",
     "VALID_POLICY_MODES",
     "VALID_RUN_OUTCOME_CLASSES",

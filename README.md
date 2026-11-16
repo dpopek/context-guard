@@ -1,6 +1,6 @@
-# Context-Guard (v4.7.0)
+# Context-Guard (v4.8.0)
 
-Zero-prompt Policy API v1 host, Read Ledger v2 (`range_trim`), reversible output spooler, artifact unwrapper, budget advisor, and Evidence Engine for **Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex** (`macOS`, `Linux`, `Windows`).
+Zero-prompt Policy API v1 host, Read Ledger v2 (`range_trim`), reversible output spooler, artifact unwrapper, budget advisor, Evidence Engine, and Adaptive Governor for **Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex** (`macOS`, `Linux`, `Windows`).
 
 Pure Python 3.9+ stdlib: `cg-outline` (21 extensions, optional `tree-sitter-language-pack`), `policy_packs`, `cg-spool`, Outcomes v4, `cg budget`, and `cg eval`.
 
@@ -66,21 +66,22 @@ Trims noisy test/grep boilerplate unless explicit verbosity flags (`-v`/`--verbo
 - **Recovery & GC:** Stores `sp_<12hex>.txt` (`24h` TTL, `64` entries, `32 MB`) across `available`/`evicting`/`evicted`/`corrupt`; verifies SHA-256 and unlinks unlocked.
 - **Scoped Access & Receipts:** `cg-spool` (`--workspace`/`--workspace-root`, `--session`) and MCP (`roots/list` + `--workspace-root`) enforce `os.path.samefile()`; `hooks/outcomes.py` emits `ContextReceiptV1`.
 
-### 6. Evidence Engine & Isolated Evaluation (`evidence/ledger.py`, `evidence/metrics.py`, `evidence/runner.py`)
-- **Ledger & Cursor Gate:** Deduplicates `evidence_events.json`, derives Outcomes v4 (`unavailable`/`incomplete`), emits `EvidenceContractV1` / `CapabilityAttestationKey`, and gates Cursor CLI.
-- **Metrics & Runner:** Computes `Cost per Passed Run` (including TTL misses/failures, Wilson & bootstrap CIs) and runs isolated `--offline-replay`, `--pilot` (`6x2x3`), and `--release` (`12-15x3x2`).
+### 6. Evidence Engine & Adaptive Governor (`evidence/ledger.py`, `evidence/metrics.py`, `evidence/runner.py`)
+- **Ledger & Gate:** Deduplicates `evidence_events.json`, derives Outcomes v4 (`unavailable`/`incomplete`), emits `EvidenceContractV1`/`CapabilityAttestationKey`, and gates Cursor CLI.
+- **Runner & Governor:** Computes `Cost per Passed Run` (Wilson/bootstrap CIs), runs `--offline-replay`/`--pilot`/`--release`/`--governor-check`, and opens hysteresis breakers on hard failures.
 
 ---
 
 ## Architecture & Module Inventory
 
 Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`:
-- **Zero Import Cycles & Slim Footprint:** `Tarjan SCC == 0` (`hooks`/`spool`/`policies`/`integrations` never import `evidence`); `.py <= 800` LOC; `hooks/*.py < 6,800` LOC.
+- **Zero Cycles & Slim Footprint:** `Tarjan SCC == 0` (`hooks`/`spool`/`policies`/`integrations` never import `evidence`); `.py <= 800` LOC; `hooks/*.py < 6,800` LOC.
 - **Lock Ordering:** Independent locks + `os.replace` across state, `stats`, `outcomes`, `token_usage`, `receipts`, `evidence_events`, `update`, and `update_refresh`.
 
 | Module | Layer | Responsibility |
 | :--- | :--- | :--- |
-| `policies/api.py` | Policy | `POLICY_API_VERSION = 1`, `SpoolContractV1`, `ContextReceiptV1`, `EvidenceContractV1`, `CapabilityAttestationKey`. |
+| `policies/api.py` | Policy | `POLICY_API_VERSION = 1`, `SpoolContractV1`, `ContextReceiptV1`, `EvidenceContractV1`, `CapabilityContractV1`. |
+| `policies/governor.py` | Policy | Capability-aware governor (`CapabilityAttestationKey`, hysteresis breakers, `replay_governor_decisions`). |
 | `policies/loader.py` | Policy | Verified pack loader (`file_hashes`, `tree_sha256` byte checks). |
 | `integrations/atlassian_twg.py` | Integration | Opt-in CLI rewriter and JSON stdout summarizer (`"atlassian_twg": "active"`). |
 | `spool/receipts.py` | Spool | Workspace `samefile` identity, link checks, `receipts.jsonl`, `summarize_spool_lifecycle`. |
@@ -144,9 +145,9 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 Clone anywhere (`~/.gemini/config/plugins/context-guard` for Antigravity; `CONTEXT_GUARD_HOME` overrides):
 
 ```bash
-CG_DIR=~/tools/context-guard  # or unpack dist/context-guard-v4.7.0.zip
+CG_DIR=~/tools/context-guard  # or unpack dist/context-guard-v4.8.0.zip
 git clone https://github.com/dpopek/context-guard.git "$CG_DIR"
-python3 "$CG_DIR/bin/install_harnesses.py" --install  # hooks + advox.context-guard-statusbar-4.7.0
+python3 "$CG_DIR/bin/install_harnesses.py" --install  # hooks + advox.context-guard-statusbar-4.8.0
 python3 "$CG_DIR/bin/install_harnesses.py" --status   # also: --dry-run, --pack-source <dir>, --uninstall
 ```
 
@@ -156,6 +157,7 @@ python3 "$CG_DIR/bin/install_harnesses.py" --status   # also: --dry-run, --pack-
 
 ```bash
 cg eval --offline-replay                      # isolated EvidenceContractV1 replay (or cg-eval)
+cg eval --governor-check                      # replay 8 Adaptive Governor capability & breaker gates
 cg eval --pilot --plan                        # plan 6x2x3=36 pilot; --release --plan for 72-90
 cg eval --cursor-conformance                  # isolated Cursor CLI hook conformance gate
 cg eval --ledger-verify                       # ingest receipts.jsonl & verify Outcomes v4 ledger

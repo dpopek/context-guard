@@ -20,6 +20,7 @@ from evidence.ledger import (
 )
 from evidence.metrics import compute_arm_summary, compute_paired_comparison, plan_evaluation_matrix
 from policies.api import EVIDENCE_SCHEMA_VERSION, EvidenceContractV1, VALID_EVAL_TIERS
+from policies.governor import replay_governor_decisions
 from spool.receipts import check_unsafe_link, receipts_path_for
 from spool.store import slice_spool, spool_tool_output
 
@@ -388,6 +389,7 @@ def run_offline_evidence_replay(
         ingest_res = ingest_context_receipts(ledger_path, receipts_path)
         derived_res = derive_outcomes_from_ledger(ledger_path)
         cursor_conf = run_cursor_cli_conformance(work_dir=cursor_dir)
+    governor_replay = replay_governor_decisions()
 
     env_meta = collect_environment_metadata(clean_harness, model_id=clean_model, harness_build_id=clean_build, runtime_cfg={})
     cg_ver = env_meta["context_guard_version"]
@@ -404,7 +406,8 @@ def run_offline_evidence_replay(
         bool(cursor_conf.get("ok")) and bool(cursor_conf.get("admitted"))
         and cursor_conf.get("cache_attribution_status") == "excluded_missing_telemetry"
     )
-    all_ok = replay_ok and bench_ok and spool_ok and ledger_ok and cursor_ok
+    governor_ok = bool(governor_replay.get("ok"))
+    all_ok = replay_ok and bench_ok and spool_ok and ledger_ok and cursor_ok and governor_ok
 
     is_cursor = clean_harness == "cursor"
     slice_bytes = len(str(slice_res.get("content") or "").encode("utf-8")) if spool_ok else 0
@@ -452,9 +455,11 @@ def run_offline_evidence_replay(
     report["gate_verdict"]["checks"] = {
         "deterministic_replay_ok": replay_ok, "deterministic_benchmark_ok": bench_ok,
         "spool_and_slice_ok": spool_ok, "durable_ledger_ok": ledger_ok, "cursor_conformance_ok": cursor_ok,
+        "governor_replay_ok": governor_ok,
     }
     report["gate_verdict"]["ledger_outcomes"] = derived_res
     report["gate_verdict"]["cursor_conformance"] = cursor_conf
+    report["gate_verdict"]["governor_replay"] = governor_replay
     report["gate_verdict"]["benchmark"] = {
         k: bench_res.get(k) for k in ("ok", "isolated", "measurement_scope", "iterations", "corpus_calls", "raw_bytes", "delivered_bytes", "saved_bytes", "saved_tokens", "savings_pct")
     }
