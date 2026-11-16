@@ -434,6 +434,7 @@ def test_shadow_mode_byte_parity_with_off_and_shadow_ledger_invalidation(
             d_off, d_sh = json.loads(p_off.read_text(encoding="utf-8")), json.loads(p_sh.read_text(encoding="utf-8"))
             d_off.pop("updated_at", None)
             d_sh.pop("updated_at", None)
+            assert bool(d_off.pop("installed_at", None)) == bool(d_sh.pop("installed_at", None))
             for doc in (d_off, d_sh):
                 for ent in (doc.get("files") or {}).values():
                     for pend in (ent.get("pending_reads") or {}).values():
