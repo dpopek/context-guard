@@ -8,6 +8,9 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
+import sys
 import threading
 from typing import Any
 
@@ -19,6 +22,7 @@ from spool.receipts import (
     compute_scoped_spool_id,
     read_spool_isolation_config,
     resolve_workspace_identity,
+    same_workspace_dir,
 )
 from spool.store import spool_tool_output
 
@@ -353,3 +357,317 @@ def test_session_and_global_isolation_modes_and_roots_list_changed_invalidation(
     (spool_dir / f"{sid_1}.txt").write_bytes(b"\xff\xfe\x80")
     assert cg_spool.main(["slice", sid_1, "--workspace", str(repo), "--session", "sess-1", "--spool-dir", str(spool_dir), "--json"]) == 1
     assert telemetry.load_telemetry_stats()["events"]["reliability_failures"] == 1
+
+
+def _forbid_os_getcwd() -> str:
+    raise AssertionError("serve_stdio must never call os.getcwd")
+
+
+def _make_dir_symlink(link_path: Path, target_dir: Path) -> None:
+    try:
+        link_path.symlink_to(target_dir, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable on this platform: {exc}")
+
+
+def test_symlinked_and_case_variant_workspace_parity_across_hook_and_mcp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify symlinked and case-variant workspaces match via os.path.samefile across hook writes and MCP reads."""
+    real_proj = tmp_path / "ProjAlpha"
+    (real_proj / ".git").mkdir(parents=True)
+    other_proj = tmp_path / "ProjBeta"
+    (other_proj / ".git").mkdir(parents=True)
+    symlink_proj = tmp_path / "proj_alpha_link"
+    _make_dir_symlink(symlink_proj, real_proj)
+    (symlink_proj / "nested").mkdir()
+    assert same_workspace_dir(real_proj, symlink_proj) is True
+    assert os.path.samefile(str(real_proj), str(symlink_proj))
+
+    spool_dir = tmp_path / "spool"
+    res_real = spool_tool_output(
+        _big_spool_text("SYMLINK_REAL"), session_id="s-sym", call_id="c-sym-1", harness="claude",
+        tool_name="Bash", workspace_root=real_proj, isolation="workspace", spool_dir=spool_dir, now_ts=1_700_000_100.0,
+    )
+    res_sym = spool_tool_output(
+        _big_spool_text("SYMLINK_ALIAS"), session_id="s-sym", call_id="c-sym-2", harness="cursor",
+        tool_name="MCP:sym:run", workspace_root=symlink_proj / "nested", isolation="workspace",
+        spool_dir=spool_dir, now_ts=1_700_000_101.0,
+    )
+    assert res_real is not None and res_sym is not None
+    sid_real, sid_sym = res_real[0].spool_id, res_sym[0].spool_id
+
+    with monkeypatch.context() as mp:
+        mp.setattr(os, "getcwd", _forbid_os_getcwd)
+        sym_replies = _rpc_ndjson(
+            [
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "cg_spool_list", "arguments": {}}},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "cg_spool_slice", "arguments": {"spool_id": sid_real, "limit": 2}}},
+                {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "cg_spool_grep", "arguments": {"spool_id": sid_real, "pattern": "SYMLINK_REAL-0001"}}},
+            ],
+            spool_dir=spool_dir, workspace_root=symlink_proj, isolation="workspace",
+        )
+        real_replies = _rpc_ndjson(
+            [{"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "cg_spool_slice", "arguments": {"spool_id": sid_sym, "limit": 2}}}],
+            spool_dir=spool_dir, workspace_root=real_proj, isolation="workspace",
+        )
+        other_replies = _rpc_ndjson(
+            [{"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "cg_spool_slice", "arguments": {"spool_id": sid_real}}}],
+            spool_dir=spool_dir, workspace_root=other_proj, isolation="workspace",
+        )
+        case_alias = tmp_path / "projalpha"
+        case_replies = (
+            _rpc_ndjson(
+                [{"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "cg_spool_slice", "arguments": {"spool_id": sid_real, "limit": 1}}}],
+                spool_dir=spool_dir, workspace_root=case_alias, isolation="workspace",
+            )
+            if case_alias.exists() and same_workspace_dir(real_proj, case_alias)
+            else None
+        )
+
+    assert sym_replies[0]["result"]["isError"] is False
+    assert json.loads(sym_replies[0]["result"]["content"][0]["text"])["count"] == 2
+    assert sym_replies[1]["result"]["isError"] is False
+    assert "SYMLINK_REAL-0001" in json.loads(sym_replies[1]["result"]["content"][0]["text"])["content"]
+    assert sym_replies[2]["result"]["isError"] is False
+    assert json.loads(sym_replies[2]["result"]["content"][0]["text"])["match_count"] == 1
+    assert real_replies[0]["result"]["isError"] is False
+    assert "SYMLINK_ALIAS-0001" in json.loads(real_replies[0]["result"]["content"][0]["text"])["content"]
+    assert other_replies[0]["result"]["isError"] is True
+    assert json.loads(other_replies[0]["result"]["content"][0]["text"])["error"] == "workspace_mismatch"
+    if case_replies is not None:
+        assert case_replies[0]["result"]["isError"] is False
+        assert "SYMLINK_REAL-0001" in json.loads(case_replies[0]["result"]["content"][0]["text"])["content"]
+
+
+def test_mcp_roots_list_deduplicates_symlink_and_alias_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deduplicate symlink and alias workspace roots in MCP roots/list instead of failing workspace_ambiguous."""
+    real_proj = tmp_path / "DedupRepo"
+    (real_proj / ".git").mkdir(parents=True)
+    other_proj = tmp_path / "DistinctRepo"
+    (other_proj / ".git").mkdir(parents=True)
+    symlink_proj = tmp_path / "dedup_repo_link"
+    _make_dir_symlink(symlink_proj, real_proj)
+
+    spool_dir = tmp_path / "spool"
+    res = spool_tool_output(
+        _big_spool_text("DEDUP_ROOT"), session_id="s-dd", call_id="c-dd", harness="cursor",
+        tool_name="MCP:dd:run", workspace_root=real_proj, isolation="workspace", spool_dir=spool_dir, now_ts=1_700_000_200.0,
+    )
+    assert res is not None
+    sid = res[0].spool_id
+
+    dup_roots = [{"uri": real_proj.as_uri()}, {"uri": symlink_proj.as_uri()}]
+    case_alias = tmp_path / "deduprepo"
+    if case_alias.exists() and same_workspace_dir(real_proj, case_alias):
+        dup_roots.append({"uri": case_alias.as_uri()})
+
+    c2s_r, c2s_w = os.pipe()
+    s2c_r, s2c_w = os.pipe()
+    in_fh, out_fh = os.fdopen(c2s_r, "rb"), os.fdopen(s2c_w, "wb")
+    client_w, client_r = os.fdopen(c2s_w, "wb"), os.fdopen(s2c_r, "rb")
+    t = threading.Thread(
+        target=lambda: serve_stdio(spool_dir=spool_dir, stdin=in_fh, stdout=out_fh, isolation="workspace"),
+        daemon=True,
+    )
+
+    def _send(obj: dict[str, Any]) -> None:
+        client_w.write((json.dumps(obj) + "\n").encode("utf-8"))
+        client_w.flush()
+
+    def _recv() -> dict[str, Any]:
+        return json.loads(client_r.readline().decode("utf-8"))
+
+    with monkeypatch.context() as mp:
+        mp.setattr(os, "getcwd", _forbid_os_getcwd)
+        t.start()
+        _send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {"roots": {"listChanged": True}}}})
+        assert _recv()["id"] == 1
+        _send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "cg_spool_list", "arguments": {}}})
+        req_roots = _recv()
+        assert req_roots["method"] == "roots/list"
+        _send({"jsonrpc": "2.0", "id": req_roots["id"], "result": {"roots": dup_roots}})
+        list_rep = _recv()
+        assert list_rep["id"] == 2 and list_rep["result"]["isError"] is False
+        assert json.loads(list_rep["result"]["content"][0]["text"])["count"] == 1
+
+        _send({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "cg_spool_slice", "arguments": {"spool_id": sid, "limit": 2}}})
+        slice_rep = _recv()
+        assert slice_rep["id"] == 3 and slice_rep["result"]["isError"] is False
+        assert "DEDUP_ROOT-0001" in json.loads(slice_rep["result"]["content"][0]["text"])["content"]
+
+        # Adding a genuinely distinct second workspace triggers workspace_ambiguous
+        _send({"jsonrpc": "2.0", "method": "notifications/roots/list_changed"})
+        _send({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "cg_spool_slice", "arguments": {"spool_id": sid}}})
+        req_roots_2 = _recv()
+        _send({"jsonrpc": "2.0", "id": req_roots_2["id"], "result": {"roots": [*dup_roots, {"uri": other_proj.as_uri()}]}})
+        amb_rep = _recv()
+        assert amb_rep["id"] == 4 and amb_rep["result"]["isError"] is True
+        assert json.loads(amb_rep["result"]["content"][0]["text"])["error"] == "workspace_ambiguous"
+        client_w.close()
+        t.join(timeout=5)
+
+    for fh in (client_r, in_fh, out_fh):
+        fh.close()
+    assert not t.is_alive()
+
+
+def test_deleted_or_moved_workspace_fails_closed_without_global_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject deleted or moved workspace roots as workspace_unresolved/mismatch with zero global fallback."""
+    ephemeral_proj = tmp_path / "EphemeralRepo"
+    (ephemeral_proj / ".git").mkdir(parents=True)
+    movable_proj = tmp_path / "MovableRepo"
+    (movable_proj / ".git").mkdir(parents=True)
+    spool_dir = tmp_path / "spool"
+
+    res_del = spool_tool_output(
+        _big_spool_text("DELETED_WS"), session_id="s-del", call_id="c-del", harness="cursor",
+        tool_name="MCP:del:run", workspace_root=ephemeral_proj, isolation="workspace", spool_dir=spool_dir, now_ts=1_700_000_300.0,
+    )
+    res_mov = spool_tool_output(
+        _big_spool_text("MOVED_WS"), session_id="s-mov", call_id="c-mov", harness="cursor",
+        tool_name="MCP:mov:run", workspace_root=movable_proj, isolation="workspace", spool_dir=spool_dir, now_ts=1_700_000_301.0,
+    )
+    res_glob = spool_tool_output(
+        _big_spool_text("GLOBAL_DECOY"), session_id="s-gl", call_id="c-gl", harness="cursor",
+        tool_name="MCP:gl:run", isolation="global", spool_dir=spool_dir, now_ts=1_700_000_302.0,
+    )
+    assert res_del is not None and res_mov is not None and res_glob is not None
+    sid_del, sid_mov, sid_glob = res_del[0].spool_id, res_mov[0].spool_id, res_glob[0].spool_id
+
+    shutil.rmtree(ephemeral_proj)
+    moved_proj = tmp_path / "MovedRepo"
+    movable_proj.rename(moved_proj)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(os, "getcwd", _forbid_os_getcwd)
+        del_replies = _rpc_ndjson(
+            [
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "cg_spool_list", "arguments": {}}},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "cg_spool_slice", "arguments": {"spool_id": sid_del}}},
+                {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "cg_spool_grep", "arguments": {"spool_id": sid_del, "pattern": "DELETED_WS"}}},
+                {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "cg_spool_slice", "arguments": {"spool_id": sid_glob}}},
+            ],
+            spool_dir=spool_dir, workspace_root=ephemeral_proj, isolation="workspace",
+        )
+        old_mov_replies = _rpc_ndjson(
+            [{"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "cg_spool_slice", "arguments": {"spool_id": sid_mov}}}],
+            spool_dir=spool_dir, workspace_root=movable_proj, isolation="workspace",
+        )
+        new_mov_replies = _rpc_ndjson(
+            [
+                {"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "cg_spool_list", "arguments": {}}},
+                {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "cg_spool_slice", "arguments": {"spool_id": sid_mov}}},
+                {"jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": {"name": "cg_spool_grep", "arguments": {"spool_id": sid_mov, "pattern": "MOVED_WS"}}},
+                {"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "cg_spool_slice", "arguments": {"spool_id": sid_glob}}},
+            ],
+            spool_dir=spool_dir, workspace_root=moved_proj, isolation="workspace",
+        )
+
+    for rep in del_replies:
+        assert rep["result"]["isError"] is True
+        assert json.loads(rep["result"]["content"][0]["text"])["error"] == "workspace_unresolved"
+    assert old_mov_replies[0]["result"]["isError"] is True
+    assert json.loads(old_mov_replies[0]["result"]["content"][0]["text"])["error"] == "workspace_unresolved"
+    assert new_mov_replies[0]["result"]["isError"] is False
+    assert json.loads(new_mov_replies[0]["result"]["content"][0]["text"])["count"] == 0
+    for idx in (1, 2, 3):
+        assert new_mov_replies[idx]["result"]["isError"] is True
+        assert json.loads(new_mov_replies[idx]["result"]["content"][0]["text"])["error"] == "workspace_mismatch"
+
+
+def test_cli_and_mcp_workspace_root_alias_and_startup_env_pinning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify --workspace-root across CLI/MCP/Cursor config and startup CONTEXT_GUARD_WORKSPACE_ROOT pinning."""
+    from bin import cg_spool
+
+    repo_root = Path(__file__).resolve().parent.parent
+    proj_a, proj_b = tmp_path / "CliProjA", tmp_path / "CliProjB"
+    (proj_a / ".git").mkdir(parents=True)
+    (proj_b / ".git").mkdir(parents=True)
+    spool_dir = tmp_path / "spool"
+
+    res_a = spool_tool_output(
+        _big_spool_text("WSROOT"), session_id="s-wr", call_id="c-wr", harness="claude",
+        tool_name="Bash", workspace_root=proj_a, isolation="workspace", spool_dir=spool_dir, now_ts=1_700_000_400.0,
+    )
+    assert res_a is not None
+    sid_a = res_a[0].spool_id
+
+    # Cursor mcp.json validation accepts --workspace and --workspace-root with non-empty value
+    mcp_cfg = tmp_path / "mcp.json"
+    for valid_args in (
+        ["bin/cg_spool.py", "mcp", "--workspace", "${workspaceFolder}"],
+        ["bin/cg_spool.py", "mcp", "--workspace-root", "${workspaceFolder}"],
+    ):
+        mcp_cfg.write_text(json.dumps({"mcpServers": {"context-guard-spool": {"command": "python3", "args": valid_args}}}), encoding="utf-8")
+        assert is_cursor_spool_mcp_configured(mcp_cfg) is True
+    for bad_args in (
+        ["bin/cg_spool.py", "--workspace-root", "${workspaceFolder}"],
+        ["bin/cg_spool.py", "mcp", "--workspace-root"],
+        ["bin/cg_spool.py", "mcp", "--workspace-root", "   "],
+        ["bin/cg_spool.py", "mcp", "--workspace", "${workspaceFolder}", "--workspace-root", ""],
+    ):
+        mcp_cfg.write_text(json.dumps({"mcpServers": {"context-guard-spool": {"command": "python3", "args": bad_args}}}), encoding="utf-8")
+        assert is_cursor_spool_mcp_configured(mcp_cfg) is False
+
+    cfg_absent = tmp_path / "absent_config.json"
+    with monkeypatch.context() as mp:
+        mp.setenv("CONTEXT_GUARD_CONFIG_PATH", str(cfg_absent))
+        capsys.readouterr()
+        assert cg_spool.main(["list", "--workspace-root", str(proj_a), "--spool-dir", str(spool_dir), "--json"]) == 0
+        assert json.loads(capsys.readouterr().out)["count"] == 1
+        assert cg_spool.main(["slice", sid_a, "--workspace-root", str(proj_a), "--limit", "2", "--spool-dir", str(spool_dir), "--json"]) == 0
+        assert "WSROOT-0001" in json.loads(capsys.readouterr().out)["content"]
+        assert cg_spool.main(["grep", sid_a, "WSROOT-0001", "--workspace-root", str(proj_a), "--spool-dir", str(spool_dir), "--json"]) == 0
+        assert json.loads(capsys.readouterr().out)["match_count"] == 1
+        assert cg_spool.main(["slice", sid_a, "--workspace-root", str(proj_b), "--spool-dir", str(spool_dir), "--json"]) == 1
+        assert json.loads(capsys.readouterr().out)["error"] == "workspace_mismatch"
+        assert cg_spool.main(["gc", "--workspace-root", str(proj_a), "--spool-dir", str(spool_dir), "--json"]) == 0
+        assert json.loads(capsys.readouterr().out)["ok"] is True
+
+        # Subprocess CLI `mcp --workspace-root`
+        proc_in = b"\n".join([
+            json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}).encode("utf-8"),
+            json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "cg_spool_slice", "arguments": {"spool_id": sid_a, "limit": 2}}}).encode("utf-8"),
+        ]) + b"\n"
+        proc = subprocess.run(
+            [sys.executable, str(repo_root / "bin" / "cg_spool.py"), "mcp", "--spool-dir", str(spool_dir), "--workspace-root", str(proj_a)],
+            cwd=str(repo_root), input=proc_in, capture_output=True, check=False,
+        )
+        assert proc.returncode == 0 and proc.stderr == b""
+        proc_replies = [json.loads(ln.decode("utf-8")) for ln in proc.stdout.splitlines() if ln.strip()]
+        assert proc_replies[1]["result"]["isError"] is False
+        assert "WSROOT-0001" in json.loads(proc_replies[1]["result"]["content"][0]["text"])["content"]
+
+        # Startup pinning of CONTEXT_GUARD_WORKSPACE_ROOT (immutable mid-session, zero os.getcwd)
+        c2s_r, c2s_w = os.pipe()
+        s2c_r, s2c_w = os.pipe()
+        in_fh, out_fh = os.fdopen(c2s_r, "rb"), os.fdopen(s2c_w, "wb")
+        client_w, client_r = os.fdopen(c2s_w, "wb"), os.fdopen(s2c_r, "rb")
+        mp.setattr(os, "getcwd", _forbid_os_getcwd)
+        mp.setenv("CONTEXT_GUARD_WORKSPACE_ROOT", str(proj_a))
+        t = threading.Thread(
+            target=lambda: serve_stdio(spool_dir=spool_dir, stdin=in_fh, stdout=out_fh, isolation="workspace"),
+            daemon=True,
+        )
+        t.start()
+        client_w.write((json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}) + "\n").encode("utf-8"))
+        client_w.flush()
+        assert json.loads(client_r.readline().decode("utf-8"))["id"] == 1
+        mp.setenv("CONTEXT_GUARD_WORKSPACE_ROOT", str(proj_b))
+        client_w.write((json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "cg_spool_slice", "arguments": {"spool_id": sid_a, "limit": 1}}}) + "\n").encode("utf-8"))
+        client_w.flush()
+        pinned_rep = json.loads(client_r.readline().decode("utf-8"))
+        client_w.close()
+        t.join(timeout=5)
+        for fh in (client_r, in_fh, out_fh):
+            fh.close()
+        assert not t.is_alive()
+        assert pinned_rep["result"]["isError"] is False
+        assert "WSROOT-0001" in json.loads(pinned_rep["result"]["content"][0]["text"])["content"]

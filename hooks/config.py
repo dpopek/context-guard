@@ -27,6 +27,7 @@ OPTIMIZER_MODES: frozenset[str] = frozenset({"active", "shadow", "off"})
 CLI_REWRITE_MODES: frozenset[str] = frozenset({"auto", "force", "shadow", "off"})
 INTEGRATION_MODES: frozenset[str] = frozenset({"active", "off"})
 SPOOL_ISOLATION_MODES: frozenset[str] = frozenset({"workspace", "session", "global"})
+DEFAULT_MAX_SPOOL_ENTRY_BYTES = 4 * 1024 * 1024
 LEGACY_SECURITY_CONFIG_KEYS: tuple[str, ...] = (
     "restricted_bq_datasets",
     "allowed_bq_views_dataset",
@@ -166,7 +167,7 @@ def default_runtime_config() -> dict[str, Any]:
             "atlassian_twg": "off",
             "cursor_spool_mcp": "off",
         },
-        "spool": {"isolation": "workspace"},
+        "spool": {"isolation": "workspace", "max_spool_entry_bytes": DEFAULT_MAX_SPOOL_ENTRY_BYTES},
         "regret_window_steps": 2,
         "policy_packs": [],
         "model_labels": {},
@@ -252,6 +253,10 @@ def load_runtime_config(config_path: Path | None = None) -> dict[str, Any]:
         if not isinstance((raw_sp := raw["spool"]), dict) or not isinstance((sval := raw_sp.get("isolation", "workspace")), str) or sval not in SPOOL_ISOLATION_MODES:
             return {**defaults, "config_path": str(eff_path), "config_error": "invalid 'spool'"}
         spool_out["isolation"] = sval
+        if "max_spool_entry_bytes" in raw_sp:
+            if isinstance((mval := raw_sp["max_spool_entry_bytes"]), bool) or not isinstance(mval, int) or mval < 1:
+                return {**defaults, "config_path": str(eff_path), "config_error": "invalid 'spool'"}
+            spool_out["max_spool_entry_bytes"] = mval
 
     return {
         "read_confirm_policy": read_policy_raw,

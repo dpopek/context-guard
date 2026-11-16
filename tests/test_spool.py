@@ -256,6 +256,8 @@ def test_slice_grep_list_and_invalid_regex_recovery(tmp_path: Path) -> None:
     assert only_a["entries"][0]["spool_id"] == sid_a
     assert sid_b != sid_a
     for entry in all_spools["entries"]:
+        assert "canon_root" not in entry
+        assert str(repo) not in json.dumps(entry)
         assert str(spool_dir) not in json.dumps(entry)
 
     health = inspect_spool_health(spool_dir, now_ts=1_700_000_125.0)
@@ -645,3 +647,90 @@ def test_cg_spool_cli_subcommands_json_and_exit_codes(tmp_path: Path, capsys: py
     )
     assert bad_sub.returncode == 1
     assert json.loads(bad_sub.stdout)["ok"] is False
+
+
+def test_spool_package_exports_and_recovery_receipt_telemetry_fields(tmp_path: Path) -> None:
+    """Verify spool.__init__ / spool.classifier re-exports, receipt metadata, and non-recycling after corrupt."""
+    import spool
+    from spool import classifier as spool_classifier
+    from spool.receipts import RECEIPTS_FILENAME
+
+    assert spool.compute_command_signature is compute_command_signature is spool_classifier.compute_command_signature
+    assert spool.is_verbose_override_command is is_verbose_override_command is spool_classifier.is_verbose_override_command
+    assert spool.classify_pre_tool_spool_followup is classify_pre_tool_spool_followup is spool_classifier.classify_pre_tool_spool_followup
+    for attr in (
+        "DEFAULT_MAX_SPOOL_ENTRY_BYTES",
+        "read_spool_config",
+        "same_workspace_dir",
+        "derive_spool_event_id",
+        "summarize_spool_lifecycle",
+    ):
+        assert hasattr(spool, attr)
+
+    repo = _repo(tmp_path, "proj_exp")
+    spool_dir = tmp_path / "spool"
+    payload = make_lines_text(220, prefix="exp")
+    res = spool_tool_output(
+        payload,
+        session_id="s-exp",
+        call_id="c-exp-1",
+        harness="claude",
+        tool_name="Bash",
+        workspace_root=repo,
+        spool_dir=spool_dir,
+        turn_key="s-exp:step:2",
+        turn_correlation="harness_native",
+        hook_duration_ms=1.25,
+        event_id="ev_fixed_create_1",
+        now_ts=1_000.0,
+    )
+    assert res is not None
+    contract, summary = res
+    sid = contract.spool_id
+
+    sl = slice_spool(
+        sid,
+        start_line=1,
+        limit=5,
+        workspace_root=repo,
+        spool_dir=spool_dir,
+        turn_key="s-exp:step:3",
+        turn_correlation="harness_native",
+        call_id="c-slice-1",
+        now_ts=1_010.0,
+    )
+    assert sl["ok"] is True
+
+    rows = [json.loads(ln) for ln in (spool_dir / RECEIPTS_FILENAME).read_text(encoding="utf-8").splitlines() if ln.strip()]
+    created, recovered = rows[0], rows[1]
+    assert created["event_id"] == "ev_fixed_create_1"
+    assert created["source_hash"] == contract.content_sha256
+    assert created["original_bytes"] == contract.total_bytes
+    assert created["replacement_bytes"] == len(summary.encode("utf-8"))
+    assert created["turn_correlation"] == "harness_native"
+    assert created["hook_duration_ms"] == 1.25
+    assert recovered["turn_key"] == "s-exp:step:3"
+    assert recovered["turn_correlation"] == "harness_native"
+    assert recovered["call_id"] == "c-slice-1"
+    assert recovered["tool_call_id"] == "c-slice-1"
+    assert recovered["source_hash"] == contract.content_sha256
+
+    # Marking existing blob corrupt forces a new generation spool_id on identical re-spool (INV-4).
+    (spool_dir / f"{sid}.txt").unlink()
+    assert slice_spool(sid, workspace_root=repo, spool_dir=spool_dir)["error"] == "unexpectedly_missing"
+    res2 = spool_tool_output(
+        payload,
+        session_id="s-exp",
+        call_id="c-exp-2",
+        harness="claude",
+        tool_name="Bash",
+        workspace_root=repo,
+        spool_dir=spool_dir,
+        now_ts=1_020.0,
+    )
+    assert res2 is not None and res2[0].spool_id != sid
+    assert slice_spool(sid, workspace_root=repo, spool_dir=spool_dir) == {
+        "ok": False,
+        "error": "spool_corrupt",
+        "corrupt_reason": "unexpectedly_missing",
+    }

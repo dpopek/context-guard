@@ -8,7 +8,7 @@ import json
 import os
 import re
 import shlex
-import sys
+import sys, time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -291,6 +291,7 @@ def handle_post_tool_use(
 ) -> dict[str, Any]:
     """Record shell telemetry, read confirmations (`PostToolUse`/`PostToolBatch`/`Failure`), and hooks."""
     try:
+        t0 = time.perf_counter()
         sp = stats_path or ((Path(state_dir) / "telemetry_stats.json") if state_dir else None)
         ev = str(event_name or payload.get("hook_event_name") or payload.get("event") or "PostToolUse")
         if ev in ("PostToolUse", "PostToolUseFailure") and (call := normalise_payload(harness, payload)):
@@ -303,12 +304,15 @@ def handle_post_tool_use(
         eff_spool_dir = spool_store.resolve_spool_dir(str(sdir) if state_dir is not None else None)
         ws_roots = tuple(str(r) for r in raw_wr) if isinstance((raw_wr := payload.get("workspace_roots")), (list, tuple)) else None
         if ev == "PostToolUse" and out_mode in ("active", "shadow"):
-            rs = payload.get("stepIdx")
-            snap_s = 0 if (isinstance(rs, int) and not isinstance(rs, bool) and rs > 0) else state_store.read_state_snapshot(sdir).get("auto_step_seq")
-            cur_step = rs if (isinstance(rs, int) and not isinstance(rs, bool) and rs > 0) else max(1, snap_s if isinstance(snap_s, int) and not isinstance(snap_s, bool) else 1)
+            nat = isinstance((rs := payload.get("stepIdx")), int) and not isinstance(rs, bool) and rs > 0
+            tid = payload.get("turn_id") if payload.get("turn_id") is not None else payload.get("turnId")
+            snap = {} if nat else state_store.read_state_snapshot(sdir)
+            tc = "harness_native" if (nat or (isinstance(tid, str) and bool(tid.strip())) or (isinstance(tid, int) and not isinstance(tid, bool) and tid > 0)) else ("transcript_derived" if ((isinstance((lsi := snap.get("last_step_index")), int) and not isinstance(lsi, bool) and lsi >= 0) or any(isinstance(v, str) and bool(v.strip()) for v in (snap.get("transcript_path"), payload.get("transcript_path"), payload.get("transcriptPath")))) else "unobserved")
+            cur_step = rs if nat else max(1, snap_s if isinstance((snap_s := snap.get("auto_step_seq")), int) and not isinstance(snap_s, bool) else 1)
             spool_resp, spool_meta = spool_store.build_post_tool_spool_response(
                 harness, payload, mode=out_mode, session_id=sess_id, call_id=cid, workspace_root=payload.get("cwd"),
-                workspace_roots=ws_roots, turn_key=f"{sess_id}:step:{cur_step}", spool_dir=eff_spool_dir)
+                workspace_roots=ws_roots, turn_key=f"{sess_id}:step:{cur_step}", spool_dir=eff_spool_dir,
+                turn_correlation=tc, hook_duration_ms=round((time.perf_counter() - t0) * 1000.0, 3))
         else:
             spool_resp, spool_meta = {}, None
             if ev == "PostToolBatch":

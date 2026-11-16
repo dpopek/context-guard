@@ -20,7 +20,7 @@ from spool.store import gc_spools, grep_spool, list_spools, slice_spool  # noqa:
 
 
 def _add_scope_args(subparser: argparse.ArgumentParser, *, with_session: bool = True) -> None:
-    subparser.add_argument("--workspace", default=None)
+    subparser.add_argument("--workspace", "--workspace-root", dest="workspace", default=None)
     if with_session:
         subparser.add_argument("--session", default=None)
 

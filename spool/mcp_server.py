@@ -283,7 +283,7 @@ def _write_json_atomic(path: Path, data: Mapping[str, Any]) -> None:
         raise
 
 def is_cursor_spool_mcp_configured(mcp_path: Path) -> bool:
-    """Return True when Cursor `mcp.json` configures `context-guard-spool` with `--workspace`."""
+    """Return True when Cursor `mcp.json` configures `context-guard-spool` with `--workspace` or `--workspace-root`."""
     target = Path(mcp_path).expanduser()
     if check_unsafe_link(target) or not target.is_file():
         return False
@@ -295,10 +295,15 @@ def is_cursor_spool_mcp_configured(mcp_path: Path) -> bool:
         return False
     if not isinstance((ent := srvs.get(_SERVER_NAME)), Mapping) or not isinstance((args := ent.get("args")), list):
         return False
-    if "mcp" not in args or "--workspace" not in args:
+    if "mcp" not in args:
         return False
-    idx = args.index("--workspace")
-    return idx + 1 < len(args) and isinstance(args[idx + 1], str) and bool(args[idx + 1].strip())
+    found_flag = False
+    ws_val: Any = None
+    for idx, arg in enumerate(args):
+        if arg in ("--workspace", "--workspace-root"):
+            found_flag = True
+            ws_val = args[idx + 1] if idx + 1 < len(args) else None
+    return found_flag and isinstance(ws_val, str) and bool(ws_val.strip())
 
 def sync_cursor_spool_mcp(
     mcp_path: Path, plugin_root: Path, *, enabled: bool,

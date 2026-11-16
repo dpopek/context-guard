@@ -1,8 +1,8 @@
-# Context-Guard (v4.5.2)
+# Context-Guard (v4.5.3)
 
 Zero-prompt policy host, Read Ledger v2 (`range_trim`), reversible output spooling, artifact unwrapper, and telemetry plugin for **Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex** (`macOS`, `Linux`, `Windows`).
 
-Pure Python 3.9+ stdlib hooks: `cg-outline <path>` (21 extensions, optional `tree-sitter-language-pack`), Read Ledger v2 trimming, `cg-spool` recovery, Policy API v1 packs, Outcomes v4, and `--replay` / `--benchmark`.
+Pure Python 3.9+ stdlib hooks: `cg-outline <path>` (21 extensions, optional `tree-sitter-language-pack`), Read Ledger v2, `cg-spool` recovery, Policy API v1 packs, Outcomes v4, and `--replay` / `--benchmark`.
 
 ---
 
@@ -19,13 +19,13 @@ Pure Python 3.9+ stdlib hooks: `cg-outline <path>` (21 extensions, optional `tre
 
 ## Machine-Artifact `AUTO-OUTLINE` & Unwrap (`PreToolUse`)
 
-Source code and Markdown reads never block; `cg-outline <path>` handles on-demand structural outlining across 21 extensions. `AUTO-OUTLINE` intercepts bloated machine artifacts and transcripts:
+Code/Markdown reads never block; `cg-outline <path>` outlines 21 extensions on demand, while `AUTO-OUTLINE` intercepts bloated artifacts and transcripts:
 
 | Target Type | Trigger Threshold | Action & Output |
 | :--- | :--- | :--- |
-| **Wrapped JSON-String MCP Envelope** (`.system_generated/steps/<N>/output.txt`) | `>= 16 KB` 1-line JSON with `"content"` | Unwraps `"content"` to sibling `<safe_name>` (`output_formatted.json` for tabular JSON); redirects follow-ups automatically. |
+| **Wrapped JSON-String MCP Envelope** (`.system_generated/steps/<N>/output.txt`) | `>= 16 KB` 1-line JSON with `"content"` | Unwraps `"content"` to sibling `<safe_name>` (`output_formatted.json` for tabular JSON); redirects follow-ups. |
 | **Tabular Rows MCP** (`rows[]` JSON) | `>= 16 KB` JSON with `rows[]` | Unwraps to `output_formatted.json`; returns row count, schema, and 3-row preview. |
-| **Generic JSON List/Items MCP** | `>= 16 KB` JSON array or `items`/`results`/`values` | Unwraps to `output_formatted.json`; returns item count, keys, and sample preview. |
+| **Generic JSON List/Items MCP** | `>= 16 KB` JSON array or `items`/`results`/`values` | Unwraps to `output_formatted.json`; returns item count, keys, and preview. |
 | **Opt-In Integrations** (`integrations/atlassian_twg.py`) | `>= 6 KB` (`6,144` B; inline `< 6 KB`) when `"atlassian_twg": "active"` | Summarizes structured issue/doc JSON stdout and extracts plain-text content to sibling files. |
 | **Conversation Transcripts** (`.system_generated/logs/transcript*.jsonl`) | `>= 16 KB` unbounded or span `> 8` lines | Streams step index (`step_index`, `type`, `tools=[...]`, byte sizes) with span markers. |
 
@@ -47,7 +47,7 @@ Source code and Markdown reads never block; `cg-outline <path>` handles on-deman
 
 Trims noisy test/grep boilerplate without overriding explicit user flags (`-v`/`--verbose`/`--tb=long`/`--tb=full`/`--no-quiet`):
 
-| CLI Command | Injected Flags (Antigravity `run_command`; auto-approved Claude/Cursor `Bash`/`Shell`: `bypassPermissions`/`dontAsk`/`auto`) | Guardrails |
+| CLI Command | Injected Flags (Antigravity `run_command`; auto-approved Claude/Cursor `Bash`/`Shell`) | Guardrails |
 | :--- | :--- | :--- |
 | `grep -r` / `grep -rn` | `-I --exclude-dir={...}` + minified/lock exclusions | Skipped if explicit `--include`/`--exclude` or lock/minified target is passed. |
 | `pytest`, `poetry`/`uv run pytest` | `-q --tb=short --no-header` (supports `cd <dir> &&`) | Skipped if `-v`, `-q`, `--tb`, `--no-header`, `--`, or pipes are present. |
@@ -60,11 +60,11 @@ Trims noisy test/grep boilerplate without overriding explicit user flags (`-v`/`
 - Scans `transcript*.jsonl` (`O(delta)`), emitting `AUTO-COMPACT SENSOR` (`>= 80` steps or `512 KB`) and `AUTO-COMPACT HARD STOP` (`>= 200` steps or `1024 KB`).
 - Splits `claude (cli)`/`(desktop)` (`mcp:ccd_*`) and `codex (cli)`/`(desktop)`, scores `Recent (10)` preamble hygiene, and computes 30-day `sunset_verdict` in `--usage`.
 
-### 5. Reversible Output Spooling & Multi-Step Regret (`spool/store.py`, `spool/receipts.py`, `spool/mcp_server.py`)
-- **Opt-In Spooling:** `"output_spool": "active"` swaps huge Claude/Cursor outputs (`>= 12,288` B or `200` lines, saving `>= 2,048` B) for `<= 3,072` B summaries; `"shadow"` logs `shadow_spools` without blobs.
-- **Verified Storage & Receipts:** Holds `sp_<12hex>.txt` (`24h` TTL, `64` entries, `32 MB`) with locked SHA-256 reads, two-phase GC tombstones, and `receipts.jsonl` (`replacement_emitted` vs `delivery_verified`).
-- **Scoped Recovery (Logical Boundary):** `cg-spool` (`--workspace`, `--session`) and MCP (`roots/list` + `--workspace`) enforce a logical workspace boundary under one OS user (not an OS sandbox).
-- **Multi-Step Regret (`hooks/outcomes.py`):** Tracks `output_spool`, `cli_rewrite`, and `range_trim` follow-ups (`suspected` heuristic regret; reconciled on edits).
+### 5. Reversible Output Spooling & Multi-Step Regret (`spool/store.py`, `spool/classifier.py`, `spool/receipts.py`, `spool/mcp_server.py`)
+- **Opt-In Spooling:** `"output_spool": "active"` enforces UTF-8 and `max_spool_entry_bytes` (`4 MiB`), swapping outputs (`>= 12,288` B / `200` lines) for `<= 3,072` B summaries; `"shadow"` logs `shadow_spools`.
+- **Non-Blocking Recovery & GC:** Holds `sp_<12hex>.txt` (`24h` TTL, `64` entries, `32 MB`) across `available`/`evicting`/`evicted`/`corrupt` states; verifies SHA-256 and unlinks outside `_spool_lock`.
+- **Scoped Recovery (Logical Boundary):** `cg-spool` (`--workspace`/`--workspace-root`, `--session`) and MCP (`roots/list` + `--workspace-root`) enforce `os.path.samefile()` workspace boundaries under one OS user.
+- **Receipts & Regret (`hooks/outcomes.py`):** Emits `ContextReceiptV1` (`turn_correlation`, `recovery_amplification`, `delivery_verified`) and tracks `suspected` follow-up regret reconciled on edits.
 
 ---
 
@@ -79,8 +79,9 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 | `policies/api.py` | Policy API | `POLICY_API_VERSION = 1` contracts (`PolicyPackManifest`, `PolicyContext`, `PolicyDecision`, `InstallerHookSpec`, `SpoolContractV1`, `ContextReceiptV1`). |
 | `policies/loader.py` | Policy API | Verified pack directory, `file_hashes`, and `tree_sha256` in-memory byte loader. |
 | `integrations/atlassian_twg.py` | Integration | Opt-in CLI rewriter and JSON stdout summarizer (`"atlassian_twg": "active"`). |
-| `spool/receipts.py` | Output Spool | Workspace root canonicalization, `check_unsafe_link`, isolation config, and bounded `receipts.jsonl` ledger. |
-| `spool/store.py` | Output Spool | Content-addressed spool storage, head/tail summaries, `slice`/`grep`/`list`/`gc`, and pre-tool follow-up classifier. |
+| `spool/receipts.py` | Output Spool | Workspace `samefile` identity, config/link checks, `receipts.jsonl`, and `summarize_spool_lifecycle`. |
+| `spool/store.py` | Output Spool | Write-once blobs, UTF-8/`max_spool_entry_bytes` guard, and non-blocking `slice`/`grep`/`list`/`gc`. |
+| `spool/classifier.py` | Output Spool | Stateless command signatures, verbose overrides, and pre-tool spool follow-up classifier. |
 | `spool/mcp_server.py` | Output Spool | Dual-framed (`Content-Length` + NDJSON) stdio MCP server (`cg_spool_*`) and atomic `.cursor/mcp.json` sync. |
 | `hooks/policy_engine.py` | Hook Core | Evaluates verified packs, Pass-2 fallbacks, and lifecycle dispatch. |
 | `hooks/pre_tool_use.py` | Hook Entry | Runs Policy API v1 passes, silent `range_trim`, CLI rewrites, regret tracking, and telemetry. |
@@ -131,11 +132,11 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 Context-Guard runs from wherever you clone it (`~/.gemini` is needed only if you use Antigravity).
 
 ```bash
-# 1. Clone anywhere (or unpack dist/context-guard-v4.5.2.zip there)
+# 1. Clone anywhere (or unpack dist/context-guard-v4.5.3.zip there)
 CG_DIR=~/tools/context-guard
 git clone https://github.com/dpopek/context-guard.git "$CG_DIR"
 
-# 2. Install hooks (Claude Code, Codex, Cursor, Antigravity) & advox.context-guard-statusbar-4.5.2 extension
+# 2. Install hooks (Claude Code, Codex, Cursor, Antigravity) & advox.context-guard-statusbar-4.5.3 extension
 python3 "$CG_DIR/bin/install_harnesses.py" --install
 
 # Check status, preview dry-run, stage verified policy packs, or uninstall cleanly
@@ -169,9 +170,9 @@ python3 "$CG_DIR/bin/cg_status.py" --json \
   --usage-path /tmp/token_usage.json --update-path /tmp/update.json
 cg-outline path/to/file.py  # or python3 "$CG_DIR/bin/outline.py"
 cg-spool list --workspace . --json                 # or python3 "$CG_DIR/bin/cg_spool.py" list --json
-cg-spool slice <spool_id> --start 1 --limit 120     # bounded recovery slice (--workspace / --session)
-cg-spool grep <spool_id> --pattern '<regex>'        # regex search with context (--workspace / --session)
-cg-spool gc --json                                  # evict expired/LRU spools (two-phase tombstones)
+cg-spool slice <spool_id> --start 1 --limit 120     # bounded recovery slice (--workspace/--workspace-root, --session)
+cg-spool grep <spool_id> --pattern '<regex>'        # regex search with context (--workspace/--workspace-root, --session)
+cg-spool gc --json                                  # evict expired/LRU spools (evicting -> evicted)
 ```
 
 ---
@@ -185,7 +186,7 @@ Optional per-user config (override via `CONTEXT_GUARD_CONFIG_PATH`). Absent = un
 | `"read_confirm_policy"` | `"strict"` | Read confirmation mode (`"strict"` or `"bounded"`). |
 | `"optimizers"` | `{"range_trim": "active", "auto_outline": "active", "cli_rewrites": "auto", "output_spool": "off"}` | Optimizer modes (`active`/`shadow`/`off`; `cli_rewrites`: `auto`/`force`/`shadow`/`off`). |
 | `"integrations"` | `{"atlassian_twg": "off", "cursor_spool_mcp": "off"}` | Opt-in external/MCP adapters (`"atlassian_twg"`, `"cursor_spool_mcp"`: `"active"` or `"off"`). |
-| `"spool"` | `{"isolation": "workspace"}` | Optional spool isolation mode (`"workspace"`, `"session"`, or `"global"`). |
+| `"spool"` | `{"isolation": "workspace", "max_spool_entry_bytes": 4194304}` | Spool isolation (`"workspace"`, `"session"`, or `"global"`) and pre-write byte cap. |
 | `"regret_window_steps"` | `2` | Positive integer tracking follow-up regret attribution horizon across steps. |
 | `"policy_packs"` | `[]` | Verified Policy API v1 packs pinned by `file_hashes` + `tree_sha256` and declared `scopes`. |
 | `"model_labels"` | `{}` | Harness-to-model label overrides (`antigravity`, `claude`, `cursor`, `codex`) for `outcomes.json`. |

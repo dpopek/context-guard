@@ -10,44 +10,65 @@ import stat
 import pytest
 
 import policies.api as api
-from policies.api import ContextReceiptV1, RECEIPT_SCHEMA_VERSION
+from policies.api import ContextReceiptV1, RECEIPT_SCHEMA_VERSION, VALID_TURN_CORRELATIONS
 from spool.receipts import (
+    DEFAULT_MAX_SPOOL_ENTRY_BYTES,
     RECEIPTS_KEEP_ROWS,
     RECEIPTS_MAX_BYTES,
     append_receipt,
     build_receipt,
+    derive_spool_event_id,
     find_created_receipt,
     persist_spool_delivery_verification,
+    read_spool_config,
+    read_spool_isolation_config,
+    resolve_workspace_identity,
+    same_workspace_dir,
     summarize_receipts,
+    summarize_spool_lifecycle,
 )
 
 
 def test_context_receipt_v1_schema_contract() -> None:
-    """Verify ContextReceiptV1 exports, required keys, and PEP 563 string annotations."""
+    """Verify ContextReceiptV1 exports, all 29 required keys, VALID_TURN_CORRELATIONS, and build defaults."""
     assert RECEIPT_SCHEMA_VERSION == 1
+    assert VALID_TURN_CORRELATIONS == ("harness_native", "transcript_derived", "unobserved")
     assert "RECEIPT_SCHEMA_VERSION" in api.__all__
     assert "ContextReceiptV1" in api.__all__
+    assert "VALID_TURN_CORRELATIONS" in api.__all__
 
     expected_annotations = {
         "schema_version": "int",
         "receipt_id": "str",
+        "event_id": "str",
         "parent_event_id": "str | None",
         "timestamp": "str",
+        "ts_ms": "int",
+        "hook_duration_ms": "float | None",
         "event_type": "str",
         "harness": "str",
         "session_id": "str",
         "workspace_id": "str",
         "turn_key": "str",
+        "turn_correlation": "str",
         "call_id": "str",
+        "tool_call_id": "str",
         "spool_id": "str",
+        "intervention": "str",
+        "mode": "str",
+        "status": "str",
         "line_span": "tuple[int, int]",
         "byte_span": "tuple[int, int]",
+        "source_hash": "str",
+        "original_bytes": "int",
+        "replacement_bytes": "int",
         "upstream_truncation": "bool",
         "delivery_evidence": "str",
         "spool_id_referenced": "bool",
         "failure_kind": "str | None",
         "reason": "str | None",
     }
+    assert len(expected_annotations) == 29
     ann = ContextReceiptV1.__annotations__
     assert set(ann.keys()) == set(expected_annotations.keys())
     assert ContextReceiptV1.__required_keys__ == frozenset(expected_annotations.keys())
@@ -55,6 +76,30 @@ def test_context_receipt_v1_schema_contract() -> None:
         raw_val = ann[key]
         actual = raw_val if isinstance(raw_val, str) else getattr(raw_val, "__forward_arg__", repr(raw_val))
         assert actual == expected
+
+    ev1 = derive_spool_event_id("spool_created", "s1", "c1", "sp_000000000001")
+    ev2 = derive_spool_event_id("spool_created", "s1", "c1", "sp_000000000001")
+    ev_rand_1 = derive_spool_event_id("spool_recovery", "s1", "", "sp_000000000001")
+    ev_rand_2 = derive_spool_event_id("spool_recovery", "s1", "", "sp_000000000001")
+    assert ev1 == ev2 and ev1.startswith("ev_") and len(ev1) == 19
+    assert ev_rand_1 != ev_rand_2 and ev_rand_1.startswith("ev_") and len(ev_rand_1) == 19
+
+    built = build_receipt(
+        event_type="spool_created", harness="claude", session_id="s1", workspace_id="ws_1",
+        turn_key="s1:step:1", call_id="c1", spool_id="sp_000000000001", line_span=(0, 10), byte_span=(0, 100),
+        delivery_evidence="replacement_emitted", spool_id_referenced=False,
+        timestamp="2026-11-16T00:00:00Z", turn_correlation="unknown_val",
+    )
+    assert built["event_id"] == ev1 and built["tool_call_id"] == "c1"
+    assert built["mode"] == "active" and built["status"] == "ok" and built["turn_correlation"] == "unobserved"
+    assert built["intervention"] == "output_spool" and built["ts_ms"] > 0
+
+    fail_r = build_receipt(
+        event_type="spool_integrity_failure", harness="mcp", session_id="s1", workspace_id="ws_1",
+        turn_key="", call_id="", spool_id="sp_000000000001", line_span=(0, 0), byte_span=(0, 50),
+        delivery_evidence="unverified", spool_id_referenced=True, failure_kind="reliability_failure",
+    )
+    assert fail_r["mode"] == "recovery" and fail_r["status"] == "error"
 
 
 def test_receipts_rotate_at_limit_and_public_json_scrubs_receipt_paths_and_workspace_ids(tmp_path: Path) -> None:
@@ -430,3 +475,254 @@ def test_regret_downgrade_never_emits_heuristic_confirmed_regret(
     st = telemetry.load_telemetry_stats(stats_path)
     assert st["events"]["reliability_failures"] == 1 and all(v["hits"] == 0 for v in st["by_harness"].values())
     assert outcomes.SCHEMA_VERSION == 4
+
+
+def test_append_receipt_event_id_idempotency_and_legacy_18_key_rows(tmp_path: Path) -> None:
+    """Verify event_id idempotent append deduplication and full backward compatibility for 18-key JSONL rows."""
+    rcpt_path = tmp_path / "spool" / "receipts.jsonl"
+    r1 = build_receipt(
+        event_type="spool_created", harness="claude", session_id="s-idem", workspace_id="ws_1",
+        turn_key="s-idem:step:1", call_id="c-idem", spool_id="sp_111111111111",
+        line_span=(0, 100), byte_span=(0, 8000), delivery_evidence="replacement_emitted",
+        spool_id_referenced=False, original_bytes=8000, replacement_bytes=240,
+    )
+    r2 = build_receipt(
+        event_type="spool_created", harness="claude", session_id="s-idem", workspace_id="ws_1",
+        turn_key="s-idem:step:1", call_id="c-idem", spool_id="sp_111111111111",
+        line_span=(0, 100), byte_span=(0, 8000), delivery_evidence="replacement_emitted",
+        spool_id_referenced=False, original_bytes=8000, replacement_bytes=240,
+    )
+    assert r1["event_id"] == r2["event_id"]
+    assert append_receipt(r1, receipts_path=rcpt_path) is True
+    assert append_receipt(r2, receipts_path=rcpt_path) is True
+    assert len(rcpt_path.read_text(encoding="utf-8").splitlines()) == 1
+
+    no_id_1 = build_receipt(
+        event_type="spool_recovery", harness="mcp", session_id="s-idem", workspace_id="ws_1",
+        turn_key="", call_id="", spool_id="sp_111111111111", line_span=(0, 5), byte_span=(0, 50),
+        delivery_evidence="unverified", spool_id_referenced=True, event_id="",
+    )
+    no_id_2 = dict(no_id_1, receipt_id="rcpt_other")
+    assert append_receipt(no_id_1, receipts_path=rcpt_path) is True
+    assert append_receipt(no_id_2, receipts_path=rcpt_path) is True
+    assert len(rcpt_path.read_text(encoding="utf-8").splitlines()) == 3
+
+    legacy_path = tmp_path / "legacy_receipts.jsonl"
+    legacy_created = {
+        "schema_version": 1, "receipt_id": "rcpt_leg_created", "parent_event_id": None,
+        "timestamp": "2026-11-16T01:00:00Z", "event_type": "spool_created", "harness": "claude",
+        "session_id": "s-leg", "workspace_id": "ws_leg", "turn_key": "s-leg:step:1",
+        "call_id": "c-leg", "spool_id": "sp_222222222222", "line_span": [0, 200], "byte_span": [0, 14000],
+        "upstream_truncation": False, "delivery_evidence": "replacement_emitted",
+        "spool_id_referenced": False, "failure_kind": None, "reason": None,
+    }
+    legacy_rec = {
+        "schema_version": 1, "receipt_id": "rcpt_leg_rec", "parent_event_id": "rcpt_leg_created",
+        "timestamp": "2026-11-16T01:00:05Z", "event_type": "spool_recovery", "harness": "mcp",
+        "session_id": "s-leg", "workspace_id": "ws_leg", "turn_key": "s-leg:step:2",
+        "call_id": "", "spool_id": "sp_222222222222", "line_span": [10, 20], "byte_span": [100, 600],
+        "upstream_truncation": False, "delivery_evidence": "unverified",
+        "spool_id_referenced": True, "failure_kind": None, "reason": None,
+    }
+    legacy_path.write_text(json.dumps(legacy_created) + "\n" + json.dumps(legacy_rec) + "\n", encoding="utf-8")
+    loaded = find_created_receipt("sp_222222222222", receipts_path=legacy_path)
+    assert loaded is not None
+    assert loaded["event_id"] == "rcpt_leg_created" and loaded["tool_call_id"] == "c-leg"
+    assert loaded["turn_correlation"] == "unobserved" and loaded["mode"] == "active" and loaded["status"] == "ok"
+    assert loaded["ts_ms"] > 0 and loaded["original_bytes"] == 0 and loaded["replacement_bytes"] == 0
+
+    leg_sum = summarize_receipts(legacy_path)
+    assert leg_sum["created_count"] == 1 and leg_sum["recovery_count"] == 1
+    leg_life = summarize_spool_lifecycle(legacy_path)
+    assert leg_life["completeness"] == "complete"
+    assert leg_life["original_bytes"] == 14000 and leg_life["replacement_bytes"] is None
+    assert leg_life["turn_correlation_status"] == "unobserved" and leg_life["recovery_model_turns"] is None
+    assert leg_life["unique_recovered_bytes"] == 500 and leg_life["total_recovered_bytes"] == 500
+    assert leg_life["recovery_amplification"] == 1.0 and leg_life["delivery_evidence"] == "replacement_emitted"
+
+
+def test_summarize_spool_lifecycle_intervals_turn_correlation_and_completeness(tmp_path: Path) -> None:
+    """Verify interval-union amplification, turn_correlation rules, dedup, and incomplete rotated logs."""
+    rcpt_path = tmp_path / "life.jsonl"
+    sid_a, sid_b, sid_c = "sp_aaaaaaaaaaaa", "sp_bbbbbbbbbbbb", "sp_cccccccccccc"
+    rows = [
+        build_receipt(
+            event_type="spool_created", harness="claude", session_id="s1", workspace_id="ws_1",
+            turn_key="t0", call_id="c0", spool_id=sid_a, line_span=(0, 100), byte_span=(0, 10000),
+            delivery_evidence="replacement_emitted", spool_id_referenced=False,
+            original_bytes=10000, replacement_bytes=320, timestamp="2026-11-16T02:00:00Z",
+        ),
+        build_receipt(
+            event_type="spool_delivery_verified", harness="claude", session_id="s1", workspace_id="ws_1",
+            turn_key="t0", call_id="c0", spool_id=sid_a, line_span=(0, 100), byte_span=(0, 10000),
+            delivery_evidence="delivery_verified", spool_id_referenced=False, timestamp="2026-11-16T02:00:01Z",
+        ),
+        build_receipt(
+            event_type="spool_recovery", harness="mcp", session_id="s1", workspace_id="ws_1",
+            turn_key="turn-1", call_id="", spool_id=sid_a, line_span=(0, 10), byte_span=(0, 100),
+            delivery_evidence="unverified", spool_id_referenced=True, turn_correlation="harness_native",
+            event_id="ev_rec_dup", timestamp="2026-11-16T02:00:02Z",
+        ),
+        build_receipt(
+            event_type="spool_recovery", harness="mcp", session_id="s1", workspace_id="ws_1",
+            turn_key="turn-1", call_id="", spool_id=sid_a, line_span=(0, 10), byte_span=(0, 100),
+            delivery_evidence="unverified", spool_id_referenced=True, turn_correlation="harness_native",
+            event_id="ev_rec_dup", timestamp="2026-11-16T02:00:02Z",
+        ),
+        build_receipt(
+            event_type="spool_recovery", harness="mcp", session_id="s1", workspace_id="ws_1",
+            turn_key="turn-1", call_id="", spool_id=sid_a, line_span=(5, 15), byte_span=(50, 150),
+            delivery_evidence="unverified", spool_id_referenced=True, turn_correlation="transcript_derived",
+            timestamp="2026-11-16T02:00:03Z",
+        ),
+        build_receipt(
+            event_type="spool_recovery", harness="mcp", session_id="s1", workspace_id="ws_1",
+            turn_key="turn-2", call_id="", spool_id=sid_a, line_span=(20, 30), byte_span=(200, 300),
+            delivery_evidence="unverified", spool_id_referenced=True, turn_correlation="harness_native",
+            timestamp="2026-11-16T02:00:04Z",
+        ),
+        build_receipt(
+            event_type="spool_created", harness="claude", session_id="s1", workspace_id="ws_1",
+            turn_key="t3", call_id="c3", spool_id=sid_b, line_span=(0, 50), byte_span=(0, 5000),
+            delivery_evidence="replacement_emitted", spool_id_referenced=False,
+            original_bytes=5000, replacement_bytes=200, timestamp="2026-11-16T02:00:05Z",
+        ),
+        build_receipt(
+            event_type="spool_created", harness="claude", session_id="s1", workspace_id="ws_1",
+            turn_key="t4", call_id="c4", spool_id=sid_c, line_span=(0, 50), byte_span=(0, 4000),
+            delivery_evidence="replacement_emitted", spool_id_referenced=False, timestamp="2026-11-16T02:00:06Z",
+        ),
+        build_receipt(
+            event_type="spool_recovery", harness="mcp", session_id="s1", workspace_id="ws_1",
+            turn_key="t4", call_id="", spool_id=sid_c, line_span=(0, 5), byte_span=(0, 50),
+            delivery_evidence="unverified", spool_id_referenced=True, turn_correlation="harness_native",
+            timestamp="2026-11-16T02:00:07Z",
+        ),
+        build_receipt(
+            event_type="spool_recovery", harness="mcp", session_id="s1", workspace_id="ws_1",
+            turn_key="t5", call_id="", spool_id=sid_c, line_span=(0, 5), byte_span=(0, 50),
+            delivery_evidence="unverified", spool_id_referenced=True, turn_correlation="unobserved",
+            timestamp="2026-11-16T02:00:08Z",
+        ),
+    ]
+    rcpt_path.write_text("".join(json.dumps(dict(r)) + "\n" for r in rows), encoding="utf-8")
+
+    only_a = summarize_spool_lifecycle(rcpt_path, spool_id=sid_a)
+    assert only_a["completeness"] == "complete" and only_a["recovery_calls"] == 3
+    assert only_a["recovery_model_turns"] == 2 and only_a["turn_correlation_status"] == "observed"
+    assert only_a["unique_recovered_bytes"] == 250 and only_a["total_recovered_bytes"] == 300
+    assert only_a["recovery_amplification"] == 1.2
+    assert only_a["original_bytes"] == 10000 and only_a["replacement_bytes"] == 320
+    assert only_a["delivery_evidence"] == "delivery_verified"
+
+    only_b = summarize_spool_lifecycle(rcpt_path, spool_id=sid_b)
+    assert only_b["completeness"] == "complete" and only_b["recovery_calls"] == 0
+    assert only_b["recovery_model_turns"] == 0 and only_b["turn_correlation_status"] == "observed"
+    assert only_b["recovery_amplification"] == 0.0
+
+    only_c = summarize_spool_lifecycle(rcpt_path, spool_id=sid_c)
+    assert only_c["turn_correlation_status"] == "partial" and only_c["recovery_model_turns"] is None
+
+    agg = summarize_spool_lifecycle(rcpt_path)
+    assert agg["completeness"] == "complete" and agg["turn_correlation_status"] == "partial"
+    assert agg["recovery_model_turns"] is None and agg["original_bytes"] == 19000 and agg["replacement_bytes"] == 520
+
+    from datetime import datetime, timezone
+    win_now = datetime(2026, 11, 16, 2, 0, 8, tzinfo=timezone.utc).timestamp()
+    win_only = summarize_spool_lifecycle(rcpt_path, window_seconds=2.0, now_ts=win_now)
+    assert win_only["completeness"] == "complete" and win_only["recovery_calls"] == 2
+    assert set(win_only["by_spool"].keys()) == {sid_c}
+
+    empty_tk_path = tmp_path / "empty_tk.jsonl"
+    empty_tk_path.write_text(json.dumps(dict(build_receipt(
+        event_type="spool_recovery", harness="mcp", session_id="s2", workspace_id="ws_2",
+        turn_key="", call_id="", spool_id="sp_ffffffffffff", line_span=(0, 1), byte_span=(0, 20),
+        delivery_evidence="unverified", spool_id_referenced=True, turn_correlation="harness_native",
+    ))) + "\n", encoding="utf-8")
+    etk = summarize_spool_lifecycle(empty_tk_path)
+    assert etk["turn_correlation_status"] == "unobserved" and etk["recovery_model_turns"] is None
+
+    # Rotated log missing spool_created -> incomplete (original_bytes and missing-base counts are None, never 0)
+    rot_path = tmp_path / "rotated.jsonl"
+    rot_rows = [
+        build_receipt(
+            event_type="spool_recovery", harness="mcp", session_id="s2", workspace_id="ws_2",
+            turn_key="turn-r", call_id="", spool_id="sp_dddddddddddd", line_span=(0, 4), byte_span=(0, 80),
+            delivery_evidence="unverified", spool_id_referenced=True, turn_correlation="unobserved",
+        ),
+        build_receipt(
+            event_type="spool_integrity_failure", harness="mcp", session_id="s2", workspace_id="ws_2",
+            turn_key="", call_id="", spool_id="sp_eeeeeeeeeeee", line_span=(0, 0), byte_span=(0, 10),
+            delivery_evidence="unverified", spool_id_referenced=True, failure_kind="reliability_failure",
+            reason="integrity_mismatch",
+        ),
+    ]
+    rot_path.write_text("".join(json.dumps(dict(r)) + "\n" for r in rot_rows), encoding="utf-8")
+    rot_sum = summarize_spool_lifecycle(rot_path)
+    assert rot_sum["completeness"] == "incomplete" and rot_sum["original_bytes"] is None
+    assert rot_sum["replacement_bytes"] is None and rot_sum["reliability_failures"] == 1
+    assert rot_sum["by_spool"]["sp_eeeeeeeeeeee"]["recovery_model_turns"] is None
+    assert rot_sum["by_spool"]["sp_eeeeeeeeeeee"]["recovery_amplification"] is None
+
+
+def test_same_workspace_dir_and_read_spool_config_max_entry_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify same_workspace_dir dedup, zero os.getcwd calls, and max_spool_entry_bytes config validation."""
+    from hooks import config
+
+    real_repo = tmp_path / "RepoAlpha"
+    sub_dir = real_repo / "pkg"
+    sub_dir.mkdir(parents=True)
+    (real_repo / ".git").mkdir()
+    other_repo = tmp_path / "RepoBeta"
+    (other_repo / ".git").mkdir(parents=True)
+
+    roots_to_check = [str(real_repo)]
+    if os.name != "nt":
+        sym_repo = tmp_path / "sym_repo_alpha"
+        sym_repo.symlink_to(real_repo)
+        roots_to_check.append(str(sym_repo))
+    case_variant = tmp_path / "repoalpha"
+    if case_variant.exists():
+        roots_to_check.append(str(case_variant))
+
+    def _forbid_cwd() -> str:
+        raise AssertionError("spool/receipts must never call os.getcwd")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(os, "getcwd", _forbid_cwd)
+        assert same_workspace_dir(None, real_repo) is False
+        assert same_workspace_dir("", real_repo) is False
+        assert same_workspace_dir(tmp_path / "missing_dir", real_repo) is False
+        assert same_workspace_dir(real_repo, real_repo) is True
+        if len(roots_to_check) >= 2:
+            assert same_workspace_dir(real_repo, roots_to_check[1]) is True
+            ws_id, canon, err = resolve_workspace_identity(None, workspace_roots=roots_to_check)
+            assert err is None and ws_id.startswith("ws_") and same_workspace_dir(canon, real_repo)
+            nar_id, nar_canon, nar_err = resolve_workspace_identity(
+                Path(roots_to_check[1]) / "pkg", workspace_roots=[str(real_repo), str(other_repo)],
+            )
+            assert nar_err is None and nar_id.startswith("ws_") and same_workspace_dir(nar_canon, real_repo)
+
+    assert DEFAULT_MAX_SPOOL_ENTRY_BYTES == 4 * 1024 * 1024
+    assert config.DEFAULT_MAX_SPOOL_ENTRY_BYTES == DEFAULT_MAX_SPOOL_ENTRY_BYTES
+    assert config.default_runtime_config()["spool"] == {
+        "isolation": "workspace", "max_spool_entry_bytes": DEFAULT_MAX_SPOOL_ENTRY_BYTES,
+    }
+    assert read_spool_config(tmp_path / "absent.json") == ("workspace", DEFAULT_MAX_SPOOL_ENTRY_BYTES, None)
+
+    valid_cfg = tmp_path / "valid_cfg.json"
+    valid_cfg.write_text(json.dumps({"spool": {"isolation": "session", "max_spool_entry_bytes": 1024}}), encoding="utf-8")
+    config.clear_config_cache()
+    assert read_spool_config(valid_cfg) == ("session", 1024, None)
+    assert read_spool_isolation_config(valid_cfg) == ("session", None)
+    assert config.load_runtime_config(valid_cfg)["spool"] == {"isolation": "session", "max_spool_entry_bytes": 1024}
+
+    for bad_val in (0, -1, True, False, "1024", 1.5, None):
+        bad_cfg = tmp_path / "bad_cfg.json"
+        bad_cfg.write_text(json.dumps({"spool": {"isolation": "workspace", "max_spool_entry_bytes": bad_val}}), encoding="utf-8")
+        config.clear_config_cache()
+        assert read_spool_config(bad_cfg) == ("", DEFAULT_MAX_SPOOL_ENTRY_BYTES, "invalid_spool_config")
+        assert read_spool_isolation_config(bad_cfg) == ("", "invalid_spool_config")
+        assert config.load_runtime_config(bad_cfg)["config_error"] == "invalid 'spool'"

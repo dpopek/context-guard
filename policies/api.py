@@ -10,6 +10,7 @@ POLICY_API_VERSION = 1
 ALL_SECURITY_SCOPES: tuple[str, ...] = ("file_mutation", "shell_command", "mcp_call")
 VALID_POLICY_KINDS: tuple[str, ...] = ("security", "optimization")
 VALID_POLICY_MODES: tuple[str, ...] = ("active", "shadow", "off")
+VALID_TURN_CORRELATIONS: tuple[str, ...] = ("harness_native", "transcript_derived", "unobserved")
 
 
 @dataclass(frozen=True)
@@ -139,17 +140,28 @@ class ContextReceiptV1(TypedDict):
 
     schema_version: int
     receipt_id: str
+    event_id: str
     parent_event_id: str | None
     timestamp: str
+    ts_ms: int
+    hook_duration_ms: float | None
     event_type: str
     harness: str
     session_id: str
     workspace_id: str
     turn_key: str
+    turn_correlation: str
     call_id: str
+    tool_call_id: str
     spool_id: str
+    intervention: str
+    mode: str
+    status: str
     line_span: tuple[int, int]
     byte_span: tuple[int, int]
+    source_hash: str
+    original_bytes: int
+    replacement_bytes: int
     upstream_truncation: bool
     delivery_evidence: str
     spool_id_referenced: bool
@@ -190,4 +202,5 @@ __all__ = [
     "SpoolContractV1",
     "VALID_POLICY_KINDS",
     "VALID_POLICY_MODES",
+    "VALID_TURN_CORRELATIONS",
 ]

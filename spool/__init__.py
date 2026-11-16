@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+from spool.classifier import (
+    classify_pre_tool_spool_followup,
+    compute_command_signature,
+    is_verbose_override_command,
+)
 from spool.mcp_server import is_cursor_spool_mcp_configured, serve_stdio, sync_cursor_spool_mcp
 from spool.receipts import (
+    DEFAULT_MAX_SPOOL_ENTRY_BYTES,
     RECEIPTS_FILENAME,
     RECEIPTS_KEEP_ROWS,
     RECEIPTS_LOCK_FILENAME,
@@ -15,21 +21,22 @@ from spool.receipts import (
     check_unsafe_link,
     compute_scope_key,
     compute_scoped_spool_id,
+    derive_spool_event_id,
     find_created_receipt,
     persist_spool_delivery_verification,
+    read_spool_config,
     read_spool_isolation_config,
     receipts_path_for,
     resolve_workspace_identity,
+    same_workspace_dir,
     summarize_receipts,
+    summarize_spool_lifecycle,
 )
 from spool.store import (
     build_post_tool_spool_response,
-    classify_pre_tool_spool_followup,
-    compute_command_signature,
     gc_spools,
     grep_spool,
     inspect_spool_health,
-    is_verbose_override_command,
     list_spools,
     resolve_spool_dir,
     slice_spool,
@@ -37,6 +44,7 @@ from spool.store import (
 )
 
 __all__ = [
+    "DEFAULT_MAX_SPOOL_ENTRY_BYTES",
     "RECEIPTS_FILENAME",
     "RECEIPTS_KEEP_ROWS",
     "RECEIPTS_LOCK_FILENAME",
@@ -51,6 +59,7 @@ __all__ = [
     "compute_command_signature",
     "compute_scope_key",
     "compute_scoped_spool_id",
+    "derive_spool_event_id",
     "find_created_receipt",
     "gc_spools",
     "grep_spool",
@@ -59,13 +68,16 @@ __all__ = [
     "is_verbose_override_command",
     "list_spools",
     "persist_spool_delivery_verification",
+    "read_spool_config",
     "read_spool_isolation_config",
     "receipts_path_for",
     "resolve_spool_dir",
     "resolve_workspace_identity",
+    "same_workspace_dir",
     "serve_stdio",
     "slice_spool",
     "spool_tool_output",
     "summarize_receipts",
+    "summarize_spool_lifecycle",
     "sync_cursor_spool_mcp",
 ]

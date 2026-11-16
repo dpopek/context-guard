@@ -5,6 +5,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 
 ## [Unreleased]
 
+## [4.5.3] - 2026-11-16
+
+### Added
+- **Spool classifier split (`spool/classifier.py`):** Extracted command signatures, verbose overrides, and follow-up classifier.
+- **Pre-write spool cap (`hooks/config.py`, `spool/store.py`):** Added `max_spool_entry_bytes` (4 MiB) and strict UTF-8 check.
+- **Symlink & alias parity (`spool/receipts.py`):** Added `same_workspace_dir` (`os.path.samefile`) and `workspace_roots` deduplication.
+- **Full `ContextReceiptV1` (`policies/api.py`, `spool/receipts.py`):** Added `event_id` dedup, `turn_correlation`, and lifecycle metrics.
+- **`--workspace-root` flag (`bin/cg_spool.py`, `spool/mcp_server.py`):** Added `--workspace-root` CLI alias and Cursor MCP config check.
+
+### Changed
+- **Non-blocking read/GC (`spool/store.py`):** Moved SHA-256 verification, strict UTF-8 decode, and `unlink` outside `_spool_lock`.
+- **Monotonic spool states (`spool/store.py`):** Enforced `preparing`/`available`/`evicting`/`evicted` and `corrupt` without ID reuse.
+- **Turn correlation hooks (`hooks/post_tool_use.py`):** Recorded `hook_duration_ms` and `turn_correlation` across `PostToolUse` spools.
+- **Architectural Freeze closeout (`README.md`, `ROADMAP.md`):** Closed `INV-1`..`INV-7` and Milestone A/B gates ahead of `v4.6.0`.
+
+### Fixed
+- **Failure classification (`spool/store.py`):** Separated `format_error`, `unexpectedly_missing`, and `spool_corrupt` from evictions.
+- **Windows GC retry (`spool/store.py`):** Retained `evicting` tombstones on `PermissionError`/`EBUSY` until retry unlinks the blob.
+
 ## [4.5.2] - 2026-11-16
 
 ### Added

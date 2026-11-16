@@ -18,6 +18,7 @@ from spool.store import (
     gc_spools,
     grep_spool,
     inspect_spool_health,
+    list_spools,
     slice_spool,
     spool_tool_output,
 )
@@ -170,14 +171,31 @@ def test_tampered_payload_and_bad_utf8_fail_with_integrity_mismatch_and_record_r
     def _make_cb(target_sid: str) -> Callable[[], None]:
         return lambda: failures.append(target_sid)
 
-    for bad_sid in (sid_same, sid_trunc, sid_utf8, sid_miss):
+    expected_errors = [
+        (sid_same, "integrity_mismatch"),
+        (sid_trunc, "integrity_mismatch"),
+        (sid_utf8, "format_error"),
+        (sid_miss, "unexpectedly_missing"),
+    ]
+    for bad_sid, exp_err in expected_errors:
         res = slice_spool(
             bad_sid,
             workspace_root=repo,
             spool_dir=spool_dir,
             on_reliability_failure=_make_cb(bad_sid),
         )
-        assert res == {"ok": False, "error": "integrity_mismatch"}
+        assert res == {"ok": False, "error": exp_err}
+        assert slice_spool(
+            bad_sid,
+            workspace_root=repo,
+            spool_dir=spool_dir,
+            on_reliability_failure=_make_cb(bad_sid),
+        ) == {"ok": False, "error": "spool_corrupt", "corrupt_reason": exp_err}
+        assert grep_spool(bad_sid, "line", workspace_root=repo, spool_dir=spool_dir) == {
+            "ok": False,
+            "error": "spool_corrupt",
+            "corrupt_reason": exp_err,
+        }
 
     assert failures == [sid_same, sid_trunc, sid_utf8, sid_miss]
     rows = [
@@ -187,15 +205,31 @@ def test_tampered_payload_and_bad_utf8_fail_with_integrity_mismatch_and_record_r
     ]
     fail_rows = [r for r in rows if r["event_type"] == "spool_integrity_failure"]
     assert len(fail_rows) == 4
+    assert [fr["reason"] for fr in fail_rows] == [e for _, e in expected_errors]
     for fr in fail_rows:
         assert fr["failure_kind"] == "reliability_failure"
-        assert fr["reason"] == "integrity_mismatch"
         assert fr["line_span"] == [0, 0]
         assert fr["spool_id_referenced"] is True
         assert fr["delivery_evidence"] == "unverified"
 
+    assert list_spools(workspace_root=repo, spool_dir=spool_dir)["count"] == 0
     health = inspect_spool_health(spool_dir)
+    assert health["entry_count"] == 0
     assert health["reliability_failures"] == 4
+
+    # GC marks missing active blobs corrupt (unexpectedly_missing), never evicting them as tombstones (INV-5).
+    sid_gc_miss, blob_gc_miss, _ = _seed("gcmiss")
+    blob_gc_miss.unlink()
+    gc_spools(max_age_seconds=86_400.0, spool_dir=spool_dir, now_ts=5_100.0)
+    idx_after_gc = json.loads(idx_file.read_text(encoding="utf-8"))
+    assert idx_after_gc["entries"][sid_gc_miss]["state"] == "corrupt"
+    assert idx_after_gc["entries"][sid_gc_miss]["corrupt_reason"] == "unexpectedly_missing"
+    assert sid_gc_miss not in idx_after_gc["tombstones"]
+    assert slice_spool(sid_gc_miss, workspace_root=repo, spool_dir=spool_dir) == {
+        "ok": False,
+        "error": "spool_corrupt",
+        "corrupt_reason": "unexpectedly_missing",
+    }
 
     # Legacy v1 spool_index.json without workspace_id fails closed with workspace_mismatch in workspace mode.
     legacy_dir = tmp_path / "legacy_spool"
@@ -265,12 +299,15 @@ def test_gc_crash_between_index_save_and_blob_unlink_recovers_cleanly_on_read_an
             raise RuntimeError("simulated crash before unlink")
         real_unlink(self, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "unlink", _crash_on_blob)
-    with pytest.raises(RuntimeError, match="simulated crash"):
-        gc_spools(max_age_seconds=10.0, spool_dir=spool_dir, now_ts=1_100.0)
+    with monkeypatch.context() as mp:
+        mp.setattr(Path, "unlink", _crash_on_blob)
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            gc_spools(max_age_seconds=10.0, spool_dir=spool_dir, now_ts=1_100.0)
 
-    # Stale blob still exists on disk, yet index already committed tombstone in Phase 1.
+    # Stale blob still exists on disk, yet index already committed evicting tombstone in Phase 1.
     assert blob.is_file()
+    idx_mid = json.loads((spool_dir / "spool_index.json").read_text(encoding="utf-8"))
+    assert idx_mid["tombstones"][sid]["state"] == "evicting"
     assert slice_spool(sid, workspace_root=repo, spool_dir=spool_dir) == {
         "ok": False,
         "error": "spool_evicted",
@@ -278,13 +315,14 @@ def test_gc_crash_between_index_save_and_blob_unlink_recovers_cleanly_on_read_an
         "evicted_at": 1_100.0,
     }
 
-    # Next GC sweeps tombstone-tracked orphan immediately regardless of mtime.
-    monkeypatch.undo()
+    # Next GC sweeps tombstone-tracked orphan immediately regardless of mtime and transitions to evicted.
     gc_sweep = gc_spools(max_age_seconds=86_400.0, spool_dir=spool_dir, now_ts=1_105.0)
     assert gc_sweep["ok"] is True
     assert not blob.exists()
+    idx_swept = json.loads((spool_dir / "spool_index.json").read_text(encoding="utf-8"))
+    assert idx_swept["tombstones"][sid]["state"] == "evicted"
 
-    # Re-spooling identical payload resurrects cleanly by removing stale tombstone.
+    # Re-spooling identical payload never recycles evicted ID; derives new generation spool_id (INV-4).
     res_again = spool_tool_output(
         payload_text,
         session_id="s-crash",
@@ -295,15 +333,25 @@ def test_gc_crash_between_index_save_and_blob_unlink_recovers_cleanly_on_read_an
         spool_dir=spool_dir,
         now_ts=1_200.0,
     )
-    assert res_again is not None and res_again[0].spool_id == sid
+    assert res_again is not None
+    new_sid = res_again[0].spool_id
+    assert new_sid != sid
+    assert new_sid in res_again[1]
+    assert slice_spool(sid, workspace_root=repo, spool_dir=spool_dir) == {
+        "ok": False,
+        "error": "spool_evicted",
+        "eviction_reason": "ttl_expired",
+        "evicted_at": 1_100.0,
+    }
     ws_id, _, err = resolve_workspace_identity(repo)
     assert err is None and ws_id
-    sl_ok = slice_spool(sid, start_line=1, limit=5, workspace_root=repo, spool_dir=spool_dir, now_ts=1_201.0)
+    sl_ok = slice_spool(new_sid, start_line=1, limit=5, workspace_root=repo, spool_dir=spool_dir, now_ts=1_201.0)
     assert sl_ok["ok"] is True
     assert sl_ok["content"].startswith("crash-0001")
     idx = json.loads((spool_dir / "spool_index.json").read_text(encoding="utf-8"))
-    assert sid in idx["entries"] and idx["entries"][sid]["workspace_id"] == ws_id
-    assert sid not in idx["tombstones"]
+    assert new_sid in idx["entries"] and idx["entries"][new_sid]["state"] == "available"
+    assert idx["entries"][new_sid]["workspace_id"] == ws_id
+    assert sid in idx["tombstones"] and idx["tombstones"][sid]["state"] == "evicted"
 
 
 def test_concurrent_gc_and_recovery_never_return_unverified_data(tmp_path: Path) -> None:
