@@ -38,7 +38,7 @@ def atomic_write_bytes(target: Path, data: bytes) -> None:
         raise
 
 def _home_norm() -> str:
-    try: return os.path.normcase(os.path.realpath(str(Path.home())))
+    try: return os.path.normcase(str(Path(h).resolve())) if os.path.isabs(h := str(Path.home())) else ""
     except (RuntimeError, OSError): return ""
 
 def read_spool_isolation_config(config_path: Path | None = None) -> tuple[str, str | None]:
@@ -75,8 +75,8 @@ def _normalize_raw_path(raw: str | Path | None) -> tuple[str | None, str | None]
         if not s or _UNRESOLVED_TMPL_RE.search(s):
             return None, "workspace_unresolved"
     try:
-        canon = os.path.realpath(s) if os.path.isabs(s) else ""
-    except OSError:
+        canon = str(Path(s).resolve()) if os.path.isabs(s) else ""
+    except (RuntimeError, OSError):
         return None, "workspace_unresolved"
     if not canon or not os.path.isdir(canon):
         return None, "workspace_unresolved"

@@ -169,18 +169,26 @@ def test_workspace_isolation_blocks_cross_project_slice_grep_and_list(
     def _forbid_cwd() -> str:
         raise AssertionError("serve_stdio must never call os.getcwd")
 
-    monkeypatch.setattr(os, "getcwd", _forbid_cwd)
-    replies = _rpc_ndjson(
-        [
-            {"jsonrpc": "2.0", "id": 1, "method": "initialize"},
-            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "cg_spool_list", "arguments": {"workspace_root": str(proj_a)}}},
-            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "cg_spool_slice", "arguments": {"spool_id": sid_a, "workspace_root": str(proj_a), "workspace_id": "ws_0000000000000000"}}},
-            {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "cg_spool_grep", "arguments": {"spool_id": sid_a, "pattern": "ALPHA", "workspace": str(proj_a)}}},
-        ],
-        spool_dir=spool_dir,
-        workspace_root=proj_b,
-        isolation="workspace",
-    )
+    with monkeypatch.context() as mp:
+        mp.setattr(os, "getcwd", _forbid_cwd)
+        replies = _rpc_ndjson(
+            [
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "cg_spool_list", "arguments": {"workspace_root": str(proj_a)}}},
+                {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "cg_spool_slice", "arguments": {"spool_id": sid_a, "workspace_root": str(proj_a), "workspace_id": "ws_0000000000000000"}}},
+                {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "cg_spool_grep", "arguments": {"spool_id": sid_a, "pattern": "ALPHA", "workspace": str(proj_a)}}},
+            ],
+            spool_dir=spool_dir,
+            workspace_root=proj_b,
+            isolation="workspace",
+        )
+        ok_replies = _rpc_ndjson(
+            [{"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "cg_spool_slice", "arguments": {"spool_id": sid_a, "limit": 2}}}],
+            spool_dir=spool_dir,
+            workspace_root=proj_a,
+            isolation="workspace",
+        )
+    assert ok_replies[0]["result"]["isError"] is False
     assert [r["id"] for r in replies] == [1, 2, 3, 4]
     list_res = json.loads(replies[1]["result"]["content"][0]["text"])
     assert replies[1]["result"]["isError"] is False and list_res["count"] == 0

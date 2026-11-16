@@ -20,6 +20,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 - **Epistemic regret downgrade (`hooks/outcomes.py`):** Downgraded 3 heuristic regret helpers from `confirmed` to `suspected`.
 - **Hygiene & scrubbing (`bin/replay_benchmark.py`):** Scrubs `receipts.jsonl`, `workspace_id`, `spool_id`; emits `spool_reliability`.
 
+### Fixed
+- **Windows Python 3.9 canonicalization (`spool/receipts.py`):** Use `Path.resolve()` so absolute roots skip `os.getcwd()`.
+
 ## [4.5.1] - 2026-11-15
 
 ### Fixed
