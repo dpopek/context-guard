@@ -1,4 +1,4 @@
-# Context-Guard (v4.5.1)
+# Context-Guard (v4.5.2)
 
 Zero-prompt policy host, Read Ledger v2 (`range_trim`), reversible output spooling, artifact unwrapper, and telemetry plugin for **Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex** (`macOS`, `Linux`, `Windows`).
 
@@ -61,10 +61,10 @@ Trims noisy test/grep boilerplate without overriding explicit user flags (`-v`/`
 - Splits `claude (cli)`/`(desktop)` (`mcp:ccd_*`) and `codex (cli)`/`(desktop)`, scores `Recent (10)` preamble hygiene, and computes 30-day `sunset_verdict` in `--usage`.
 
 ### 5. Reversible Output Spooling & Multi-Step Regret (`spool/store.py`, `spool/receipts.py`, `spool/mcp_server.py`)
-- **Opt-In Spooling:** `"output_spool": "active"` swaps huge Claude (`Bash`/`mcp__*`) & Cursor (`MCP:*`/`mcp__*`) outputs (`>= 12,288` B or `200` lines, saving `>= 2,048` B) for `<= 3,072` B summaries.
-- **Storage & Shadow:** Stores `sp_<12hex>.txt` (`25`/`15` head/tail lines; `24h` TTL, `64` entries, `32 MB` cap) plus `receipts.jsonl`; `"shadow"` logs `shadow_spools` without disk blobs.
-- **Recovery CLI & MCP:** Inspect via `cg-spool` (`slice`, `grep`, `list`, `gc`, `mcp`) or stdio MCP (`cg_spool_slice`, `cg_spool_grep`, `cg_spool_list`); `"cursor_spool_mcp": "active"` syncs `~/.cursor/mcp.json`.
-- **Multi-Step Regret (`hooks/outcomes.py`):** Tracks `output_spool` recovery/repeat, `cli_rewrite` verbose-override, and `range_trim` overlap/bypass regret (reconciled on edits).
+- **Opt-In Spooling:** `"output_spool": "active"` swaps huge Claude/Cursor outputs (`>= 12,288` B or `200` lines, saving `>= 2,048` B) for `<= 3,072` B summaries; `"shadow"` logs `shadow_spools` without blobs.
+- **Verified Storage & Receipts:** Holds `sp_<12hex>.txt` (`24h` TTL, `64` entries, `32 MB`) with locked SHA-256 reads, two-phase GC tombstones, and `receipts.jsonl` (`replacement_emitted` vs `delivery_verified`).
+- **Scoped Recovery (Logical Boundary):** `cg-spool` (`--workspace`, `--session`) and MCP (`roots/list` + `--workspace`) enforce a logical workspace boundary under one OS user (not an OS sandbox).
+- **Multi-Step Regret (`hooks/outcomes.py`):** Tracks `output_spool`, `cli_rewrite`, and `range_trim` follow-ups (`suspected` heuristic regret; reconciled on edits).
 
 ---
 
@@ -131,11 +131,11 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 Context-Guard runs from wherever you clone it (`~/.gemini` is needed only if you use Antigravity).
 
 ```bash
-# 1. Clone anywhere (or unpack dist/context-guard-v4.5.1.zip there)
+# 1. Clone anywhere (or unpack dist/context-guard-v4.5.2.zip there)
 CG_DIR=~/tools/context-guard
 git clone https://github.com/dpopek/context-guard.git "$CG_DIR"
 
-# 2. Install hooks (Claude Code, Codex, Cursor, Antigravity) & advox.context-guard-statusbar-4.5.1 extension
+# 2. Install hooks (Claude Code, Codex, Cursor, Antigravity) & advox.context-guard-statusbar-4.5.2 extension
 python3 "$CG_DIR/bin/install_harnesses.py" --install
 
 # Check status, preview dry-run, stage verified policy packs, or uninstall cleanly
@@ -168,10 +168,10 @@ python3 "$CG_DIR/bin/cg_status.py" --json \
   --stats-path /tmp/stats.json --outcomes-path /tmp/outcomes.json \
   --usage-path /tmp/token_usage.json --update-path /tmp/update.json
 cg-outline path/to/file.py  # or python3 "$CG_DIR/bin/outline.py"
-cg-spool list --json                                # or python3 "$CG_DIR/bin/cg_spool.py" list --json
-cg-spool slice <spool_id> --start 1 --limit 120     # bounded recovery slice
-cg-spool grep <spool_id> --pattern '<regex>'        # regex search with context
-cg-spool gc --json                                  # evict expired/LRU spools
+cg-spool list --workspace . --json                 # or python3 "$CG_DIR/bin/cg_spool.py" list --json
+cg-spool slice <spool_id> --start 1 --limit 120     # bounded recovery slice (--workspace / --session)
+cg-spool grep <spool_id> --pattern '<regex>'        # regex search with context (--workspace / --session)
+cg-spool gc --json                                  # evict expired/LRU spools (two-phase tombstones)
 ```
 
 ---
@@ -185,6 +185,7 @@ Optional per-user config (override via `CONTEXT_GUARD_CONFIG_PATH`). Absent = un
 | `"read_confirm_policy"` | `"strict"` | Read confirmation mode (`"strict"` or `"bounded"`). |
 | `"optimizers"` | `{"range_trim": "active", "auto_outline": "active", "cli_rewrites": "auto", "output_spool": "off"}` | Optimizer modes (`active`/`shadow`/`off`; `cli_rewrites`: `auto`/`force`/`shadow`/`off`). |
 | `"integrations"` | `{"atlassian_twg": "off", "cursor_spool_mcp": "off"}` | Opt-in external/MCP adapters (`"atlassian_twg"`, `"cursor_spool_mcp"`: `"active"` or `"off"`). |
+| `"spool"` | `{"isolation": "workspace"}` | Optional spool isolation mode (`"workspace"`, `"session"`, or `"global"`). |
 | `"regret_window_steps"` | `2` | Positive integer tracking follow-up regret attribution horizon across steps. |
 | `"policy_packs"` | `[]` | Verified Policy API v1 packs pinned by `file_hashes` + `tree_sha256` and declared `scopes`. |
 | `"model_labels"` | `{}` | Harness-to-model label overrides (`antigravity`, `claude`, `cursor`, `codex`) for `outcomes.json`. |

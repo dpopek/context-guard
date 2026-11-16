@@ -5,6 +5,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 
 ## [Unreleased]
 
+## [4.5.2] - 2026-11-16
+
+### Added
+- **`ContextReceiptV1` & receipts (`policies/api.py`, `spool/receipts.py`):** Bounded `0o600` `receipts.jsonl` with 512 KiB rotation.
+- **Two-phase GC tombstones (`spool/store.py`):** Schema v2 commits up to 128 tombstones before unlinking to surface `spool_evicted`.
+- **Workspace isolation (`spool/receipts.py`, `bin/cg_spool.py`):** Canonical `.git` root hashing plus `--workspace` and `--session`.
+- **MCP `roots/list` handshake (`spool/mcp_server.py`):** FIFO replay queue, `list_changed` invalidation, and fail-closed scope checks.
+- **Cursor `--workspace` & doctor checks (`bin/harness_status.py`, `bin/cg_status.py`):** Flags `cursor_mcp_stale` and failures.
+
+### Changed
+- **Locked spool recovery (`spool/store.py`):** Verifies byte length, 64-hex SHA-256, and strict UTF-8 inside `spool_index.lock`.
+- **Delivery evidence (`hooks/post_tool_use.py`):** Separates `replacement_emitted` from Claude `PostToolBatch` `delivery_verified`.
+- **Epistemic regret downgrade (`hooks/outcomes.py`):** Downgraded 3 heuristic regret helpers from `confirmed` to `suspected`.
+- **Hygiene & scrubbing (`bin/replay_benchmark.py`):** Scrubs `receipts.jsonl`, `workspace_id`, `spool_id`; emits `spool_reliability`.
+
 ## [4.5.1] - 2026-11-15
 
 ### Fixed
