@@ -239,7 +239,7 @@ def compute_hook_config_fingerprint(
              "scopes": list(e.get("scopes") or ()), "tree_sha256": str(e.get("tree_sha256") or ""),
              "settings": _scrub_value(e.get("settings")) if isinstance(e.get("settings"), Mapping) else {}}
             for e in (runtime_cfg.get("policy_packs") or ()) if isinstance(e, Mapping)
-        ), key=lambda item: item["id"])
+        ), key=lambda item: str(item["id"]))
         if packs:
             rt_out["policy_packs"] = packs
     canonical = {"harness_id": _norm_harness(harness_id), "runtime_cfg": rt_out, "hook_payload": _scrub_value(hook_payload) if isinstance(hook_payload, Mapping) else {}}
