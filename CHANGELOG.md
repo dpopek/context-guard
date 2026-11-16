@@ -13,6 +13,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 - **Workspace isolation (`spool/receipts.py`, `bin/cg_spool.py`):** Canonical `.git` root hashing plus `--workspace` and `--session`.
 - **MCP `roots/list` handshake (`spool/mcp_server.py`):** FIFO replay queue, `list_changed` invalidation, and fail-closed scope checks.
 - **Cursor `--workspace` & doctor checks (`bin/harness_status.py`, `bin/cg_status.py`):** Flags `cursor_mcp_stale` and failures.
+- **Architectural Freeze roadmap (`ROADMAP.md`):** Added `v4.5.2`–`v5.0.0` roadmap, release gates, and review notes.
 
 ### Changed
 - **Locked spool recovery (`spool/store.py`):** Verifies byte length, 64-hex SHA-256, and strict UTF-8 inside `spool_index.lock`.

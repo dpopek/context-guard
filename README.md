@@ -203,6 +203,6 @@ pytest tests/ -q
 
 ---
 
-## License
+## Roadmap & License
 
-Released under the [MIT License](LICENSE).
+See [ROADMAP.md](ROADMAP.md) for the `v4.5.2`–`v5.0.0` Architectural Freeze roadmap. Released under the [MIT License](LICENSE).
