@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
+
+_PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+if str(_PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PACKAGE_ROOT))
+
+from spool.mcp_server import is_cursor_spool_mcp_configured  # noqa: E402
 
 DEFAULT_CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
 DEFAULT_CURSOR_HOOKS = Path.home() / ".cursor" / "hooks.json"
@@ -241,13 +248,47 @@ def _resolve_harness_paths(
     )
 
 
+def _inspect_cursor_mcp(mcp_path: Path) -> tuple[bool, bool]:
+    if is_cursor_spool_mcp_configured(mcp_path):
+        return True, False
+    try:
+        raw = json.loads(mcp_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False, False
+    srvs = raw.get("mcpServers") if isinstance(raw, Mapping) else None
+    return False, isinstance(srvs, Mapping) and "context-guard-spool" in srvs
+
+
 def verify_harness_hooks(
     claude_settings_path: Path | None = None, cursor_hooks_path: Path | None = None,
     codex_hooks_path: Path | None = None, *, output_spool_mode: str = "off",
+    cursor_mcp_path: Path | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Verify registered hook configs and check on-disk existence of extracted `pre_tool_use.py` targets."""
+    """Verify registered hook configs, Cursor MCP `--workspace` flag, and `pre_tool_use.py` targets."""
     paths = _resolve_harness_paths(claude_settings_path, cursor_hooks_path, codex_hooks_path)
-    return {name: _inspect_harness_config(p, harness=name, output_spool_mode=output_spool_mode) for name, p in paths}
+    out = {name: _inspect_harness_config(p, harness=name, output_spool_mode=output_spool_mode) for name, p in paths}
+    cu_hooks = paths[1][1]
+    eff_mcp = cursor_mcp_path if cursor_mcp_path is not None else (
+        (Path.home() / ".cursor" / "mcp.json") if cu_hooks == DEFAULT_CURSOR_HOOKS else (cu_hooks.parent / "mcp.json")
+    )
+    mcp_ok, mcp_stale = _inspect_cursor_mcp(eff_mcp)
+    out["cursor"]["cursor_mcp_ok"] = mcp_ok
+    out["cursor"]["cursor_mcp_stale"] = mcp_stale
+    return out
+
+
+def format_doctor_harness_row(name: str, installed: bool, detail_obj: Any) -> str:
+    """Format one `--doctor` Markdown table row for Claude, Cursor, or Codex."""
+    d = detail_obj if isinstance(detail_obj, Mapping) else {}
+    if installed and d.get("target_exists") is False:
+        status_lbl, detail_str = "WARN", f"registered, missing target ({d.get('target') or 'pre_tool_use.py'})"
+    elif installed and d.get("spool_hook_ok") is False:
+        status_lbl, detail_str = "WARN", "registered, spool post-hook mismatch (re-run install_harnesses.py)"
+    elif name == "cursor" and d.get("cursor_mcp_stale") is True:
+        status_lbl, detail_str = "WARN", "Cursor spool MCP missing --workspace (re-run install_harnesses.py)"
+    else:
+        status_lbl, detail_str = ("OK" if installed else "WARN"), ("registered" if installed else "not registered")
+    return f"| Harness: `{name}` | `{status_lbl}` | `{detail_str}` |"
 
 
 def check_status(

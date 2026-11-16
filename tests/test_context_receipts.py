@@ -57,7 +57,7 @@ def test_context_receipt_v1_schema_contract() -> None:
         assert actual == expected
 
 
-def test_receipts_rotate_at_limit_and_summarize_counts(tmp_path: Path) -> None:
+def test_receipts_rotate_at_limit_and_public_json_scrubs_receipt_paths_and_workspace_ids(tmp_path: Path) -> None:
     """Verify 0o600 creation, symlink refusal, atomic 512 KiB rotation, and 7-key summary."""
     rcpt_path = tmp_path / "spool" / "receipts.jsonl"
     first = build_receipt(
@@ -147,6 +147,17 @@ def test_receipts_rotate_at_limit_and_summarize_counts(tmp_path: Path) -> None:
         target.write_text("", encoding="utf-8")
         sym_path.symlink_to(target)
         assert append_receipt(extra, receipts_path=sym_path) is False
+
+    from bin.replay_benchmark import build_public_json_bundle, check_release_hygiene
+
+    bundle = build_public_json_bundle(
+        {"saved_bytes": 100, "receipts_path": str(rcpt_path), "workspace_id": "ws_0123456789abcdef"},
+        {}, {"schema_version": 4}, receipt_summary=summary,
+    )
+    dumped = json.dumps(bundle)
+    assert "receipts.jsonl" not in dumped and "ws_0123456789abcdef" not in dumped and "receipts_path" not in dumped
+    assert bundle["spool_reliability"]["integrity_failures"] == 1
+    assert check_release_hygiene(tmp_path, public_bundle=bundle) == []
 
 
 def test_persist_spool_delivery_verification_matches_created_and_deduplicates(tmp_path: Path) -> None:

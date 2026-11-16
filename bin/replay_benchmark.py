@@ -20,13 +20,15 @@ from hooks.harness_adapter import normalize_pre_tool_payload
 
 ALLOWED_TEST_USERS = frozenset({"dev", "x", "u", "user", "example", "acme", "alice", "bob", "jan"})
 _SPOOL_ID_FIND_RE = re.compile(r"\bsp_[0-9a-f]{12}\b")
+_WS_ID_FIND_RE = re.compile(r"\bws_[0-9a-f]{16}\b")
 _SCRUB_KEYS = frozenset({
     "config_path", "transcript_path", "shadow_path", "private_policy_stats", "private_policy_stats_path",
     "policy_packs", "pack_details", "file_hashes", "tree_sha256", "repo_map_path", "workspace_root",
     "stats_path", "outcomes_path", "usage_path", "update_path", "state_dir", "home_dir", "shadow", "cwd",
-    "spool_dir", "spool_path", "spool_index",
+    "spool_dir", "spool_path", "spool_index", "receipts_path", "receipts_dir", "receipts_index",
+    "workspace_id", "canon_root", "spool_id", "session_id",
 })
-_SENSITIVE_FILES = ("shadow.json", "private_policy_stats.json", "spool_index.json")
+_SENSITIVE_FILES = ("shadow.json", "private_policy_stats.json", "spool_index.json", "receipts.jsonl")
 _SKIP_DIRS = frozenset({".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "node_modules", ".venv", "venv"})
 _POSIX_HOME_RE = re.compile(r"(?<![A-Za-z0-9_])/(?:Users|home)/([A-Za-z0-9_][A-Za-z0-9._-]*)")
 _WIN_HOME_RE = re.compile(r"[A-Za-z]:[/\\](?:Users)[/\\]([A-Za-z0-9_][A-Za-z0-9._-]*)")
@@ -172,6 +174,7 @@ def _replay_one_mode(root: Path, mode: str) -> dict[str, Any]:
             "tool_calls": [{"tool_name": "Read", "tool_use_id": "cl-2", "tool_input": {"file_path": str(large_py), "offset": 241, "limit": 120}, "tool_response": [{"type": "text", "text": "\n".join(all_lines[240:360])}]}],
         }
         batch_res = post_tool_use.handle_post_tool_use("claude", batch_payload, stats_path=stats_p, state_dir=sdir, event_name="PostToolBatch")
+        ws_dir = str(mode_dir / "workspace")
         spool_out = "\n".join(f"line-{i:04d}: " + ("x" * 70) for i in range(260))
         spool_payload = {
             "tool_name": "Bash",
@@ -179,6 +182,7 @@ def _replay_one_mode(root: Path, mode: str) -> dict[str, Any]:
             "tool_response": {"stdout": spool_out, "stderr": ""},
             "session_id": f"cl-{mode}",
             "tool_use_id": "cl-spool-1",
+            "cwd": ws_dir,
         }
         spool_res = post_tool_use.handle_post_tool_use("claude", spool_payload, stats_path=stats_p, state_dir=sdir)
         decisions.append({"step": "claude:post_spool", "decision": _decision_kind(spool_res)})
@@ -191,6 +195,7 @@ def _replay_one_mode(root: Path, mode: str) -> dict[str, Any]:
                 "tool_input": {"command": f"cg-spool slice {sp_match.group(0)} --start 1 --limit 80"},
                 "session_id": f"cl-{mode}",
                 "tool_use_id": "cl-spool-slice-1",
+                "cwd": ws_dir,
             }
             decisions.append({"step": "claude:spool_slice_recovery", "decision": _decision_kind(pre_tool_use.evaluate_hook(cl_slice, state_dir=sdir, cli_harness="claude"))})
 
@@ -383,6 +388,8 @@ def _scrub_string(text: str) -> str:
     for name in _SENSITIVE_FILES:
         if name in cleaned:
             cleaned = cleaned.replace(name, "[redacted]")
+    cleaned = _SPOOL_ID_FIND_RE.sub("[redacted]", cleaned)
+    cleaned = _WS_ID_FIND_RE.sub("[redacted]", cleaned)
     cleaned = _POSIX_HOME_RE.sub("[redacted-path]", cleaned)
     cleaned = _WIN_HOME_RE.sub("[redacted-path]", cleaned)
     cleaned = _ATLASSIAN_RE.sub(lambda m: m.group(0) if m.group(1).lower() in {"acme", "example"} else "[redacted-domain]", cleaned)
@@ -414,9 +421,10 @@ def build_public_json_bundle(
     usage: Mapping[str, Any],
     outcomes_data: Mapping[str, Any],
     update: Mapping[str, Any] | None = None,
+    receipt_summary: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return scrubbed JSON telemetry bundle safe for public diagnostics and sharing."""
-    raw = {
+    raw: dict[str, Any] = {
         "public": True,
         "stats": dict(stats),
         "token_usage": dict(usage),
@@ -426,6 +434,11 @@ def build_public_json_bundle(
         },
         "update": dict(update) if isinstance(update, Mapping) else {},
     }
+    if isinstance(receipt_summary, Mapping):
+        raw["spool_reliability"] = {
+            k: max(0, int(receipt_summary.get(k) or 0))
+            for k in ("receipt_count", "created_count", "delivery_verified_count", "recovery_count", "integrity_failures")
+        }
     scrubbed = _scrub_value(raw)
     return scrubbed if isinstance(scrubbed, dict) else {"public": True}
 
@@ -492,7 +505,10 @@ def check_release_hygiene(root: Path | None = None, public_bundle: Mapping[str, 
         for sf in _SENSITIVE_FILES:
             if sf in dumped:
                 issues.append(f"public_bundle: disallowed reference to {sf}")
-        for fk in ("config_path", "transcript_path", "policy_packs"):
+        for fk in (
+            "config_path", "transcript_path", "policy_packs", "receipts_path", "receipts_dir",
+            "receipts_index", "workspace_id", "canon_root", "spool_id", "session_id", "receipts",
+        ):
             if f'"{fk}"' in dumped:
                 issues.append(f"public_bundle: disallowed key {fk}")
         issues.extend(_scan_text_hygiene("public_bundle", dumped, allow_synthetic_tests=False))

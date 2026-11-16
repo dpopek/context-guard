@@ -40,7 +40,7 @@ from hooks.config import cached_raw_config_status, clear_config_cache, load_runt
 from hooks.policy_engine import PolicyPackLoadError, load_verified_policy_pack  # noqa: E402
 from hooks.state_store import resolve_plugin_root, warn  # noqa: E402
 from policies.api import InstallerHookSpec  # noqa: E402
-from spool.mcp_server import sync_cursor_spool_mcp  # noqa: E402
+from spool.mcp_server import is_cursor_spool_mcp_configured, sync_cursor_spool_mcp  # noqa: E402
 
 _INITIAL_PLUGIN_ROOT = resolve_plugin_root()
 DEFAULT_PLUGIN_ROOT = _INITIAL_PLUGIN_ROOT
@@ -86,12 +86,7 @@ def _sync_cursor_mcp(
 
 
 def _cursor_spool_mcp_installed(mcp_path: Path) -> bool:
-    try:
-        raw = json.loads(Path(mcp_path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
-    servers = raw.get("mcpServers") if isinstance(raw, dict) else None
-    return isinstance(servers, dict) and "context-guard-spool" in servers
+    return is_cursor_spool_mcp_configured(mcp_path)
 
 
 def resolve_python_command(

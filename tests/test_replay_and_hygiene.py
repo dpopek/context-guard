@@ -94,10 +94,17 @@ def test_public_json_scrubs_sensitive_paths_and_files(tmp_path: Path, capsys: An
         "spool_dir": str(tmp_path / "spool"),
         "spool_path": home_posix + "/spool/sp_0123456789ab.txt",
         "spool_index": "spool_index.json",
+        "receipts_path": str(tmp_path / "spool" / "receipts.jsonl"),
+        "receipts_dir": str(tmp_path / "spool"),
+        "receipts_index": {"sp_0123456789ab": "rcpt_1"},
+        "workspace_id": "ws_0123456789abcdef",
+        "canon_root": home_posix,
+        "spool_id": "sp_0123456789ab",
+        "session_id": "sess-secret-1",
         "shadow_path": str(tmp_path / "shadow.json"),
         "private_policy_stats": {"hits": 9},
         "config_path": home_posix + "/config.json",
-        "notes": ["shadow.json", "private_policy_stats.json", "spool_index.json", f"read {home_posix}"],
+        "notes": ["shadow.json", "private_policy_stats.json", "spool_index.json", "receipts.jsonl", "ws_0123456789abcdef", f"read {home_posix}"],
     }
     raw_usage = {
         "today": {"cost_usd": 1.25},
@@ -110,14 +117,29 @@ def test_public_json_scrubs_sensitive_paths_and_files(tmp_path: Path, capsys: An
         "policy_packs": [{"id": "internal_pack", "path": home_posix}],
     }
     raw_update = {"latest": "4.3.9", "cache_path": home_posix + "/update.json", "tag": f"{gcp_id} {local_mail}"}
+    rcpt_summary = {
+        "receipt_count": 7, "created_count": 3, "delivery_verified_count": 2,
+        "recovery_count": 1, "integrity_failures": 1,
+        "last_failure_ts": "2026-11-16T01:00:00Z", "last_event_ts": "2026-11-16T02:00:00Z",
+    }
 
-    bundle = replay_benchmark.build_public_json_bundle(raw_stats, raw_usage, raw_outcomes, raw_update)
+    bundle = replay_benchmark.build_public_json_bundle(raw_stats, raw_usage, raw_outcomes, raw_update, receipt_summary=rcpt_summary)
     dumped = json.dumps(bundle)
     assert bundle["public"] is True
     assert bundle["stats"]["saved_tokens"] == 300
     assert bundle["stats"]["events"]["outputs_spooled"] == 3
     assert bundle["outcomes"]["schema_version"] == 4
-    for secret_key in ("shadow.json", "private_policy_stats.json", "spool_index.json", "spool_dir", "spool_path", "spool_index", "sp_0123456789ab", "config_path", "transcript_path", "policy_packs", "jdoe_real", priv_dom, gcp_id, local_mail):
+    assert bundle["spool_reliability"] == {
+        "receipt_count": 7, "created_count": 3, "delivery_verified_count": 2,
+        "recovery_count": 1, "integrity_failures": 1,
+    }
+    assert "receipts" not in bundle
+    for secret_key in (
+        "shadow.json", "private_policy_stats.json", "spool_index.json", "receipts.jsonl",
+        "spool_dir", "spool_path", "spool_index", "receipts_path", "receipts_dir", "receipts_index",
+        "workspace_id", "canon_root", "spool_id", "session_id", "sp_0123456789ab", "ws_0123456789abcdef",
+        "sess-secret-1", "config_path", "transcript_path", "policy_packs", "jdoe_real", priv_dom, gcp_id, local_mail,
+    ):
         assert secret_key not in dumped
     assert replay_benchmark.check_release_hygiene(tmp_path, public_bundle=bundle) == []
 
@@ -165,10 +187,13 @@ def test_release_hygiene_allows_mit_publisher_and_flags_leaks(tmp_path: Path) ->
     assert "GCP-style" in joined
     assert "removed private domain" in joined
 
-    bad_bundle = {"stats": {"file": "private_policy_stats.json"}, "note": "shadow.json"}
+    bad_bundle = {
+        "stats": {"file": "private_policy_stats.json", "receipts_path": "/tmp/receipts.jsonl", "workspace_id": "ws_1", "spool_id": "sp_1", "session_id": "s1"},
+        "note": "shadow.json",
+    }
     bundle_issues = replay_benchmark.check_release_hygiene(clean_root, public_bundle=bad_bundle)
-    assert any("private_policy_stats.json" in i for i in bundle_issues)
-    assert any("shadow.json" in i for i in bundle_issues)
+    for needle in ("private_policy_stats.json", "shadow.json", "receipts.jsonl", "receipts_path", "workspace_id", "spool_id", "session_id"):
+        assert any(needle in i for i in bundle_issues)
 
 
 def test_git_history_secrets_clean_on_repo_and_flags_synthetic_commit(tmp_path: Path) -> None:
@@ -249,7 +274,7 @@ def test_doctor_reports_spool_health_and_hook_mismatch(monkeypatch: Any, tmp_pat
 
     spool_dir = tmp_path / "spool"
     spool_store.build_post_tool_spool_response(
-        "claude", {"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": {"stdout": "\n".join(f"line {i}: " + ("x" * 70) for i in range(240))}},
+        "claude", {"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": {"stdout": "\n".join(f"line {i}: " + ("x" * 70) for i in range(240))}, "cwd": str(tmp_path)},
         mode="active", session_id="s-doc", call_id="c-1", spool_dir=spool_dir,
     )
     (spool_dir / "sp_deadbeefcafe.txt").write_text("orphan\n", encoding="utf-8")
@@ -280,3 +305,48 @@ def test_doctor_reports_spool_health_and_hook_mismatch(monkeypatch: Any, tmp_pat
         cursor_hooks_path=tmp_path / "cu.json", codex_hooks_path=tmp_path / "cx.json",
     )
     assert ok_report["harness_details"]["claude"]["spool_hook_ok"] is True
+
+
+def test_doctor_warns_on_reliability_failures_and_outcomes_receipt_scoping(
+    monkeypatch: Any, tmp_path: Path, capsys: Any,
+) -> None:
+    from spool import receipts as spool_receipts
+
+    spool_dir = tmp_path / "spool_doc"
+    monkeypatch.setenv("CONTEXT_GUARD_SPOOL_DIR", str(spool_dir))
+    rcpt_path = spool_dir / "receipts.jsonl"
+    spool_receipts.append_receipt(
+        spool_receipts.build_receipt(
+            event_type="spool_integrity_failure", harness="cli", session_id="s1",
+            workspace_id="ws_0123456789abcdef", turn_key="", call_id="", spool_id="sp_0123456789ab",
+            line_span=(0, 0), byte_span=(0, 10), delivery_evidence="unverified", spool_id_referenced=True,
+            failure_kind="reliability_failure", reason="integrity_mismatch",
+        ),
+        receipts_path=rcpt_path,
+    )
+    cursor_mcp = tmp_path / "cursor_mcp.json"
+    cursor_mcp.write_text(json.dumps({"mcpServers": {"context-guard-spool": {"command": "python3", "args": ["bin/cg_spool.py", "mcp"]}}}), encoding="utf-8")
+
+    doc = cg_status.run_doctor(
+        plugin_root=tmp_path, claude_settings_path=tmp_path / "cl.json",
+        cursor_hooks_path=tmp_path / "cu.json", codex_hooks_path=tmp_path / "cx.json",
+        cursor_mcp_path=cursor_mcp,
+    )
+    assert doc["spool_health"]["reliability_failures"] == 1
+    assert doc["harness_details"]["cursor"]["cursor_mcp_stale"] is True
+    md = cg_status.render_doctor_report(doc)
+    assert "| Output spool | `WARN` |" in md
+    assert "missing --workspace" in md
+
+    # Custom --outcomes-path omits default spool receipts; default --outcomes includes them BEFORE _Schema: v4_
+    custom_out = tmp_path / "custom_outcomes.json"
+    custom_out.write_text(json.dumps({"schema_version": 4, "updated_at": "2026-11-16T00:00:00Z", "by_key": {}}), encoding="utf-8")
+    assert cg_status.main(["--outcomes", "--outcomes-path", str(custom_out)]) == 0
+    out_custom = capsys.readouterr().out
+    assert "Spool Receipts & Integrity" not in out_custom
+    assert out_custom.splitlines()[-1].startswith("_Schema: v4")
+
+    assert cg_status.main(["--outcomes"]) == 0
+    out_default = capsys.readouterr().out
+    assert "Spool Receipts & Integrity" in out_default
+    assert out_default.splitlines()[-1].startswith("_Schema: v4")

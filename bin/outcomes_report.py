@@ -122,6 +122,8 @@ def _dim_int(row: Mapping[str, Any], dim: str, field: str) -> int:
 def render_outcomes_report(
     ledger: Mapping[str, Any],
     usage_state: Mapping[str, Any] | None = None,
+    *,
+    receipt_summary: Mapping[str, Any] | None = None,
 ) -> str:
     """Render Schema v4 Markdown table of outcomes and estimated associated model costs (no paths)."""
     lines = ["# 🛡️ Context-Guard Intervention Outcomes", ""]
@@ -166,6 +168,16 @@ def render_outcomes_report(
             lines.append(f"\n_Unattributed interventions: {int(unattr):,} · Late post-archive: {int(late):,}_")
         lines.append(f"\n_Basis: {COST_ATTRIBUTION_BASIS}_")
         lines.append(f"_Causal A/B: {costs['causal_ab']['status']} · Tariff date: {TARIFF_EFFECTIVE_DATE}_")
+    if isinstance(receipt_summary, Mapping):
+        rc_tot = max(0, int(receipt_summary.get("receipt_count") or 0))
+        rc_cr = max(0, int(receipt_summary.get("created_count") or 0))
+        rc_ver = max(0, int(receipt_summary.get("delivery_verified_count") or 0))
+        rc_rec = max(0, int(receipt_summary.get("recovery_count") or 0))
+        rc_fail = max(0, int(receipt_summary.get("integrity_failures") or 0))
+        lines.append(
+            f"\n_Spool Receipts & Integrity: {rc_tot:,} total · {rc_cr:,} created · "
+            f"{rc_ver:,} delivery_verified · {rc_rec:,} recovery · {rc_fail:,} integrity_failures_"
+        )
     lines.append("")
     schema_v = ledger.get("schema_version", 4) if isinstance(ledger, Mapping) else 4
     upd = (ledger.get("updated_at") or "never") if isinstance(ledger, Mapping) else "never"

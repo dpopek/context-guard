@@ -694,14 +694,22 @@ def test_installer_output_spool_hooks_mcp_verify_and_status(tmp_path: Path, monk
     cu_hooks = json.loads(cursor_cfg.read_text(encoding="utf-8"))["hooks"]
     assert cu_hooks["postToolUse"][0]["matcher"] == CURSOR_POST_SPOOL_MATCHER
     mcp_data = json.loads(cursor_mcp.read_text(encoding="utf-8"))
-    assert mcp_data["mcpServers"]["context-guard-spool"]["args"][0].endswith("cg_spool.py")
+    mcp_args = mcp_data["mcpServers"]["context-guard-spool"]["args"]
+    assert mcp_args[0].endswith("cg_spool.py") and mcp_args[1:] == ["mcp", "--workspace", "${workspaceFolder}"]
 
     vh_on = verify_harness_hooks(claude_cfg, cursor_cfg, codex_cfg, output_spool_mode="active")
     vh_off = verify_harness_hooks(claude_cfg, cursor_cfg, codex_cfg, output_spool_mode="off")
     assert vh_on["claude"]["spool_hook_ok"] is True and vh_on["cursor"]["spool_hook_ok"] is True
+    assert vh_on["cursor"]["cursor_mcp_ok"] is True and vh_on["cursor"]["cursor_mcp_stale"] is False
     assert vh_off["claude"]["spool_hook_ok"] is False and vh_off["cursor"]["spool_hook_ok"] is False
     st = install_check_status(claude_cfg, cursor_cfg, codex_cfg, shim_bin_dir=bin_dir, cursor_mcp_path=cursor_mcp)
     assert st["claude"] and st["cursor"] and st["cg_spool_shim"] and st["cursor_spool_mcp"]
+
+    # Stale Cursor mcp.json missing --workspace flags cursor_spool_mcp=False and cursor_mcp_stale=True
+    cursor_mcp.write_text(json.dumps({"mcpServers": {"context-guard-spool": {"command": "python3", "args": ["bin/cg_spool.py", "mcp"]}}}), encoding="utf-8")
+    assert install_check_status(claude_cfg, cursor_cfg, codex_cfg, shim_bin_dir=bin_dir, cursor_mcp_path=cursor_mcp)["cursor_spool_mcp"] is False
+    vh_stale = verify_harness_hooks(claude_cfg, cursor_cfg, codex_cfg, output_spool_mode="active", cursor_mcp_path=cursor_mcp)
+    assert vh_stale["cursor"]["cursor_mcp_stale"] is True and vh_stale["cursor"]["spool_hook_ok"] is True
 
     assert without_cg_handlers(cl_hooks["PostToolUse"]) == []
     assert without_cg_handlers(cu_hooks["postToolUse"]) == []

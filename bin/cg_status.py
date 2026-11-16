@@ -28,7 +28,7 @@ from hooks.telemetry import DEFAULT_TELEMETRY_PATH, load_telemetry_stats  # noqa
 from hooks.outcomes import DEFAULT_OUTCOMES_PATH, load_outcomes  # noqa: E402
 from hooks.state_store import resolve_plugin_root, warn  # noqa: E402
 from bin import replay_benchmark, token_usage, usage_report  # noqa: E402
-from bin.harness_status import check_status, verify_harness_hooks  # noqa: E402
+from bin.harness_status import check_status, format_doctor_harness_row, verify_harness_hooks  # noqa: E402
 from bin.outcomes_report import render_outcomes_report  # noqa: E402
 from bin.update_check import UPDATE_LOCK, is_update_stale  # noqa: E402
 from spool.store import inspect_spool_health  # noqa: E402
@@ -522,6 +522,7 @@ def run_doctor(
     claude_settings_path: Path | None = None,
     cursor_hooks_path: Path | None = None,
     codex_hooks_path: Path | None = None,
+    cursor_mcp_path: Path | None = None,
 ) -> dict[str, Any]:
     """Run cross-OS self-diagnostics across Python runtime, flock, telemetry dir, harnesses, and git."""
     root = plugin_root if plugin_root is not None else ROOT
@@ -568,7 +569,7 @@ def run_doctor(
     )
     harness_details = verify_harness_hooks(
         claude_settings_path=claude_settings_path, cursor_hooks_path=cursor_hooks_path,
-        codex_hooks_path=codex_hooks_path, output_spool_mode=out_spool_mode,
+        codex_hooks_path=codex_hooks_path, output_spool_mode=out_spool_mode, cursor_mcp_path=cursor_mcp_path,
     )
     eff_spool = None if (plugin_root is None or os.environ.get("CONTEXT_GUARD_SPOOL_DIR", "").strip()) else (telemetry_dir / "spool")
     try:
@@ -682,21 +683,10 @@ def render_doctor_report(report: dict[str, Any]) -> str:
         f"| Harness: `antigravity` | `{'OK' if hr.get('antigravity') else 'FAIL'}` | `hooks.json` & `plugin.json` |",
     ])
     for name in ("claude", "cursor", "codex"):
-        installed = bool(hr.get(name))
-        detail_obj = hd.get(name) if isinstance(hd, dict) else None
-        if installed and isinstance(detail_obj, dict) and detail_obj.get("target_exists") is False:
-            status_lbl = "WARN"
-            detail_str = f"registered, missing target ({detail_obj.get('target') or 'pre_tool_use.py'})"
-        elif installed and isinstance(detail_obj, dict) and detail_obj.get("spool_hook_ok") is False:
-            status_lbl = "WARN"
-            detail_str = "registered, spool post-hook mismatch (re-run install_harnesses.py)"
-        else:
-            status_lbl = "OK" if installed else "WARN"
-            detail_str = "registered" if installed else "not registered"
-        lines.append(f"| Harness: `{name}` | `{status_lbl}` | `{detail_str}` |")
+        lines.append(format_doctor_harness_row(name, bool(hr.get(name)), hd.get(name) if isinstance(hd, dict) else None))
     raw_sp = report.get("spool_health")
     sp_h: dict[str, Any] = raw_sp if isinstance(raw_sp, dict) else {}
-    sp_warn = int(sp_h.get("expired_count", 0) or 0) > 0 or int(sp_h.get("orphan_count", 0) or 0) > 0
+    sp_warn = int(sp_h.get("expired_count", 0) or 0) > 0 or int(sp_h.get("orphan_count", 0) or 0) > 0 or int(sp_h.get("reliability_failures", 0) or 0) > 0
     lines.append(f"| Output spool | `{'WARN' if sp_warn else 'OK'}` | `{sp_h.get('summary_line') or 'empty (0 entries, 0 B)'}` |")
     git_detail = f"is_repo={gt.get('is_repo')}, clean={gt.get('clean')}"
     lines.append(f"| Git workspace | `OK` | `{git_detail}` |")
@@ -751,7 +741,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.outcomes:
             u_path = args.usage_path or (token_usage.DEFAULT_USAGE_PATH if args.outcomes_path is None else None)
             u_state = token_usage.restore_usage_state(u_path) if u_path and u_path.is_file() else None
-            print(render_outcomes_report(load_outcomes(args.outcomes_path), u_state), end="")
+            rcpt_sum = inspect_spool_health()["receipts"] if args.outcomes_path is None else None
+            print(render_outcomes_report(load_outcomes(args.outcomes_path), u_state, receipt_summary=rcpt_sum), end="")
             return 0
         stats = load_telemetry_stats(args.stats_path)
         if args.claude_hud:
@@ -770,8 +761,10 @@ def main(argv: list[str] | None = None) -> int:
             print(report + (f"\n{update_line}\n" if update_line else ""), end="")
             return 0
         if args.public_json:
+            rcpt_sum = inspect_spool_health()["receipts"] if args.outcomes_path is None else None
             bundle = replay_benchmark.build_public_json_bundle(
                 stats, usage_json(stats, args.usage_path, args.outcomes_path), load_outcomes(args.outcomes_path), load_update(args.update_path),
+                receipt_summary=rcpt_sum,
             )
             print(json.dumps(bundle, indent=2))
             return 0
