@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, TypedDict
 
 POLICY_API_VERSION = 1
 
@@ -131,6 +131,32 @@ class SpoolContractV1:
     content_sha256: str
 
 
+RECEIPT_SCHEMA_VERSION: int = 1
+
+
+class ContextReceiptV1(TypedDict):
+    """Schema v1 receipt emitted on spool creation, delivery verification, recovery, and failures."""
+
+    schema_version: int
+    receipt_id: str
+    parent_event_id: str | None
+    timestamp: str
+    event_type: str
+    harness: str
+    session_id: str
+    workspace_id: str
+    turn_key: str
+    call_id: str
+    spool_id: str
+    line_span: tuple[int, int]
+    byte_span: tuple[int, int]
+    upstream_truncation: bool
+    delivery_evidence: str
+    spool_id_referenced: bool
+    failure_kind: str | None
+    reason: str | None
+
+
 @dataclass(frozen=True)
 class PolicyPackManifest:
     """Public registration contract exported as PACK_MANIFEST by external policy packs."""
@@ -150,6 +176,7 @@ class PolicyPackManifest:
 
 __all__ = [
     "ALL_SECURITY_SCOPES",
+    "ContextReceiptV1",
     "HARNESS_OUTPUT_CAPABILITIES",
     "HarnessOutputCapabilities",
     "InstallerHookSpec",
@@ -158,6 +185,7 @@ __all__ = [
     "PolicyDecision",
     "PolicyPackManifest",
     "PolicyPostContext",
+    "RECEIPT_SCHEMA_VERSION",
     "RuntimeCapabilities",
     "SpoolContractV1",
     "VALID_POLICY_KINDS",
