@@ -6,7 +6,7 @@ Live token savings telemetry, status bar indicator, SVG donut ring side panel, a
 
 ## Overview
 
-**Context-Guard (v4.5.3)** is a zero-prompt Policy API v1 host, verified Read Ledger v2 (`range_trim`), reversible output spooler, and multi-harness telemetry plugin for **Google Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex CLI/App** using pure Python 3.9+ stdlib hooks.
+**Context-Guard (v4.6.0)** is a zero-prompt Policy API v1 host, verified Read Ledger v2 (`range_trim`), reversible output spooler, preamble/MCP budget advisor, and multi-harness telemetry plugin for **Google Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex CLI/App** using pure Python 3.9+ stdlib hooks.
 
 This companion IDE extension reads `telemetry/stats.json`, `token_usage.json`, `outcomes.json` (Outcomes Schema v4), and `update.json` from your installed Context-Guard checkout (auto-refreshing missing or stale `token_usage.json` via `cg_status.py --usage`) to surface token savings and v4.5 insights in your editor.
 
@@ -60,6 +60,10 @@ This companion IDE extension reads `telemetry/stats.json`, `token_usage.json`, `
 
 ```bash
 CG_DIR="${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}"
+
+# Unified CLI: passive preamble/MCP budget audit, doctor, status, spool, and outline
+python3 "$CG_DIR/bin/cg.py" budget --preamble --mcp --recommendations
+python3 "$CG_DIR/bin/cg.py" doctor
 
 # Short summary, Claude HUD, full Markdown report, or raw JSON
 python3 "$CG_DIR/bin/cg_status.py" --short

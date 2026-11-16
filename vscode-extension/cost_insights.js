@@ -7,7 +7,7 @@ const TARGET_WINDOW_DAYS = 30;
 const CACHE_READ_PRICE_RATIO = 0.1;
 const DENIAL_KINDS = new Set(["outline", "reread_block", "shell_block", "wide_followup"]);
 const TARIFF_EFFECTIVE_DATE = "2026-11-01";
-const COST_ATTRIBUTION_BASIS = "1/k step-weighted share of mean (harness, model) API list event cost; non-causal approximation; per-call_id join deferred to v4.6.0";
+const COST_ATTRIBUTION_BASIS = "1/k step-weighted share of mean (harness, model) API list event cost; non-causal approximation; per-call_id join deferred to a future release";
 
 const OPUS_RATE = [15.0, 18.75, 1.5, 75.0];
 const SONNET_RATE = [3.0, 3.75, 0.3, 15.0];

@@ -32,6 +32,7 @@ from bin.harness_status import (  # noqa: E402
     merge_harness_matcher, native_fail_closed_hook_extras, verify_harness_hooks, without_cg_handlers,
 )
 from bin.instruction_block import (  # noqa: E402
+    BUDGET_SHIM_MARKER, BUDGET_SHIM_NAME, CG_SHIM_MARKER, CG_SHIM_NAME,
     DEFAULT_INSTRUCTION_FILES, DEFAULT_SHIM_BIN_DIR, SPOOL_SHIM_MARKER, SPOOL_SHIM_NAME,
     install_outline_pull, shim_installed, uninstall_outline_pull,
 )
@@ -618,8 +619,8 @@ def install_all(
         if j_arg is not None:
             eff_bin = shim_bin_dir or (DEFAULT_SHIM_BIN_DIR if use_defaults else None)
             if eff_bin is not None:
-                j_arg.record_file_backup(eff_bin / "cg-outline")
-                j_arg.record_file_backup(eff_bin / SPOOL_SHIM_NAME)
+                for name in ("cg-outline", SPOOL_SHIM_NAME, CG_SHIM_NAME, BUDGET_SHIM_NAME):
+                    j_arg.record_file_backup(eff_bin / name)
             eff_inst = instruction_files if instruction_files is not None else (DEFAULT_INSTRUCTION_FILES if use_defaults else ())
             for inst_path in eff_inst:
                 j_arg.record_file_backup(inst_path)
@@ -719,6 +720,8 @@ def check_status(
         status["cursor"] = status["cursor"] and bool(details["cursor"].get("spool_hook_ok"))
     status["outline_pull"] = shim_installed(eff_bin)
     status["cg_spool_shim"] = shim_installed(eff_bin, shim_name=SPOOL_SHIM_NAME, marker=SPOOL_SHIM_MARKER)
+    status["cg_shim"] = shim_installed(eff_bin, shim_name=CG_SHIM_NAME, marker=CG_SHIM_MARKER)
+    status["cg_budget_shim"] = shim_installed(eff_bin, shim_name=BUDGET_SHIM_NAME, marker=BUDGET_SHIM_MARKER)
     status["cursor_spool_mcp"] = _cursor_spool_mcp_installed(_resolve_cursor_mcp_path(eff_cu, cursor_mcp_path))
     return status
 

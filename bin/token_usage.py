@@ -56,12 +56,21 @@ from bin.transcript_parsers import (  # noqa: E402
 
 _ROOT = resolve_plugin_root()
 DEFAULT_USAGE_PATH = _ROOT / "telemetry" / "token_usage.json"
-TRANSCRIPT_ROOTS: dict[str, Path] = {
-    "antigravity": Path.home() / ".gemini" / "antigravity" / "brain",
-    "claude": Path.home() / ".claude" / "projects",
-    "codex": Path.home() / ".codex" / "sessions",
-    "cursor": Path.home() / ".cursor" / "projects",
-}
+PASSIVE_BUDGET_MAX_BYTES = 8 * 1024 * 1024
+
+
+def transcript_roots_for_home(home: Path) -> dict[str, Path]:
+    """Return default per-harness transcript root directories rooted under `home`."""
+    h = Path(home)
+    return {
+        "antigravity": h / ".gemini" / "antigravity" / "brain",
+        "claude": h / ".claude" / "projects",
+        "codex": h / ".codex" / "sessions",
+        "cursor": h / ".cursor" / "projects",
+    }
+
+
+TRANSCRIPT_ROOTS: dict[str, Path] = transcript_roots_for_home(Path.home())
 _TRANSCRIPT_GLOBS: dict[str, tuple[str, ...]] = {
     "antigravity": (ANTIGRAVITY_FULL_TRANSCRIPT_GLOB,),
     "claude": ("*/*.jsonl", "*/*/subagents/*.jsonl"),
@@ -103,12 +112,7 @@ def _clean_counter_row(row: dict[str, Any]) -> dict[str, int]:
     return {str(k): nonneg_int(v) for k, v in row.items()}
 
 
-def restore_usage_state(path: Path) -> dict[str, Any]:
-    """The ledger at `path` with missing or mistyped sections reset; a file that is not a JSON object is quarantined."""
-    try:
-        raw = read_json_object_or_quarantine(path) or {}
-    except OSError:
-        raw = {}
+def _normalise_usage_raw(raw: dict[str, Any]) -> dict[str, Any]:
     state = empty_usage_state()
     if raw:
         raw_ver = raw.get("schema_version")
@@ -157,6 +161,15 @@ def restore_usage_state(path: Path) -> dict[str, Any]:
     state["preamble_parts"] = [row for row in state["preamble_parts"] if isinstance(row, dict)]
     state["codex_preamble_parts"] = [row for row in state["codex_preamble_parts"] if isinstance(row, dict)]
     return state
+
+
+def restore_usage_state(path: Path) -> dict[str, Any]:
+    """The ledger at `path` with missing or mistyped sections reset; a file that is not a JSON object is quarantined."""
+    try:
+        raw = read_json_object_or_quarantine(path) or {}
+    except OSError:
+        raw = {}
+    return _normalise_usage_raw(raw)
 
 
 def list_transcripts(harness: str, root: Path) -> list[Path]:
@@ -720,3 +733,32 @@ def refresh_usage(
             except OSError:
                 pass
             lock_fh.close()
+
+
+def read_usage_snapshot(
+    state_path: Path | None = None,
+    roots: dict[str, Path] | None = None,
+    max_bytes: int = PASSIVE_BUDGET_MAX_BYTES,
+) -> dict[str, Any]:
+    """Pure read-only in-memory snapshot of usage state without creating directories, locks, or files."""
+    if state_path is not None and state_path.is_file():
+        try:
+            loaded = json.loads(state_path.read_text(encoding="utf-8"))
+            raw = loaded if isinstance(loaded, dict) else {}
+        except (OSError, ValueError):
+            raw = {}
+        state = _normalise_usage_raw(raw)
+    else:
+        state = empty_usage_state()
+    eff_roots = roots if roots is not None else TRANSCRIPT_ROOTS
+    migrate_usage_state(state, eff_roots)
+    ingest_transcripts(state, eff_roots, max_bytes)
+    prune_vanished(state)
+    state["updated_at"] = now_iso()
+    today = date.fromisoformat(state["updated_at"][:10])
+    if state["component_use_since"] is None and (
+        bool(state["component_use"]) or bool(state["totals"]) or any(bool(v) for v in state["preamble"].values())
+    ):
+        state["component_use_since"] = today.isoformat()
+    prune_component_use(state, today)
+    return state

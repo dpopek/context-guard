@@ -44,3 +44,12 @@ If Context-Guard is cloned outside `~/.gemini/config/plugins/context-guard`, run
    python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg_status.py" --public-json
    ```
    Evaluate the built-in isolated deterministic synthetic corpus (`--replay`, `--benchmark`) without mutating live state, and export scrubbed OSS snapshots (`--public-json`).
+
+5. **Passive Preamble & MCP Budget Advisor (`cg budget`):**
+   ```bash
+   python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg.py" budget --preamble --mcp --recommendations
+   ```
+   Review:
+   - Strictly read-only 4-harness audit cleanly separating `measured`, `estimated`, and `unavailable` figures (never emitting `0` when schemas or usage telemetry are absent).
+   - Always-on instruction, memory-index, and skill bytes, duplicate skills, MCP tool overlaps, and non-mutating `minimal-core` / `full-integrations` profiles (note prompt-cache `cache_read` caveats).
+   - Use opt-in `--mcp --probe --probe-timeout 3` only when live local stdio `tools/list` schema probing is explicitly requested.

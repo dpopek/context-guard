@@ -7,7 +7,7 @@
 **Przeznaczenie dokumentu:** tworzenie specyfikacji, planów TDD, issue i kryteriów akceptacji kolejnych wydań
 
 > [!NOTE]
-> **Kontekst stanu repozytorium w `v4.5.3`:** Punkt bazowy przeglądu zakotwiczono w `v4.5.1` (`54045e2`), a w `v4.5.3` domknięto całą deltę kontraktową Milestone A i Milestone B niniejszego Architectural Freeze (`INV-1`–`INV-7`). Wdrożono nieblokujące hashowanie `SHA-256` i `unlink` poza `_spool_lock`, monotoniczne przejście `preparing -> available -> evicting -> evicted` i stan `corrupt` bez recyklingu ID (z retry `PermissionError`/`EBUSY` na Windows), kody błędów `format_error` / `unexpectedly_missing` / `spool_corrupt`, limit `max_spool_entry_bytes` z walidacją UTF-8 przed spoolowaniem, kontrolę tożsamości katalogów przez `os.path.samefile()` oraz `--workspace-root` w CLI/MCP, a także pełny `ContextReceiptV1` z `turn_correlation`, deduplikacją `event_id` i metrykami `summarize_spool_lifecycle`, otwierając bramkę do prac nad `v4.6.0`.
+> **Kontekst stanu repozytorium w `v4.6.0`:** Po domknięciu Architectural Freeze (`INV-1`–`INV-7`) w `v4.5.3`, w `v4.6.0` wdrożono doradcę budżetu preambuły i serwerów MCP (**Preamble & MCP Budget Advisor**): pasywny i wyłącznie odczytowy audyt `cg budget` (`--preamble`, `--mcp`, `--recommendations`) dla Antigravity, Claude Code, Cursor i Codex z jawnym rozdziałem danych `measured` / `estimated` / `unavailable`, redukcją sekretów i ścieżek domowych, wykrywaniem duplikatów oraz nakładek narzędzi MCP, ostrożnymi profilami (`minimal-core`, `full-integrations`), jawnie włączanym sondowaniem stdio `tools/list` pod `--probe` oraz zunifikowanym dispatcherem `cg` (z shimami `cg` i `cg-budget`), otwierając bramkę do prac nad `v4.7.0`.
 
 ---
 

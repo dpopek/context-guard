@@ -5,6 +5,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 
 ## [Unreleased]
 
+## [4.6.0] - 2026-11-16
+
+### Added
+- **Unified `cg` CLI (`bin/cg.py`, `bin/instruction_block.py`):** Dispatches `budget`, `doctor`, `status`, `spool`, `outline`, and shims.
+- **Passive MCP inventory (`bin/mcp_inventory.py`):** Scans 4-harness configs with redaction, overlaps, and opt-in `--probe`.
+- **Budget advisor (`bin/budget_advisor.py`, `bin/cg_budget.py`):** Audits preambles, `session_profiles`, and safe advice.
+- **Read-only snapshot & TOML (`token_usage.py`, `codex_toml.py`):** Added `read_usage_snapshot` and `parse_codex_mcp_servers`.
+- **Bundled spool schema (`spool/mcp_server.py`):** Exported `SPOOL_MCP_TOOL_SCHEMAS` for zero-subprocess Cursor spool sizing.
+
+### Changed
+- **Installer status (`bin/install_harnesses.py`):** Wired `cg_shim` and `cg_budget_shim` into `check_status` and rollback backups.
+- **Docs & audit skill (`README.md`, `ROADMAP.md`, `SKILL.md`):** Documented `cg budget`, `--probe`, and v4.6.0 modules.
+
 ## [4.5.3] - 2026-11-16
 
 ### Added

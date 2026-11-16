@@ -9,7 +9,7 @@ from bin.tariffs import TARIFF_EFFECTIVE_DATE, attribute_turn_cost, resolve_mode
 
 COST_ATTRIBUTION_BASIS = (
     "1/k step-weighted share of mean (harness, model) API list event cost; "
-    "non-causal approximation; per-call_id join deferred to v4.6.0"
+    "non-causal approximation; per-call_id join deferred to a future release"
 )
 
 

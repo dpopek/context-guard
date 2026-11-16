@@ -151,3 +151,118 @@ def sync_codex_config_toml(
     if not dry_run:
         (atomic_writer or _default_atomic_write)(codex_config_path, final_toml)
     return "updated"
+
+_TOML_BAD, _TOML_BARE_RE, _TOML_VAL_RE = object(), re.compile(r"[A-Za-z0-9_-]+"), re.compile(r"[^ \t\n#,\]}]+")
+_TOML_WS = (re.compile(r"(?:[ \t]+|#[^\n]*)*"), re.compile(r"(?:[ \t\n]+|#[^\n]*)*"))
+_TOML_ESC_RE = re.compile(r"\\([ \t]*\n[ \t\n]*|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|.)", re.DOTALL)
+_TOML_ESC = {"b": "\b", "t": "\t", "n": "\n", "f": "\f", "r": "\r", '"': '"', "\\": "\\"}
+_TOML_STRS = (('"""', re.compile(r'"""\n?((?:\\.|[^\\])*?)"""("{0,2})', re.DOTALL), False, True), ("'''", re.compile(r"'''\n?(.*?)'''('{0,2})", re.DOTALL), True, True), ('"', re.compile(r'"((?:\\[^\n]|[^"\\\n])*)"'), False, False), ("'", re.compile(r"'([^'\n]*)'"), True, False))
+def _toml_ws(src: str, pos: int, nl: bool = False) -> int:
+    return m.end() if (m := _TOML_WS[1 if nl else 0].match(src, pos)) else pos
+
+def _unescape_basic(raw: str, ml: bool) -> str | None:
+    def _sub(m: re.Match[str]) -> str:
+        t = m.group(1)
+        if ml and t[0] in (" ", "\t", "\n"):
+            return ""
+        if t in _TOML_ESC:
+            return _TOML_ESC[t]
+        if len(t) > 1 and t[0] in ("u", "U") and 0 <= (cp := int(t[1:], 16)) <= 0x10FFFF and not (0xD800 <= cp <= 0xDFFF):
+            return chr(cp)
+        raise ValueError(t)
+    try:
+        return _TOML_ESC_RE.sub(_sub, raw)
+    except ValueError:
+        return None
+
+def _read_toml_str(src: str, pos: int) -> tuple[str | None, int]:
+    for prefix, rx, is_lit, ml in _TOML_STRS:
+        if src.startswith(prefix, pos):
+            if (m := rx.match(src, pos)):
+                raw = m.group(1) + (m.group(2) if ml else "")
+                return (raw if is_lit else _unescape_basic(raw, ml)), m.end()
+            return None, (len(src) if ml or (nl := src.find("\n", pos)) == -1 else nl)
+    return None, pos
+
+def _read_key_path(src: str, pos: int) -> tuple[list[str] | None, int]:
+    segs: list[str] = []
+    while pos < len(src):
+        if src[pos] in ('"', "'") and not src.startswith(('"""', "'''"), pos):
+            seg, pos = _read_toml_str(src, pos)
+            if seg is None:
+                return None, pos
+        elif (m := _TOML_BARE_RE.match(src, pos)):
+            seg, pos = m.group(0), m.end()
+        else:
+            return None, pos
+        segs.append(seg)
+        if (nxt := _toml_ws(src, pos)) >= len(src) or src[nxt] != ".":
+            return segs, nxt
+        pos = _toml_ws(src, nxt + 1)
+    return segs or None, pos
+
+def _read_toml_val(src: str, pos: int) -> tuple[Any, int]:
+    if pos >= (n := len(src)):
+        return _TOML_BAD, pos
+    if (ch := src[pos]) in ('"', "'"):
+        s, nxt = _read_toml_str(src, pos)
+        return (_TOML_BAD if s is None else s), nxt
+    if ch in ("[", "{"):
+        acc: Any = [] if ch == "[" else {}
+        close, pos = ("]" if ch == "[" else "}"), pos + 1
+        while (pos := _toml_ws(src, pos, True)) < n:
+            if src[pos] == close:
+                return acc, pos + 1
+            if ch == "[":
+                val, nxt = _read_toml_val(src, pos)
+                if isinstance(val, str):
+                    acc.append(val)
+            else:
+                kp, kpos = _read_key_path(src, pos)
+                if not kp or (kpos := _toml_ws(src, kpos, True)) >= n or src[kpos] != "=":
+                    return _TOML_BAD, kpos
+                val, nxt = _read_toml_val(src, _toml_ws(src, kpos + 1, True))
+                if isinstance(val, str) and len(kp) == 1:
+                    acc[kp[0]] = val
+            if nxt == pos or (pos := _toml_ws(src, nxt, True)) >= n or src[pos] not in (",", close):
+                return _TOML_BAD, pos
+            if src[pos] == close:
+                return acc, pos + 1
+            pos += 1
+        return _TOML_BAD, pos
+    m = _TOML_VAL_RE.match(src, pos)
+    tok, end = (m.group(0), m.end()) if m else ("", pos)
+    return (True, end) if tok == "true" else ((False, end) if tok == "false" else (_TOML_BAD, end))
+
+def parse_codex_mcp_servers(toml_text: str) -> list[dict[str, Any]]:
+    """Lexically parse `[mcp_servers.<name>]` and `[mcp_servers.<name>.env]` TOML tables without tomllib."""
+    src = toml_text.replace("\r\n", "\n").replace("\r", "\n")
+    pos, n, section = 0, len(src), None
+    servers: dict[str, dict[str, Any]] = {}
+    while (pos := _toml_ws(src, pos, True)) < n:
+        if src[pos] == "[":
+            section = None
+            if not src.startswith("[[", pos):
+                kp, nxt = _read_key_path(src, _toml_ws(src, pos + 1))
+                if kp and (nxt := _toml_ws(src, nxt)) < n and src[nxt] == "]" and ((tail := _toml_ws(src, nxt + 1)) >= n or src[tail] == "\n"):
+                    if kp[0] == "mcp_servers" and (len(kp) == 2 or (len(kp) == 3 and kp[2] == "env")):
+                        servers.setdefault(kp[1], {"name": kp[1], "command": None, "args": [], "url": None, "cwd": None, "enabled": True, "env": {}})
+                        section = ("server" if len(kp) == 2 else "env", kp[1])
+        else:
+            kp, nxt = _read_key_path(src, pos)
+            if kp and (nxt := _toml_ws(src, nxt)) < n and src[nxt] == "=" and (vpos := _toml_ws(src, nxt + 1)) < n and src[vpos] != "\n":
+                val, vend = _read_toml_val(src, vpos)
+                tail = _toml_ws(src, vend)
+                if (ok := tail >= n or src[tail] == "\n") and section is not None and val is not _TOML_BAD:
+                    ent = servers[section[1]]
+                    if (section[0] == "env" and len(kp) == 1 and isinstance(val, str)) or (section[0] == "server" and len(kp) == 2 and kp[0] == "env" and isinstance(val, str)):
+                        ent["env"][kp[-1]] = val
+                    elif section[0] == "server" and len(kp) == 1:
+                        if (kp[0] in ("command", "url", "cwd") and isinstance(val, str)) or (kp[0] == "args" and isinstance(val, list)) or (kp[0] == "enabled" and isinstance(val, bool)):
+                            ent[kp[0]] = val
+                        elif kp[0] == "env" and isinstance(val, dict):
+                            ent["env"].update(val)
+                pos = min(n, tail + 1) if ok else (n if (nl := src.find("\n", vend)) == -1 else nl + 1)
+                continue
+        pos = n if (nl := src.find("\n", pos)) == -1 else nl + 1
+    return list(servers.values())

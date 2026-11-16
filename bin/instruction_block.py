@@ -26,6 +26,15 @@ SHIM_NAME = "cg-outline"
 SHIM_MARKER = "# context-guard:cg-outline"
 SPOOL_SHIM_NAME = "cg-spool"
 SPOOL_SHIM_MARKER = "# context-guard:cg-spool"
+CG_SHIM_NAME = "cg"
+CG_SHIM_MARKER = "# context-guard:cg"
+BUDGET_SHIM_NAME = "cg-budget"
+BUDGET_SHIM_MARKER = "# context-guard:cg-budget"
+_EXTRA_SHIMS: tuple[tuple[str, str, str, str], ...] = (
+    ("cg_spool_shim", SPOOL_SHIM_NAME, SPOOL_SHIM_MARKER, "cg_spool.py"),
+    ("cg_shim", CG_SHIM_NAME, CG_SHIM_MARKER, "cg.py"),
+    ("cg_budget_shim", BUDGET_SHIM_NAME, BUDGET_SHIM_MARKER, "cg_budget.py"),
+)
 IS_WINDOWS: bool = os.name == "nt"
 DEFAULT_SHIM_BIN_DIR = Path.home() / ".local" / "bin"
 DEFAULT_INSTRUCTION_FILES = (
@@ -214,18 +223,20 @@ def install_outline_pull(
     if use_defaults:
         shim_bin_dir = shim_bin_dir or DEFAULT_SHIM_BIN_DIR
         instruction_files = DEFAULT_INSTRUCTION_FILES if instruction_files is None else instruction_files
-    shim_status, spool_status, usable = _NOT_REQUESTED, _NOT_REQUESTED, False
+    shim_status, usable = _NOT_REQUESTED, False
+    extra_statuses = {key: _NOT_REQUESTED for key, _, _, _ in _EXTRA_SHIMS}
     if shim_bin_dir is not None:
         bin_dir, root = shim_bin_dir, Path(plugin_root)
         shim_status, usable = _install_one_shim(bin_dir, root, dry_run, shim_name=SHIM_NAME, marker=SHIM_MARKER, script_name="outline.py")
-        spool_status, _ = _install_one_shim(bin_dir, root, dry_run, shim_name=SPOOL_SHIM_NAME, marker=SPOOL_SHIM_MARKER, script_name="cg_spool.py")
+        for key, name, marker, script in _EXTRA_SHIMS:
+            extra_statuses[key], _ = _install_one_shim(bin_dir, root, dry_run, shim_name=name, marker=marker, script_name=script)
     if not instruction_files:
         block_status = _NOT_REQUESTED
     elif not usable:
         block_status = "skipped (shim unavailable)"
     else:
         block_status = ", ".join(_upsert_status(path, dry_run) for path in instruction_files)
-    return {"cg_outline_shim": shim_status, "cg_spool_shim": spool_status, "instruction_block": block_status}
+    return {"cg_outline_shim": shim_status, **extra_statuses, "instruction_block": block_status}
 
 
 def _removal_status(removed: Callable[[], bool]) -> str:
@@ -242,13 +253,17 @@ def uninstall_outline_pull(
     if use_defaults:
         shim_bin_dir = shim_bin_dir or DEFAULT_SHIM_BIN_DIR
         instruction_files = DEFAULT_INSTRUCTION_FILES if instruction_files is None else instruction_files
-    shim_status, spool_status = _NOT_REQUESTED, _NOT_REQUESTED
+    shim_status = _NOT_REQUESTED
+    extra_statuses = {key: _NOT_REQUESTED for key, _, _, _ in _EXTRA_SHIMS}
     if shim_bin_dir is not None:
         bin_dir = shim_bin_dir
         shim_status = _removal_status(lambda: remove_shim(bin_dir, dry_run=dry_run))
-        spool_status = _removal_status(lambda: remove_shim(bin_dir, dry_run=dry_run, shim_name=SPOOL_SHIM_NAME, marker=SPOOL_SHIM_MARKER))
+        for key, name, marker, _ in _EXTRA_SHIMS:
+            extra_statuses[key] = _removal_status(
+                lambda n=name, m=marker: remove_shim(bin_dir, dry_run=dry_run, shim_name=n, marker=m)  # type: ignore[misc]
+            )
     blocks = [
         _removal_status(lambda p=path: remove_block(p, dry_run=dry_run))  # type: ignore[misc]
         for path in instruction_files or ()
     ]
-    return {"cg_outline_shim": shim_status, "cg_spool_shim": spool_status, "instruction_block": ", ".join(blocks) or _NOT_REQUESTED}
+    return {"cg_outline_shim": shim_status, **extra_statuses, "instruction_block": ", ".join(blocks) or _NOT_REQUESTED}

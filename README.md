@@ -1,4 +1,4 @@
-# Context-Guard (v4.5.3)
+# Context-Guard (v4.6.0)
 
 Zero-prompt policy host, Read Ledger v2 (`range_trim`), reversible output spooling, artifact unwrapper, and telemetry plugin for **Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex** (`macOS`, `Linux`, `Windows`).
 
@@ -23,10 +23,10 @@ Code/Markdown reads never block; `cg-outline <path>` outlines 21 extensions on d
 
 | Target Type | Trigger Threshold | Action & Output |
 | :--- | :--- | :--- |
-| **Wrapped JSON-String MCP Envelope** (`.system_generated/steps/<N>/output.txt`) | `>= 16 KB` 1-line JSON with `"content"` | Unwraps `"content"` to sibling `<safe_name>` (`output_formatted.json` for tabular JSON); redirects follow-ups. |
+| **Wrapped JSON-String MCP Envelope** (`.system_generated/steps/<N>/output.txt`) | `>= 16 KB` 1-line JSON with `"content"` | Unwraps `"content"` to `<safe_name>` (`output_formatted.json` for tables); redirects follow-ups. |
 | **Tabular Rows MCP** (`rows[]` JSON) | `>= 16 KB` JSON with `rows[]` | Unwraps to `output_formatted.json`; returns row count, schema, and 3-row preview. |
 | **Generic JSON List/Items MCP** | `>= 16 KB` JSON array or `items`/`results`/`values` | Unwraps to `output_formatted.json`; returns item count, keys, and preview. |
-| **Opt-In Integrations** (`integrations/atlassian_twg.py`) | `>= 6 KB` (`6,144` B; inline `< 6 KB`) when `"atlassian_twg": "active"` | Summarizes structured issue/doc JSON stdout and extracts plain-text content to sibling files. |
+| **Opt-In Integrations** (`integrations/atlassian_twg.py`) | `>= 6 KB` (`6,144` B; inline `< 6 KB`) when `"atlassian_twg": "active"` | Summarizes issue/doc JSON stdout and extracts plain text to sibling files. |
 | **Conversation Transcripts** (`.system_generated/logs/transcript*.jsonl`) | `>= 16 KB` unbounded or span `> 8` lines | Streams step index (`step_index`, `type`, `tools=[...]`, byte sizes) with span markers. |
 
 ---
@@ -59,11 +59,12 @@ Trims noisy test/grep boilerplate without overriding explicit user flags (`-v`/`
 ### 4. Two-Stage Auto-Compact Sensor & Multi-Harness Preamble Attribution
 - Scans `transcript*.jsonl` (`O(delta)`), emitting `AUTO-COMPACT SENSOR` (`>= 80` steps or `512 KB`) and `AUTO-COMPACT HARD STOP` (`>= 200` steps or `1024 KB`).
 - Splits `claude (cli)`/`(desktop)` (`mcp:ccd_*`) and `codex (cli)`/`(desktop)`, scores `Recent (10)` preamble hygiene, and computes 30-day `sunset_verdict` in `--usage`.
+- **Passive Budget Advisor (`cg budget`):** Audits 4-harness preambles and MCP servers read-only (`measured`/`estimated`/`unavailable`), reserving stdio `tools/list` checks for opt-in `--probe`.
 
 ### 5. Reversible Output Spooling & Multi-Step Regret (`spool/store.py`, `spool/classifier.py`, `spool/receipts.py`, `spool/mcp_server.py`)
 - **Opt-In Spooling:** `"output_spool": "active"` enforces UTF-8 and `max_spool_entry_bytes` (`4 MiB`), swapping outputs (`>= 12,288` B / `200` lines) for `<= 3,072` B summaries; `"shadow"` logs `shadow_spools`.
-- **Non-Blocking Recovery & GC:** Holds `sp_<12hex>.txt` (`24h` TTL, `64` entries, `32 MB`) across `available`/`evicting`/`evicted`/`corrupt` states; verifies SHA-256 and unlinks outside `_spool_lock`.
-- **Scoped Recovery (Logical Boundary):** `cg-spool` (`--workspace`/`--workspace-root`, `--session`) and MCP (`roots/list` + `--workspace-root`) enforce `os.path.samefile()` workspace boundaries under one OS user.
+- **Non-Blocking Recovery & GC:** Stores `sp_<12hex>.txt` (`24h` TTL, `64` entries, `32 MB`) across `available`/`evicting`/`evicted`/`corrupt`; verifies SHA-256 and unlinks unlocked.
+- **Scoped Recovery:** `cg-spool` (`--workspace`/`--workspace-root`, `--session`) and MCP (`roots/list` + `--workspace-root`) enforce `os.path.samefile()` workspace boundaries under one OS user.
 - **Receipts & Regret (`hooks/outcomes.py`):** Emits `ContextReceiptV1` (`turn_correlation`, `recovery_amplification`, `delivery_verified`) and tracks `suspected` follow-up regret reconciled on edits.
 
 ---
@@ -72,7 +73,7 @@ Trims noisy test/grep boilerplate without overriding explicit user flags (`-v`/`
 
 Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`:
 - **Zero Import Cycles & Slim Footprint:** `Tarjan SCC == 0`; every `.py <= 800` LOC; `hooks/*.py` total `< 6,800` LOC.
-- **Lock Ordering:** Independent non-truncating locks + `os.replace` across `.context_guard_state.lock`, `stats.lock`, `outcomes.lock`, `token_usage.lock`, `receipts.lock`, `update.lock`, and `update_refresh.lock`.
+- **Lock Ordering:** Independent locks + `os.replace` across state, `stats`, `outcomes`, `token_usage`, `receipts`, `update`, and `update_refresh` locks.
 
 | Module | Layer | Responsibility |
 | :--- | :--- | :--- |
@@ -103,25 +104,29 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 | `hooks/outcomes.py` | Telemetry | `O(1)` Outcomes Schema v4 ledger (`outcomes.json`) for `output_spool`, `cli_rewrite`, and `range_trim` correlation. |
 | `hooks/shell_output.py` | Telemetry | Extracts shell stdout/stderr, classifies command families, and updates `stats.json`. |
 | `hooks/model_identity.py` | Telemetry | Resolves canonical model slugs (Antigravity, Claude, Codex) and `model_labels` overrides. |
+| `bin/cg.py` | CLI & UI | Unified `cg` CLI dispatcher (`budget`, `doctor`, `status`, `spool`, `outline`, `--version`). |
+| `bin/cg_budget.py` | CLI & UI | Budget Advisor CLI (`cg-budget`) for `--preamble`, `--mcp`, `--recommendations`, `--probe`. |
 | `bin/cg_status.py` | CLI & UI | Status CLI (`--short`, `--claude-hud`, `--markdown`, `--json`, `--outcomes`, `--usage`, `--doctor`, `--replay`, `--benchmark`, `--public-json`). |
 | `bin/cg_spool.py` | CLI & UI | CLI and stdio MCP entrypoint (`cg-spool`) for `slice`, `grep`, `list`, `gc`, and `mcp`. |
+| `bin/mcp_inventory.py` | CLI & UI | Passive 4-harness MCP inventory, redaction, overlap checks, and `--probe` runner. |
+| `bin/budget_advisor.py` | CLI & UI | Preamble measurements, `session_profiles`, and non-mutating recommendations. |
 | `bin/install_harnesses.py` | CLI & UI | Multi-harness hook, MCP, and IDE installer (`--install`, `--uninstall`, `--status`, `--dry-run`, `--pack-source`). |
-| `bin/migration_guard.py` | CLI & UI | Staged pack transaction (`StagedPackTransaction`), rollback journal, and migration preflight (`--pack-source`). |
-| `bin/replay_benchmark.py` | CLI & UI | Deterministic `--replay`, `--benchmark`, `--public-json` exporter, and release hygiene/secret checks. |
-| `bin/codex_toml.py` | CLI & UI | Lexical TOML scanner for non-destructive `~/.codex/config.toml` sync. |
+| `bin/migration_guard.py` | CLI & UI | Staged pack transaction (`StagedPackTransaction`), rollback journal, and `--pack-source` preflight. |
+| `bin/replay_benchmark.py` | CLI & UI | Deterministic `--replay`, `--benchmark`, `--public-json` exporter, and hygiene/secret checks. |
+| `bin/codex_toml.py` | CLI & UI | Lexical TOML scanner for `~/.codex/config.toml` sync and `[mcp_servers]` discovery. |
 | `bin/harness_status.py` | CLI & UI | Cycle-free status verifier and matcher merger across Claude Code, Cursor, and Codex configs. |
 | `bin/outline.py` | CLI & UI | CLI wrapper around `hooks/outline.py` (`cg-outline`). |
-| `bin/instruction_block.py` | CLI & UI | `cg-outline` + `cg-spool` shims and instruction-file rule block. |
+| `bin/instruction_block.py` | CLI & UI | `cg`, `cg-budget`, `cg-outline`, `cg-spool` shims and instruction-file rule block. |
 | `bin/update_check.py` | CLI & UI | Non-blocking `origin` tag checker (`update.json` / `install.json`, `--force`). |
 | `bin/token_usage.py` | CLI & UI | Incremental session log reader (`token_usage.json` v3) with model carry-over across all 4 harnesses. |
 | `bin/transcript_parsers.py` | CLI & UI | Stateless record parsers and UTC day normalizer for Claude, Codex, Antigravity, and Cursor logs. |
 | `bin/preamble_attribution.py` | CLI & UI | Measures always-on instruction files, separates CLI/Desktop apps, and computes `sunset_verdict`. |
 | `bin/usage_report.py` | CLI & UI | Formats real token usage, cache read share, preamble breakdowns, and sunset advice. |
-| `bin/outcomes_report.py` | CLI & UI | Formats Schema v4 follow-up outcomes and `"Estimated Cost Impact (non-counterfactual)"` (`1/k` step share). |
+| `bin/outcomes_report.py` | CLI & UI | Formats Schema v4 outcomes and `"Estimated Cost Impact (non-counterfactual)"` (`1/k` step share). |
 | `bin/tariffs.py` | CLI & UI | Bundled model token tariff tables (`TARIFF_EFFECTIVE_DATE`) for non-counterfactual cost estimates. |
 | `vscode-extension/extension.js` | IDE Extension | Status bar pill, 4s pulse, report panel, `update.lock` backoff, and one-click updater. |
 | `vscode-extension/view_model.js` | IDE Extension | Telemetry normalization, v4.x insights summarization, SemVer validation, and CSP. |
-| `vscode-extension/updater.js` | IDE Extension | Self-update runner with dirty precheck, `git reset --keep` rollback, `plugin_root.json` resolver, and `probeDoctor`. |
+| `vscode-extension/updater.js` | IDE Extension | Self-updater with dirty precheck, `git reset --keep` rollback, `plugin_root.json`, and `probeDoctor`. |
 | `vscode-extension/renderers.js` | IDE Extension | Escaped tooltip Markdown, sidebar SVG donut HTML, and dashboard report views. |
 | `vscode-extension/cost_insights.js` | IDE Extension | Formats bounded non-counterfactual cost estimates and model insights. |
 
@@ -132,27 +137,27 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 Clone anywhere (`~/.gemini/config/plugins/context-guard` for Antigravity; `CONTEXT_GUARD_HOME` overrides path):
 
 ```bash
-CG_DIR=~/tools/context-guard  # or unpack dist/context-guard-v4.5.3.zip
+CG_DIR=~/tools/context-guard  # or unpack dist/context-guard-v4.6.0.zip
 git clone https://github.com/dpopek/context-guard.git "$CG_DIR"
-python3 "$CG_DIR/bin/install_harnesses.py" --install  # hooks + advox.context-guard-statusbar-4.5.3
+python3 "$CG_DIR/bin/install_harnesses.py" --install  # hooks + advox.context-guard-statusbar-4.6.0
 python3 "$CG_DIR/bin/install_harnesses.py" --status   # also: --dry-run, --pack-source <dir>, --uninstall
 ```
 
 ---
 
-## CLI Reference (`cg_status.py`, `cg_spool.py` & `outline.py`)
+## CLI Reference (`cg`, `cg_status.py`, `cg_spool.py` & `outline.py`)
 
 ```bash
-python3 "$CG_DIR/bin/cg_status.py" --short       # also: --claude-hud, --markdown, --json, --outcomes, --usage
-python3 "$CG_DIR/bin/cg_status.py" --doctor      # health check; --replay, --benchmark, --public-json
-python3 "$CG_DIR/bin/cg_status.py" --json \
-  --stats-path /tmp/stats.json --outcomes-path /tmp/outcomes.json \
-  --usage-path /tmp/token_usage.json --update-path /tmp/update.json
-cg-outline path/to/file.py                       # or python3 "$CG_DIR/bin/outline.py"
-cg-spool list --workspace . --json               # or python3 "$CG_DIR/bin/cg_spool.py" list --json
-cg-spool slice <spool_id> --start 1 --limit 120   # bounded recovery (--workspace/--workspace-root, --session)
-cg-spool grep <spool_id> --pattern '<regex>'      # regex search (--workspace/--workspace-root, --session)
-cg-spool gc --json                                # evict expired/LRU spools (evicting -> evicted)
+cg budget --preamble --mcp --recommendations  # passive audit; opt-in: --probe --probe-timeout 3
+cg status --short                             # or: cg doctor, cg spool list --json, cg outline <file>
+python3 "$CG_DIR/bin/cg_status.py" --short    # also: --claude-hud, --markdown, --json, --outcomes, --usage
+python3 "$CG_DIR/bin/cg_status.py" --doctor   # health check; --replay, --benchmark, --public-json
+python3 "$CG_DIR/bin/cg_status.py" --json --stats-path /tmp/stats.json --outcomes-path /tmp/outcomes.json --usage-path /tmp/token_usage.json --update-path /tmp/update.json
+cg-outline path/to/file.py                    # or python3 "$CG_DIR/bin/outline.py"
+cg-spool list --workspace . --json            # or python3 "$CG_DIR/bin/cg_spool.py" list --json
+cg-spool slice <spool_id> --start 1 --limit 120  # bounded recovery (--workspace/--workspace-root, --session)
+cg-spool grep <spool_id> --pattern '<regex>'     # regex search (--workspace/--workspace-root, --session)
+cg-spool gc --json                               # evict expired/LRU spools (evicting -> evicted)
 ```
 
 ---

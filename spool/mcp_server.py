@@ -54,6 +54,8 @@ _TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
 ]
 
+SPOOL_MCP_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = tuple(_TOOL_SCHEMAS)
+
 def _load_plugin_version(plugin_root: Path | None = None) -> str:
     root = Path(plugin_root) if plugin_root is not None else state_store.resolve_plugin_root()
     try:

@@ -1,15 +1,22 @@
 """The installer's outline-pull rule block and `cg-outline` shim: idempotent, owned, removable."""
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
+from bin import cg
 from bin.install_harnesses import check_status, install_all, uninstall_all
 from bin.instruction_block import (
     BLOCK_BODY,
     BLOCK_END,
     BLOCK_START,
+    BUDGET_SHIM_MARKER,
+    BUDGET_SHIM_NAME,
+    CG_SHIM_MARKER,
+    CG_SHIM_NAME,
     SPOOL_SHIM_MARKER,
     SPOOL_SHIM_NAME,
     install_shim,
@@ -135,6 +142,8 @@ def test_install_all_skips_shim_and_blocks_unless_requested(tmp_path: Path) -> N
     res = install_all(PLUGIN_ROOT, *_configs(tmp_path))
     assert res["cg_outline_shim"] == "skipped (not requested)"
     assert res["cg_spool_shim"] == "skipped (not requested)"
+    assert res["cg_shim"] == "skipped (not requested)"
+    assert res["cg_budget_shim"] == "skipped (not requested)"
     assert res["instruction_block"] == "skipped (not requested)"
 
 
@@ -154,15 +163,20 @@ def test_install_and_uninstall_all_manage_shim_and_blocks(tmp_path: Path, monkey
     res = install_all(PLUGIN_ROOT, *configs, shim_bin_dir=bin_dir, instruction_files=files)
     assert res["cg_outline_shim"] == "created (not_on_path)"
     assert res["cg_spool_shim"] == "created (not_on_path)"
+    assert res["cg_shim"] == "created (not_on_path)"
+    assert res["cg_budget_shim"] == "created (not_on_path)"
     assert res["instruction_block"] == "skipped (shim unavailable)"
     assert with_text.read_text(encoding="utf-8") == USER_TEXT and not fresh.exists()
     st = check_status(*configs[:3], shim_bin_dir=bin_dir)
     assert st["outline_pull"] is True and st["cg_spool_shim"] is True
+    assert st["cg_shim"] is True and st["cg_budget_shim"] is True
 
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.defpath}")
     res = install_all(PLUGIN_ROOT, *configs, shim_bin_dir=bin_dir, instruction_files=files)
     assert res["cg_outline_shim"] == "unchanged"
     assert res["cg_spool_shim"] == "unchanged"
+    assert res["cg_shim"] == "unchanged"
+    assert res["cg_budget_shim"] == "unchanged"
     assert res["instruction_block"] == "updated, created, skipped (no harness directory)"
     assert not no_harness.parent.exists()
     again = install_all(PLUGIN_ROOT, *configs, shim_bin_dir=bin_dir, instruction_files=files)
@@ -171,11 +185,14 @@ def test_install_and_uninstall_all_manage_shim_and_blocks(tmp_path: Path, monkey
     out = uninstall_all(*configs, shim_bin_dir=bin_dir, instruction_files=files)
     assert out["cg_outline_shim"] == "removed"
     assert out["cg_spool_shim"] == "removed"
+    assert out["cg_shim"] == "removed"
+    assert out["cg_budget_shim"] == "removed"
     assert out["instruction_block"] == "removed, removed, absent"
     assert with_text.read_text(encoding="utf-8") == USER_TEXT
     assert fresh.read_text(encoding="utf-8") == ""
     st_after = check_status(*configs[:3], shim_bin_dir=bin_dir)
     assert st_after["outline_pull"] is False and st_after["cg_spool_shim"] is False
+    assert st_after["cg_shim"] is False and st_after["cg_budget_shim"] is False
 
 
 def test_install_all_dry_run_touches_nothing(tmp_path: Path) -> None:
@@ -232,6 +249,8 @@ def test_install_all_reports_instruction_and_shim_errors_instead_of_raising(
     res = install_all(PLUGIN_ROOT, *configs, shim_bin_dir=blocker, instruction_files=(good,))
     assert res["cg_outline_shim"].startswith("error (")
     assert res["cg_spool_shim"].startswith("error (")
+    assert res["cg_shim"].startswith("error (")
+    assert res["cg_budget_shim"].startswith("error (")
     assert res["instruction_block"] == "skipped (shim unavailable)"
 
 
@@ -265,3 +284,64 @@ def test_cg_spool_shim_executes_cli_and_respects_foreign_files(tmp_path: Path, m
     assert shim_installed(bin_dir, shim_name=SPOOL_SHIM_NAME, marker=SPOOL_SHIM_MARKER) is False
     assert remove_shim(bin_dir, shim_name=SPOOL_SHIM_NAME, marker=SPOOL_SHIM_MARKER) is False
     assert foreign.read_text(encoding="utf-8") == "#!/bin/sh\necho custom\n"
+
+
+def test_cg_and_budget_shims_execute_and_respect_foreign_files(tmp_path: Path, monkeypatch) -> None:
+    expected_ver = json.loads((PLUGIN_ROOT / "plugin.json").read_text(encoding="utf-8"))["version"]
+    bin_dir = tmp_path / "bin"
+    shims = ((CG_SHIM_NAME, CG_SHIM_MARKER, "cg.py"), (BUDGET_SHIM_NAME, BUDGET_SHIM_MARKER, "cg_budget.py"))
+    if os.name == "nt":
+        for shim_name, marker, script_name in shims:
+            assert install_shim(bin_dir, PLUGIN_ROOT, shim_name=shim_name, marker=marker, script_name=script_name) == "skipped (windows)"
+        proc = subprocess.run([sys.executable, str(PLUGIN_ROOT / "bin" / "cg.py"), "--version"], capture_output=True, text=True, check=True)
+        assert proc.stdout.strip() == f"context-guard {expected_ver}"
+    else:
+        for shim_name, marker, script_name in shims:
+            assert install_shim(bin_dir, PLUGIN_ROOT, shim_name=shim_name, marker=marker, script_name=script_name) == "created"
+            assert install_shim(bin_dir, PLUGIN_ROOT, shim_name=shim_name, marker=marker, script_name=script_name) == "unchanged"
+            assert shim_installed(bin_dir, shim_name=shim_name, marker=marker) is True and os.access(bin_dir / shim_name, os.X_OK)
+        proc = subprocess.run([str(bin_dir / CG_SHIM_NAME), "--version"], capture_output=True, text=True, check=True)
+        assert proc.stdout.strip() == f"context-guard {expected_ver}"
+        for shim_name, marker, _ in shims:
+            assert remove_shim(bin_dir, shim_name=shim_name, marker=marker) is True and not (bin_dir / shim_name).exists()
+
+    monkeypatch.setattr("bin.instruction_block.IS_WINDOWS", False)
+    bin_dir.mkdir(exist_ok=True)
+    for shim_name, marker, script_name in shims:
+        foreign = bin_dir / shim_name
+        foreign.write_text("#!/bin/sh\necho foreign\n", encoding="utf-8")
+        assert install_shim(bin_dir, PLUGIN_ROOT, shim_name=shim_name, marker=marker, script_name=script_name) == "skipped (foreign file)"
+        assert shim_installed(bin_dir, shim_name=shim_name, marker=marker) is False
+        assert remove_shim(bin_dir, shim_name=shim_name, marker=marker) is False
+        assert foreign.read_text(encoding="utf-8") == "#!/bin/sh\necho foreign\n"
+
+
+def test_cg_dispatcher_version_help_and_budget_routing(tmp_path: Path, monkeypatch, capsys) -> None:
+    from bin import cg_budget, cg_spool, cg_status, outline
+
+    expected_ver = json.loads((PLUGIN_ROOT / "plugin.json").read_text(encoding="utf-8"))["version"]
+    assert cg.main([]) == 0 and "budget" in capsys.readouterr().out
+    assert cg.main(["--help"]) == 0 and "outline" in capsys.readouterr().out
+    assert cg.main(["--version"]) == 0 and capsys.readouterr().out.strip() == f"context-guard {expected_ver}"
+    assert cg.main(["unknown-cmd"]) == 1 and "unknown" in capsys.readouterr().err
+
+    seen: list[tuple[str, list[str] | None]] = []
+
+    def _rec(tag: str):
+        def _fn(argv: list[str] | None = None) -> int:
+            seen.append((tag, argv))
+            return 0
+        return _fn
+
+    monkeypatch.setattr(cg_status, "main", _rec("status"))
+    monkeypatch.setattr(cg_spool, "main", _rec("spool"))
+    monkeypatch.setattr(outline, "main", _rec("outline"))
+    for args in (["doctor", "--json"], ["status", "--short"], ["spool", "list", "--json"], ["outline", "sample.py"]):
+        assert cg.main(args) == 0
+    assert seen == [("status", ["--doctor", "--json"]), ("status", ["--short"]), ("spool", ["list", "--json"]), ("outline", ["sample.py"])]
+
+    assert hasattr(cg_budget, "main")
+    assert cg.main(["budget", "--preamble", "--json", "--home", str(tmp_path), "--workspace", str(tmp_path)]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["mode"] == "passive" and "preamble" in payload
+
