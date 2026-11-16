@@ -137,6 +137,7 @@ def test_output_spool_targeted_slice_and_grep_resolve_without_regret(
             "tool_use_id": "c4",
             "tool_name": "mcp__context-guard-spool__cg_spool_grep",
             "tool_input": {"spool_id": sid2, "pattern": "mismatch"},
+            "cwd": str(tmp_path),
         },
         state_dir=str(sd),
         cli_harness="claude",
@@ -145,7 +146,7 @@ def test_output_spool_targeted_slice_and_grep_resolve_without_regret(
     # 3) Direct bounded Read on sp_<id>.txt (limit 50 <= 200) resolves output_spool -> targeted/none/observed
     _bash_pre(sd, "s3", "pytest tests/b", "c5", cwd=tmp_path)
     sid3 = _extract_spool_id(_bash_post(sd, "s3", "pytest tests/b", _big_lines(260, "dread"), "c5", cwd=tmp_path))
-    claude_read(spool_dir / f"{sid3}.txt", sd, offset=1, limit=50, session_id="s3", confirm=False, tool_use_id="c6")
+    claude_read(spool_dir / f"{sid3}.txt", sd, offset=1, limit=50, session_id="s3", confirm=False, tool_use_id="c6", cwd=tmp_path)
 
     ledger = read_outcomes_ledger(sd)
     assert ledger["open_windows"] == {}
@@ -183,7 +184,7 @@ def test_output_spool_full_read_above_200_lines_and_80_pct_resolves_suspected_re
     # Suspected Case B: direct unbounded Read of sp_<id>.txt -> full/suspected/observed
     _bash_pre(sd, "sf2", "pytest t3", "f3", cwd=tmp_path)
     sid_f2 = _extract_spool_id(_bash_post(sd, "sf2", "pytest t3", _big_lines(250, "f2"), "f3", cwd=tmp_path))
-    claude_read(spool_dir / f"{sid_f2}.txt", sd, session_id="sf2", confirm=False, tool_use_id="f4")
+    claude_read(spool_dir / f"{sid_f2}.txt", sd, session_id="sf2", confirm=False, tool_use_id="f4", cwd=tmp_path)
 
     ledger = read_outcomes_ledger(sd)
     assert ledger["open_windows"] == {}
@@ -213,11 +214,12 @@ def test_output_spool_command_repeat_without_edit_resolves_confirmed_regret(
     _bash_pre(sd, "sr", "pytest tests/", "r1", cwd=tmp_path)
     _extract_spool_id(_bash_post(sd, "sr", "pytest tests/", _big_lines(260, "rep"), "r1", cwd=tmp_path))
 
-    # Step 2 (no intervening edit): repeating `pytest tests/` resolves output_spool as full/confirmed/observed
+    # Step 2 (no intervening edit): repeating `pytest tests/` resolves output_spool as full/suspected/observed
     _bash_pre(sd, "sr", "pytest tests/", "r2", cwd=tmp_path)
     spool_row = _spool_row(sd, "output_spool")
     assert spool_row["recovery"]["full"] == 1
-    assert spool_row["regret"]["confirmed"] == 1
+    assert spool_row["regret"]["suspected"] == 1
+    assert spool_row["regret"]["confirmed"] == 0
     assert spool_row["evidence"]["observed"] == 1
     assert not any(w["key"].endswith("|output_spool") for w in read_outcomes_ledger(sd)["open_windows"].values())
 
@@ -229,6 +231,7 @@ def test_output_spool_command_repeat_without_edit_resolves_confirmed_regret(
         "tool_name": "mcp__srv__query",
         "tool_input": {"q": "select 1"},
         "tool_response": _big_lines(260, "mcp"),
+        "cwd": str(tmp_path),
     }
     handle_post_tool_use("claude", mcp_payload, state_dir=str(sd))
     pre_tool_use.evaluate_hook(
@@ -238,11 +241,13 @@ def test_output_spool_command_repeat_without_edit_resolves_confirmed_regret(
             "tool_use_id": "m2",
             "tool_name": "mcp__srv__query",
             "tool_input": {"q": "select 1"},
+            "cwd": str(tmp_path),
         },
         state_dir=str(sd),
         cli_harness="claude",
     )
-    assert _spool_row(sd, "output_spool")["regret"]["confirmed"] == 2
+    assert _spool_row(sd, "output_spool")["regret"]["suspected"] == 2
+    assert _spool_row(sd, "output_spool")["regret"]["confirmed"] == 0
 
 
 def test_edit_clears_cmd_sig_preventing_false_regret_while_preserving_later_slice_recovery(
@@ -308,7 +313,8 @@ def test_cli_rewrite_verbose_override_regret_and_edit_clear(
     assert "updatedInput" not in (d2.get("hookSpecificOutput") or {})
     cli_row = _spool_row(sd, "cli_rewrite")
     assert cli_row["recovery"]["full"] == 1
-    assert cli_row["regret"]["confirmed"] == 1
+    assert cli_row["regret"]["suspected"] == 1
+    assert cli_row["regret"]["confirmed"] == 0
     assert cli_row["evidence"]["observed"] == 1
 
     # Case B: Edit clears cli_rewrite window with none/none so a subsequent verbose run records zero additional regret
@@ -319,7 +325,8 @@ def test_cli_rewrite_verbose_override_regret_and_edit_clear(
     assert read_outcomes_ledger(sd)["open_windows"] == {}
     _bash_pre(sd, "sv2", "pytest --verbose tests/", "v6", cwd=tmp_path)
     cli_after = _spool_row(sd, "cli_rewrite")
-    assert cli_after["regret"]["confirmed"] == 1
+    assert cli_after["regret"]["suspected"] == 1
+    assert cli_after["regret"]["confirmed"] == 0
     assert cli_after["regret"]["none"] == 1
 
 
@@ -331,7 +338,7 @@ def test_range_trim_prefix_reread_and_shell_bypass_confirmed_regret(
     sd.mkdir()
     mod = write_python_module(tmp_path / "big_trim.py", funcs=26, body_lines=9)
 
-    # Session 1: prefix trim [1, 100], disjoint read [151, 220] -> no regret; overlapping read [20, 60] -> confirmed
+    # Session 1: prefix trim [1, 100], disjoint read [151, 220] -> no regret; overlapping read [20, 60] -> suspected
     claude_read(mod, sd, offset=1, limit=100, session_id="srt1", tool_use_id="t1")
     r2 = claude_read(mod, sd, offset=1, limit=150, session_id="srt1", tool_use_id="t2")
     assert r2["hookSpecificOutput"]["updatedInput"]["offset"] == 101
@@ -339,13 +346,14 @@ def test_range_trim_prefix_reread_and_shell_bypass_confirmed_regret(
     assert len(wins1) == 1 and wins1[0]["meta"] == {"trimmed_start": 1, "trimmed_end": 100}
 
     claude_read(mod, sd, offset=151, limit=70, session_id="srt1", tool_use_id="t3")
+    assert _spool_row(sd, "range_trim")["regret"]["suspected"] == 0
     assert _spool_row(sd, "range_trim")["regret"]["confirmed"] == 0
 
     claude_read(mod, sd, offset=20, limit=41, session_id="srt1", tool_use_id="t4")
     rt_row = _spool_row(sd, "range_trim")
-    assert rt_row["recovery"]["full"] == 1 and rt_row["regret"]["confirmed"] == 1
+    assert rt_row["recovery"]["targeted"] == 1 and rt_row["regret"]["suspected"] == 1 and rt_row["regret"]["confirmed"] == 0
 
-    # Session 2: shell bypass (`cat big_trim2.py`) resolves range_trim window as full/confirmed/observed
+    # Session 2: shell bypass (`cat big_trim2.py`) resolves range_trim window as targeted/suspected/observed
     mod2 = write_python_module(tmp_path / "big_trim2.py", funcs=26, body_lines=9)
     canon2 = os.path.realpath(str(mod2))
     claude_read(mod2, sd, offset=1, limit=100, session_id="srt2", tool_use_id="t5")
@@ -353,7 +361,7 @@ def test_range_trim_prefix_reread_and_shell_bypass_confirmed_regret(
     assert r4["hookSpecificOutput"]["updatedInput"]["offset"] == 101
     _bash_pre(sd, "srt2", f"cat {canon2}", "t7", cwd=tmp_path)
     rt_after = _spool_row(sd, "range_trim")
-    assert rt_after["recovery"]["full"] == 2 and rt_after["regret"]["confirmed"] == 2
+    assert rt_after["recovery"]["targeted"] == 2 and rt_after["regret"]["suspected"] == 2 and rt_after["regret"]["confirmed"] == 0
     assert read_outcomes_ledger(sd)["open_windows"] == {}
 
 

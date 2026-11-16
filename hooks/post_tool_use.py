@@ -21,7 +21,7 @@ from hooks.outcomes import (dispatch_direct_outcome, ledger_path_for, open_outco
 from hooks.shell_output import classify_family, measure  # noqa: E402
 from hooks.telemetry import record_shell_output, record_telemetry_event, warn  # noqa: E402
 from policies.api import PolicyPostContext  # noqa: E402
-from spool import store as spool_store  # noqa: E402
+from spool import receipts as spool_receipts, store as spool_store  # noqa: E402
 
 _SHELL_TOOLS = {"claude": frozenset(("Bash",)), "codex": frozenset(("Bash", "shell", "exec_command", "exec")),
                 "cursor": frozenset(("Shell", "run_terminal_cmd"))}
@@ -300,12 +300,20 @@ def handle_post_tool_use(
         sh_path, out_p = telemetry.shadow_path_for(sd_str), ledger_path_for(sd_str)
         sess_id = str(payload.get("session_id") or payload.get("conversation_id") or payload.get("conversationId") or "default")
         cid, out_mode = _extract_item_call_id(payload), str((cfg.get("optimizers") or {}).get("output_spool") or "off")
-        spool_resp, spool_meta = (
-            spool_store.build_post_tool_spool_response(
-                harness, payload, mode=out_mode, session_id=sess_id, call_id=cid,
-                spool_dir=spool_store.resolve_spool_dir(str(sdir) if state_dir is not None else None),
-            ) if ev == "PostToolUse" and out_mode in ("active", "shadow") else ({}, None)
-        )
+        eff_spool_dir = spool_store.resolve_spool_dir(str(sdir) if state_dir is not None else None)
+        ws_roots = tuple(str(r) for r in raw_wr) if isinstance((raw_wr := payload.get("workspace_roots")), (list, tuple)) else None
+        if ev == "PostToolUse" and out_mode in ("active", "shadow"):
+            rs = payload.get("stepIdx")
+            snap_s = 0 if (isinstance(rs, int) and not isinstance(rs, bool) and rs > 0) else state_store.read_state_snapshot(sdir).get("auto_step_seq")
+            cur_step = rs if (isinstance(rs, int) and not isinstance(rs, bool) and rs > 0) else max(1, snap_s if isinstance(snap_s, int) and not isinstance(snap_s, bool) else 1)
+            spool_resp, spool_meta = spool_store.build_post_tool_spool_response(
+                harness, payload, mode=out_mode, session_id=sess_id, call_id=cid, workspace_root=payload.get("cwd"),
+                workspace_roots=ws_roots, turn_key=f"{sess_id}:step:{cur_step}", spool_dir=eff_spool_dir)
+        else:
+            spool_resp, spool_meta = {}, None
+            if ev == "PostToolBatch":
+                spool_receipts.persist_spool_delivery_verification(
+                    payload, harness=harness, session_id=sess_id, workspace_root=payload.get("cwd"), workspace_roots=ws_roots, spool_dir=eff_spool_dir)
         mut_paths = _apply_mutation_invalidation(payload, sdir, sh_path) if ev == "PostToolUse" else []
         trims = _apply_read_confirmation(harness, payload, sdir, cfg, sp, eff_event=ev, shadow_path=sh_path, outcomes_path=out_p)
         step_idx, mod = _advance_spool_step_and_model(harness, sess_id, payload, sdir) if (out_mode == "active" and spool_meta is not None) else (0, "unknown")

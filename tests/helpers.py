@@ -55,6 +55,7 @@ def claude_read(
     session_id: str = "s1",
     confirm: bool = True,
     tool_use_id: str | None = None,
+    cwd: Path | str | None = None,
 ) -> dict[str, Any]:
     """Evaluate a Claude Code `Read` tool call and optionally confirm delivery via `PostToolBatch`."""
     tool_input: dict[str, Any] = {"file_path": str(path)}
@@ -63,14 +64,17 @@ def claude_read(
     if limit is not None:
         tool_input["limit"] = limit
     cid = tool_use_id or f"toolu_helper_{next(_HELPER_CALL_SEQ)}"
+    pre_payload: dict[str, Any] = {
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "tool_name": "Read",
+        "tool_input": tool_input,
+        "tool_use_id": cid,
+    }
+    if cwd is not None:
+        pre_payload["cwd"] = str(cwd)
     out = evaluate_hook(
-        {
-            "hook_event_name": "PreToolUse",
-            "session_id": session_id,
-            "tool_name": "Read",
-            "tool_input": tool_input,
-            "tool_use_id": cid,
-        },
+        pre_payload,
         state_dir=str(state_dir),
         cli_harness="claude",
     )
@@ -89,21 +93,24 @@ def claude_read(
                     eff_start, eff_end = int(pending["exec_start"]), int(pending["delivered_end"])
                     break
         body = _read_lines_slice(exec_path, eff_start, eff_end)
+        batch_payload: dict[str, Any] = {
+            "hook_event_name": "PostToolBatch",
+            "session_id": session_id,
+            "tool_calls": [
+                {
+                    "tool_name": "Read",
+                    "tool_use_id": cid,
+                    "tool_input": eff_in,
+                    "tool_response": body,
+                    "is_error": False,
+                }
+            ],
+        }
+        if cwd is not None:
+            batch_payload["cwd"] = str(cwd)
         handle_post_tool_use(
             "claude",
-            {
-                "hook_event_name": "PostToolBatch",
-                "session_id": session_id,
-                "tool_calls": [
-                    {
-                        "tool_name": "Read",
-                        "tool_use_id": cid,
-                        "tool_input": eff_in,
-                        "tool_response": body,
-                        "is_error": False,
-                    }
-                ],
-            },
+            batch_payload,
             state_dir=str(state_dir),
             event_name="PostToolBatch",
         )

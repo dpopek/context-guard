@@ -26,6 +26,7 @@ READ_CONFIRM_POLICIES: frozenset[str] = frozenset({"strict", "bounded"})
 OPTIMIZER_MODES: frozenset[str] = frozenset({"active", "shadow", "off"})
 CLI_REWRITE_MODES: frozenset[str] = frozenset({"auto", "force", "shadow", "off"})
 INTEGRATION_MODES: frozenset[str] = frozenset({"active", "off"})
+SPOOL_ISOLATION_MODES: frozenset[str] = frozenset({"workspace", "session", "global"})
 LEGACY_SECURITY_CONFIG_KEYS: tuple[str, ...] = (
     "restricted_bq_datasets",
     "allowed_bq_views_dataset",
@@ -165,6 +166,7 @@ def default_runtime_config() -> dict[str, Any]:
             "atlassian_twg": "off",
             "cursor_spool_mcp": "off",
         },
+        "spool": {"isolation": "workspace"},
         "regret_window_steps": 2,
         "policy_packs": [],
         "model_labels": {},
@@ -245,6 +247,11 @@ def load_runtime_config(config_path: Path | None = None) -> dict[str, Any]:
     workspace_root = str(Path(ws_raw).expanduser()) if isinstance(ws_raw, str) and ws_raw.strip() else None
     rm_raw = raw.get("repo_map_path")
     repo_map_path = str(Path(rm_raw).expanduser()) if isinstance(rm_raw, str) and rm_raw.strip() else None
+    spool_out = dict(defaults["spool"])
+    if "spool" in raw:
+        if not isinstance((raw_sp := raw["spool"]), dict) or not isinstance((sval := raw_sp.get("isolation", "workspace")), str) or sval not in SPOOL_ISOLATION_MODES:
+            return {**defaults, "config_path": str(eff_path), "config_error": "invalid 'spool'"}
+        spool_out["isolation"] = sval
 
     return {
         "read_confirm_policy": read_policy_raw,
@@ -255,7 +262,7 @@ def load_runtime_config(config_path: Path | None = None) -> dict[str, Any]:
         "model_labels": model_labels,
         "repo_map_path": repo_map_path,
         "workspace_root": workspace_root,
-        "legacy_security_keys": legacy_keys,
+        "legacy_security_keys": legacy_keys, "spool": spool_out,
         "config_path": str(eff_path),
         "config_error": None,
     }

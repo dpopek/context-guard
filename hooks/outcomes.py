@@ -266,15 +266,15 @@ def record_spool_followup(session_id: str, spool_id: str, recovery: str, regret:
         (recovery, regret, evidence) if k == "output_spool" and wp == f"spool:{spool_id}" else None), ledger_path=ledger_path, step_idx=step_idx)
 
 def record_spool_command_repeat(session_id: str, cmd_sig: str, step_idx: int, *, ledger_path: Path | None = None) -> bool:
-    """Resolve matching open output_spool windows as full/confirmed/observed on repeat command."""
+    """Resolve matching open output_spool windows as full/suspected/observed on repeat command."""
     return bool(cmd_sig) and _reconcile_windows(session_id, lambda _wp, k, w: (
-        ("full", "confirmed", "observed") if k == "output_spool" and isinstance(m := w.get("meta"), Mapping) and m.get("cmd_sig") == cmd_sig else None),
+        ("full", "suspected", "observed") if k == "output_spool" and isinstance(m := w.get("meta"), Mapping) and m.get("cmd_sig") == cmd_sig else None),
         ledger_path=ledger_path, step_idx=step_idx)
 
 def record_cli_verbose_regret(session_id: str, base_sig: str, step_idx: int, *, ledger_path: Path | None = None) -> bool:
-    """Resolve matching open cli_rewrite window as full/confirmed/observed on verbose override."""
+    """Resolve matching open cli_rewrite window as full/suspected/observed on verbose override."""
     return bool(base_sig) and _reconcile_windows(session_id, lambda wp, k, _w: (
-        ("full", "confirmed", "observed") if k == "cli_rewrite" and wp == f"cli:{base_sig}" else None), ledger_path=ledger_path, step_idx=step_idx)
+        ("full", "suspected", "observed") if k == "cli_rewrite" and wp == f"cli:{base_sig}" else None), ledger_path=ledger_path, step_idx=step_idx)
 
 def _trim_overlaps(meta: Any, req_start: int, req_end: int | None, is_shell_bypass: bool) -> bool:
     if isinstance(meta, Mapping) and isinstance(ts := meta.get("trimmed_start"), int) and not isinstance(ts, bool):
@@ -284,9 +284,9 @@ def _trim_overlaps(meta: Any, req_start: int, req_end: int | None, is_shell_bypa
 
 def record_range_trim_regret(session_id: str, canon_path: str, req_start: int, req_end: int | None, step_idx: int, *,
                              is_shell_bypass: bool = False, ledger_path: Path | None = None) -> bool:
-    """Resolve matching open range_trim windows as full/confirmed/observed on omitted-span overlap or bypass."""
+    """Resolve matching open range_trim windows as targeted/suspected/observed on omitted-span overlap or bypass."""
     return bool(tr := _real(canon_path)) and _reconcile_windows(session_id, lambda wp, k, w: (
-        ("full", "confirmed", "observed") if k == "range_trim" and _real(str(w.get("target_path") or wp)) == tr
+        ("targeted", "suspected", "observed") if k == "range_trim" and _real(str(w.get("target_path") or wp)) == tr
         and _trim_overlaps(w.get("meta"), req_start, req_end, is_shell_bypass) else None), ledger_path=ledger_path, step_idx=step_idx)
 
 def _on_mutation_win(wp: str, k: str, w: dict[str, Any], mut_real: set[str]) -> tuple[str, str, str] | bool | None:

@@ -132,7 +132,9 @@ def _is_non_self_mcp(norm: NormalizedToolCall) -> bool:
 
 def _apply_spool_followup(sess_id: str, norm: NormalizedToolCall, step_idx: int,
                           sp_dir: str | None, outcomes_path: Path | None) -> bool:
-    fu = classify_pre_tool_spool_followup(norm.original_tool_name, norm.original_tool_input, spool_dir=resolve_spool_dir(sp_dir))
+    fu = classify_pre_tool_spool_followup(
+        norm.original_tool_name, norm.original_tool_input, spool_dir=resolve_spool_dir(sp_dir),
+        workspace_root=norm.cwd, workspace_roots=norm.workspace_roots, session_id=norm.session_id)
     if fu is None:
         return False
     record_spool_followup(sess_id, str(fu["spool_id"]), str(fu["recovery"]), str(fu["regret"]), step_idx,

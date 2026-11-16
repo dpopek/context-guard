@@ -66,6 +66,7 @@ class NormalizedToolCall:
     permission_mode: str | None = None
     call_id: str = ""
     has_synthetic_call_id: bool = False
+    workspace_roots: tuple[str, ...] = ()
 
 
 _AG_MUTATION_TOOLS = frozenset((
@@ -164,6 +165,8 @@ def normalize_pre_tool_payload(
 ) -> NormalizedToolCall:
     """Normalize an incoming PreToolUse JSON payload into a canonical representation."""
     harness = detect_harness(payload, cli_harness=cli_harness, env=env)
+    raw_wr = payload.get("workspace_roots")
+    ws_roots = tuple(r.strip() for r in raw_wr if isinstance(r, str) and r.strip()) if isinstance(raw_wr, (list, tuple)) else ()
     if harness == "antigravity":
         tc = raw if isinstance((raw := payload.get("toolCall")), dict) else {}
         raw_tool = str(tc.get("name") or "")
@@ -186,7 +189,7 @@ def normalize_pre_tool_payload(
             original_tool_name=raw_tool, original_tool_input=orig_args,
             session_id=str(payload.get("conversationId") or "default"),
             step_idx=_safe_finite_int(payload.get("stepIdx"), default=0), cwd=cwd, artifact_dir=art_dir,
-            mutated_paths=mutated, call_id=cid, has_synthetic_call_id=synth,
+            mutated_paths=mutated, call_id=cid, has_synthetic_call_id=synth, workspace_roots=ws_roots,
         )
     raw_tool, raw_in = str(payload.get("tool_name") or ""), payload.get("tool_input")
     orig_in: dict[str, Any] = dict(raw_in) if isinstance(raw_in, dict) else (
@@ -208,7 +211,7 @@ def normalize_pre_tool_payload(
             harness=harness, canonical_tool=c_tool, canonical_args=c_args, original_tool_name=raw_tool,
             original_tool_input=orig_in, session_id=sess_id, step_idx=step_idx, cwd=cwd,
             artifact_dir=None, mutated_paths=mut, permission_mode=perm_mode,
-            call_id=cid, has_synthetic_call_id=is_synth,
+            call_id=cid, has_synthetic_call_id=is_synth, workspace_roots=ws_roots,
         )
 
     if raw_tool in ("Read", "NotebookRead", "read_file", "view_file"):

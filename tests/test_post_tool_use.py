@@ -422,12 +422,20 @@ def test_active_spool_claude_bash_and_mcp_records_stats_window_and_main_stdout(
     _write_spool_cfg(isolated_user_env, output_spool="active", range_trim="active")
     sd = tmp_path / "sd_active"
     big_out = "\n".join(f"FAILED tests/test_mod.py::test_case_{i} - {'payload_' * 10}" for i in range(300))
+    # Omitting cwd in default workspace isolation mode fails open ({}) without writing spools
+    assert handle_post_tool_use(
+        "claude",
+        _bash("pytest tests/", session_id="s-act", tool_use_id="cid-no-cwd", hook_event_name="PostToolUse", tool_response=big_out),
+        state_dir=str(sd),
+    ) == {}
+    assert load_telemetry_stats(sd / "telemetry_stats.json")["events"]["outputs_spooled"] == 0
     bash_payload = _bash(
         "pytest tests/",
         session_id="s-act",
         tool_use_id="cid-bash-1",
         hook_event_name="PostToolUse",
         tool_response=big_out,
+        cwd=str(tmp_path),
     )
     # Bash-first session (state_dir does not yet exist): main() must emit replaced output JSON and bump auto_step_seq >= 1
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(bash_payload)))
@@ -461,6 +469,7 @@ def test_active_spool_claude_bash_and_mcp_records_stats_window_and_main_stdout(
         "tool_name": "mcp__srv__query",
         "tool_input": {"q": "select *"},
         "tool_response": [{"type": "text", "text": big_out}],
+        "cwd": str(tmp_path),
     }
     mcp_res = handle_post_tool_use("claude", mcp_payload, state_dir=str(sd))
     assert isinstance(mcp_res["hookSpecificOutput"]["updatedToolOutput"], list)
@@ -484,9 +493,17 @@ def test_shadow_spool_and_post_tool_batch_trim_window(
     sd.mkdir()
     big_out = "\n".join(f"row_{i}: {'d' * 75}" for i in range(300))
 
+    # Omitting cwd in shadow workspace mode also fails open without recording shadow_spools or writing blobs
+    assert handle_post_tool_use(
+        "claude",
+        _bash("pytest tests/", session_id="s-sh", tool_use_id="cid-sh-0", hook_event_name="PostToolUse", tool_response=big_out),
+        state_dir=str(sd),
+    ) == {}
+    assert not (sd / "shadow.json").exists()
+
     res = handle_post_tool_use(
         "claude",
-        _bash("pytest tests/", session_id="s-sh", tool_use_id="cid-sh-1", hook_event_name="PostToolUse", tool_response=big_out),
+        _bash("pytest tests/", session_id="s-sh", tool_use_id="cid-sh-1", hook_event_name="PostToolUse", tool_response=big_out, cwd=str(tmp_path)),
         state_dir=str(sd),
     )
     assert res == {}

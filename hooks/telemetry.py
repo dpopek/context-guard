@@ -46,7 +46,7 @@ DEFAULT_TELEMETRY_PATH = resolve_plugin_root() / "telemetry" / "stats.json"
 _EVENT_KEYS = (
     "allowed_reads", "outlines", "wide_followup_blocks", "wide_followup_retries", "multi_file_blocks",
     "multi_file_retries", "rereads_blocked", "ranges_trimmed", "cli_rewrites", "mcp_guards",
-    "credit_reversals", "outline_pulls", "outputs_spooled",
+    "credit_reversals", "outline_pulls", "outputs_spooled", "reliability_failures",
 )
 _HARNESS_KEYS = ("antigravity", "claude", "cursor", "codex")
 
@@ -288,6 +288,12 @@ def record_shell_output(
         _update_ledger(stats_path, lambda st: apply_shell_output(st, harness, family, measurement, outcome))
     except Exception as exc:  # noqa: BLE001 - telemetry is best-effort by contract
         warn(f"shell output telemetry skipped: {type(exc).__name__}")
+def record_reliability_failure(stats_path: Path | None = None) -> None:
+    """Increment `events.reliability_failures` via `_update_ledger` without touching `by_harness`."""
+    def _bump(st: dict[str, Any]) -> None:
+        ev = _ensure_dict(st, "events")
+        ev["reliability_failures"] = _as_int(ev.get("reliability_failures")) + 1
+    _update_ledger(stats_path, _bump)
 
 def _update_ledger(
     stats_path: Path | None, mutate: Callable[[dict[str, Any]], bool | None], *,
