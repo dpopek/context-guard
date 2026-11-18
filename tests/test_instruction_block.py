@@ -348,9 +348,12 @@ def test_cg_dispatcher_version_help_and_budget_routing(tmp_path: Path, monkeypat
     monkeypatch.setattr(cg_status, "main", _rec("status"))
     monkeypatch.setattr(cg_spool, "main", _rec("spool"))
     monkeypatch.setattr(outline, "main", _rec("outline"))
-    for args in (["doctor", "--json"], ["status", "--short"], ["spool", "list", "--json"], ["outline", "sample.py"]):
+    assert cg.main(["doctor", "--json"]) == 0
+    doc_payload = json.loads(capsys.readouterr().out)
+    assert doc_payload["ok"] is True and doc_payload["version"] == expected_ver and doc_payload["schema_version"] == 1
+    for args in (["status", "--short"], ["spool", "list", "--json"], ["outline", "sample.py"]):
         assert cg.main(args) == 0
-    assert seen == [("status", ["--doctor", "--json"]), ("status", ["--short"]), ("spool", ["list", "--json"]), ("outline", ["sample.py"])]
+    assert seen == [("status", ["--short"]), ("spool", ["list", "--json"]), ("outline", ["sample.py"])]
 
     assert hasattr(cg_budget, "main") and hasattr(cg_eval, "main")
     assert cg.main(["budget", "--preamble", "--json", "--home", str(tmp_path), "--workspace", str(tmp_path)]) == 0

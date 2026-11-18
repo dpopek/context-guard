@@ -7,7 +7,7 @@
 **Document purpose:** authoring specifications, TDD plans, issues, and acceptance criteria for upcoming releases
 
 > [!NOTE]
-> **Repository state in `v4.9.0`:** Building on the `v4.5.3` Architectural Freeze (`INV-1`–`INV-7`), `v4.6.0` Budget Advisor (`cg budget`), `v4.7.0` Evidence Engine (`evidence/`, `cg eval`), and `v4.8.0` Capability-Aware Adaptive Governor (`policies/governor.py`, `cg eval --governor-check`), `v4.9.0` delivered **Explainability & Operational Hardening** (`policies/api.py`, `spool/receipts.py`, `spool/store.py`, `bin/cg_explain.py`, `bin/cg_export.py`, `bin/replay_benchmark.py`, `evidence/runner.py`, `bin/cg_eval.py`, `bin/cg.py`): `ExplainContractV1` and `BackendBenchmarkContractV1` schemas, scrubbed `cg explain <event-id>` diagnostics across spool lifecycles, eviction/corruption causes, and delivery evidence tiers with zero prompt/blob/path leakage, strictly off-hot-path 100% stdlib OTLP/JSON `cg export --otel` (`hooks/*.py` untouched at `6,762` LOC), `p50`/`p95`/`p99` latency percentiles and conditional backend storage benchmarks retaining Read Ledger v2 `json_lock` (`migration_performed == False`), 6-domain operational resilience and safe-migration tests, and the 8-gate `cg eval --hardening-check` verification in Multi-OS CI, opening the gate for `v5.0.0` (**Policy API, Schema & Compatibility Stabilization**).
+> **Repository state in `v5.0.0`:** Completing the `v4.5.2`–`v5.0.0` Architectural Freeze roadmap (`v4.5.2`/`v4.5.3` spool integrity & `ContextReceiptV1`, `v4.6.0` passive `cg budget`, `v4.7.0` Evidence Engine `cg eval`, `v4.8.0` Adaptive Governor `cg eval --governor-check`, and `v4.9.0` `cg explain` / off-hot-path `cg export --otel` / `cg eval --hardening-check` with `hooks/*.py` untouched at `6,762` LOC), `v5.0.0` delivers the **Stable Context Reliability Platform** (`policies/api.py`, `policies/__init__.py`, `evidence/conformance.py`, `bin/cg.py`, `bin/cg_eval.py`): frozen `POLICY_API_VERSION = 1` without an unnecessary Policy API v2 or external SDK (`policy_api_v2_mandated == False`, `external_sdk_shipped == False`), the 17-entry `CORE_SCHEMA_VERSIONS` registry and formal `DeprecationPolicyV1`, a cohesive `cg` CLI across `doctor`, `budget`, `explain`, `eval`, and `help` with `--json`/`--markdown` parity and exit codes `0`/`1`/`2`, the published 4-harness `PlatformMatrixContractV1` capability & limitation matrix (Part III below and `cg eval --platform-matrix`), and the 10-gate `cg eval --conformance` adapter, baseline policy-pack, migration, and rollback suite verified in Multi-OS CI.
 
 ---
 
@@ -363,3 +363,124 @@ Modifying a frozen contract requires:
 4. Re-passing the **Contract Gate**.
 
 **Final decision:** the top priority at the `v4.5.2`/`v4.5.3` boundary was full closure of integrity invariants, non-blocking hashing/GC, and `samefile()` workspace isolation before starting `v4.6.0` (`Preamble & MCP Budget Advisor`).
+
+---
+
+## Part III — `v5.0.0` Platform Reference: Guarantees, Capability & Limitation Matrix, Schema Versioning, Migrations, Rollback & Effectiveness Evidence
+
+Part III records the authoritative public contracts, harness boundaries, migration invariants, operational rollback procedures, and effectiveness methodology shipped in `v5.0.0` (`policies/api.py`, `evidence/conformance.py`, `bin/cg.py`, `bin/cg_eval.py`). Programmatic equivalents are exported via `cg doctor --contracts --json`, `cg eval --platform-matrix --json`, and `cg eval --conformance --json`.
+
+### 1. Cohesive CLI Contract (`cg` Dispatcher & Subcommands)
+
+All operator workflows route through `bin/cg.py` (`cg <command> [args...]`, `-h`/`--help`, `-V`/`--version`) with passive, non-mutating, zero-network defaults. The four primary diagnostic pillars (`doctor`, `budget`, `explain`, `eval`) share mutually exclusive `--json` / `--markdown` output flags (defaulting to Markdown) and deterministic exit codes (`0` / `1` / `2`).
+
+| Command | Key Flags & Modes | Output Formats | Exit Codes (`0` / `1` / `2`) | Default Side-Effect Posture |
+| :--- | :--- | :--- | :--- | :--- |
+| `cg doctor` | `[--contracts] [--json \| --markdown]` | Markdown (default), JSON (`DOCTOR_SCHEMA_VERSION = 1`) | `0` healthy; `1` environment/harness drift; `2` invalid CLI args | Strictly read-only; probes local Python, `flock`, telemetry dir, harness hooks, and schema contracts (`cg_status.py --doctor` stays 100% backward-compatible Markdown) |
+| `cg budget` | `[--preamble] [--mcp] [--recommendations] [--probe] [--probe-server <id>] [--probe-timeout <sec>] [--harness <id>] [--workspace <dir>] [--home <dir>] [--usage-path <file>] [--json \| --markdown]` | Markdown (default), JSON | `0` audit emitted; `2` invalid flags / `--probe` without `--mcp` or `--recommendations` / invalid timeout | Strictly passive read-only by default (never spawns MCP servers); stdio `tools/list` probing runs only when `--probe` is explicitly passed |
+| `cg explain` | `<event-id> [--receipts-path <file>] [--spool-dir <dir>] [--ledger-path <file>] [--state-dir <dir>] [--json \| --markdown]` | Markdown (default), JSON (`ExplainContractV1`, schema `1`) | `0` matched & explained; `1` unmatched ID / read error; `2` invalid CLI args or `invalid_event_id` | Strictly read-only & privacy-scrubbed; zero raw prompt, blob, or operator home-path leakage |
+| `cg eval` | `[--offline-replay \| --pilot \| --release \| --cursor-conformance \| --ledger-verify \| --governor-check \| --hardening-check \| --conformance \| --platform-matrix] [--plan] [--runs-file <file>] [--output <file>] [--json \| --markdown]` | Markdown (default), JSON (`EvidenceContractV1` / `ConformanceContractV1` / `PlatformMatrixContractV1`) | `0` gate/report passed; `1` failed gate, verification error, or missing input file; `2` invalid flag combination (e.g., `--conformance --plan`) or unsafe symlink `--output` | Isolated temp-dir execution; zero live LLM calls or network traffic (`--output` enforces `check_unsafe_link` atomic writes) |
+| `cg export` | `--otel [--receipts-path <file>] [--ledger-path <file>] [--outcomes-path <file>] [--window-seconds <sec>] [--output <file>] [--ndjson] [--endpoint <url>] [--timeout <sec>] [--service-name <name>] [--json]` | OTLP/JSON (default), NDJSON (`--ndjson`), status JSON (`OTEL_EXPORT_SCHEMA_VERSION = 1`) | `0` exported; `1` source/write/HTTP failure; `2` missing `--otel`, invalid args, or `invalid_endpoint_scheme` | Strictly off-hot-path 100% stdlib exporter; reads local ledgers only unless `--endpoint http(s)://...` is explicitly supplied |
+| `cg status` | `[--short \| --claude-hud \| --markdown \| --json \| --public-json \| --outcomes \| --usage \| --doctor \| --replay \| --benchmark] [--stats-path <file>] [--outcomes-path <file>] [--usage-path <file>]` | Short status line (default), Markdown, JSON, scrubbed public JSON | `0` status/report rendered (`1` on failed `--doctor`, `--replay`, or `--benchmark`) | Read-only telemetry formatting (`--replay` and `--benchmark` run inside isolated temporary directories) |
+| `cg spool` | `<slice \| grep \| list \| gc \| mcp> [--workspace <dir>] [--session <id>] [--spool-dir <dir>] [--json]` | Human text (default), JSON (`--json`), or JSON-RPC 2.0 stdio (`mcp`) | `0` operation succeeded; `1` access denied, integrity/eviction error, or invalid `cg-spool` args | Enforces `samefile()` workspace isolation and off-lock SHA-256 verification on `slice`/`grep`; `gc` transitions `available -> evicting -> evicted` |
+| `cg outline` | `<file1> [<file2> ...]` | Line-numbered structural symbol outline (`L<start>-L<end>`) | `0` all files outlined; `1` missing arguments or missing file | Pure read-only AST / Tree-sitter / lexical symbol extraction |
+| `cg help` | `[budget \| doctor \| eval \| explain \| export \| status \| spool \| outline]` | Help text on `stdout` | `0` top-level or known subcommand help; `1` unknown subcommand (error on `stderr`) | Pure help delegation (`cg help <cmd>` forwards `["--help"]` to the target subcommand) |
+
+* **JSON invalid-argument invariant:** Across `cg doctor`, `cg budget`, `cg explain`, and `cg eval`, passing `--json` alongside invalid CLI flags emits `{"ok": false, "error": "invalid_arguments"}` on `stdout` and exits with code `2`.
+
+### 2. Frozen Policy API v1, Core Schema Registry & Deprecation Policy
+
+`v5.0.0` freezes **`POLICY_API_VERSION = 1`** and **`ADAPTER_CONTRACT_VERSION = "harness_adapter_v1"`** (`policies/api.py`, re-exported completely in `policies/__init__.py`).
+
+* **Why Policy API v2 is not created (`policy_api_v2_mandated = False`):** Policy API v1 (`PolicyDecision`, `PolicyContext`, `PolicyPostContext`, `PolicyPackManifest`, `ALL_SECURITY_SCOPES`, two-pass `reconcile_post_transform` security/optimization reconciliation, and `StagedPackTransaction` SHA-256 tree verification) satisfies every multi-harness security and optimization requirement without structural gaps. Bumping `POLICY_API_VERSION` to `2` solely to match the `v5.0.0` release tag would break verified policy packs for zero functional benefit.
+* **Why no external SDK is shipped (`external_sdk_shipped = False`):** `policies.api` is a compact, zero-dependency Python 3.9+ `stdlib` module with frozen `dataclass` and `TypedDict` contracts. Publishing a separate PyPI SDK package without external third-party pack ecosystem demand would introduce version-skew and packaging maintenance overhead while violating the roadmap's anti-bloat constraint.
+
+#### 17-Entry `CORE_SCHEMA_VERSIONS` Registry
+
+| `CORE_SCHEMA_VERSIONS` Key | Version | Source Constant | Governed Artifact / Public Contract |
+| :--- | :---: | :--- | :--- |
+| `"policy_api"` | `1` | `policies.api.POLICY_API_VERSION` | `PolicyPackManifest`, `PolicyContext`, `PolicyPostContext`, `PolicyDecision` |
+| `"read_ledger"` | `2` | `hooks.state_store.READ_LEDGER_SCHEMA` | Per-session `.context_guard_state.json` (`json_lock` backend) |
+| `"mutated_repos"` | `2` | `hooks.state_store.MUTATED_REPOS_SCHEMA` | Mutated repository tracking inside session state |
+| `"spool_index"` | `2` | `spool.store.SPOOL_SCHEMA_VERSION` | `spool_index.json` lifecycle states & eviction tombstones |
+| `"context_receipt"` | `1` | `policies.api.RECEIPT_SCHEMA_VERSION` | `ContextReceiptV1` rows in `receipts.jsonl` |
+| `"outcomes"` | `4` | `hooks.outcomes.SCHEMA_VERSION` | `outcomes.json` intervention/regret/attribution ledger |
+| `"token_usage"` | `3` | `bin.token_usage.USAGE_SCHEMA_VERSION` | `token_usage.json` per-harness/model transcript ledger |
+| `"event_ledger"` | `1` | `evidence.ledger.EVENT_LEDGER_SCHEMA_VERSION` | Deduplicated `evidence_events.json` durable event log |
+| `"evidence_report"` | `1` | `policies.api.EVIDENCE_SCHEMA_VERSION` | `EvidenceContractV1` offline/pilot/release evaluation output |
+| `"capability_contract"` | `1` | `policies.api.CAPABILITY_CONTRACT_SCHEMA_VERSION` | `CapabilityContractV1` & `CapabilityAttestationKey` records |
+| `"governor_state"` | `1` | `policies.api.GOVERNOR_SCHEMA_VERSION` | `GovernorContractV1` & `CircuitBreakerStateV1` state |
+| `"explain_report"` | `1` | `policies.api.EXPLAIN_SCHEMA_VERSION` | `ExplainContractV1` (`cg explain <event-id>`) |
+| `"otel_export"` | `1` | `policies.api.OTEL_EXPORT_SCHEMA_VERSION` | Scrubbed OTLP/JSON export bundle (`cg export --otel`) |
+| `"backend_benchmark"` | `1` | `policies.api.BACKEND_BENCHMARK_SCHEMA_VERSION` | `BackendBenchmarkContractV1` Read Ledger storage benchmark |
+| `"doctor_report"` | `1` | `policies.api.DOCTOR_SCHEMA_VERSION` | `cg doctor` JSON diagnostic envelope |
+| `"conformance_report"` | `1` | `policies.api.CONFORMANCE_SCHEMA_VERSION` | `ConformanceContractV1` (`cg eval --conformance`) |
+| `"platform_matrix"` | `1` | `policies.api.PLATFORM_MATRIX_SCHEMA_VERSION` | `PlatformMatrixContractV1` (`cg eval --platform-matrix`) |
+
+#### `DeprecationPolicyV1` Rules (`DEPRECATION_POLICY_VERSION = 1`)
+
+* **Advance notice (`min_deprecation_minor_releases = 2`):** Removing or renaming any public CLI flag, JSON contract key, or `policies.api` export requires at least `2` minor releases of advance deprecation notice (`active_deprecations = []` in `v5.0.0`).
+* **Additive evolution (`additive_fields_non_breaking = True`):** Adding optional fields to JSON reports or `TypedDict` contracts is non-breaking within the same schema major version; consumers must ignore unrecognized keys.
+* **Unknown major policy pack fail-closed (`unknown_major_policy_pack_behavior = "reject_fail_closed"`):** A policy pack declaring `api_version != 1` (e.g., `2` or `99`) raises `PolicyPackLoadError` during `StagedPackTransaction.validate()`, removes `.staging-*`, and leaves `config.json` byte-for-byte untouched. Post-activation byte tampering of an active `security` pack triggers `PolicyPackLoadError` in the loader and enforces Stage-2 scoped fail-closed `deny` for tools within the pack's `scopes` while allowing out-of-scope reads.
+* **Telemetry store resilience (`corrupt_or_future_telemetry_store_behavior = "quarantine_or_passthrough_zero_crash"`):** Corrupt JSON or unrecognized future `schema_version` values in `.context_guard_state.json`, `outcomes.json`, `spool_index.json`, or `token_usage.json` fall back to empty/quarantined state or raw passthrough with zero hook crashes.
+
+### 3. Published 4-Harness Capability & Limitation Matrix (`PlatformMatrixContractV1`)
+
+Boolean capability flags in `PlatformMatrixContractV1` derive directly from `HARNESS_OUTPUT_CAPABILITIES` (`policies/api.py`) and runtime probes in `hooks/harness_adapter.py`, guaranteeing zero drift between documentation and runtime enforcement.
+
+| Dimension | Claude Code (`claude`) | Cursor (`cursor`) | OpenAI Codex (`codex`) | Google Antigravity (`antigravity`) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Config & hook surfaces** | `~/.claude/settings.json`, `statusLine` HUD | `~/.cursor/hooks.json`, `~/.cursor/mcp.json`, VS Code statusbar ext | `~/.codex/hooks.json`, `~/.codex/config.toml` (`[features].hooks = true`) | `plugin.json`, `hooks.json`, IDE statusbar ext |
+| **Lifecycle hooks wired** | `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PostToolBatch`, `PreCompact`, `SessionEnd` | `preToolUse`, `postToolUse`, `preCompact` | `PreToolUse`, `PostToolUse`, `PreCompact` | `PreInvocation`, `PreToolUse`, `PostToolUse` |
+| **`can_replace_tool_output`** | `True` (`PostToolUse` payload replacement) | `False` | `False` | `False` |
+| **`has_native_fail_closed_hook`** | `True` (`"onFailure": "block"` on CLI `>= 2.1.295`; `False` below `2.1.295`) | `True` (`"failClosed": true`) | `False` (blocks via `PreToolUse` `deny` / `exit 2`) | `False` (blocks via `PreToolUse` `decision="deny"` / `exit 2`) |
+| **`supports_apply_patch_block`** | `True` | `True` | `False` (built-in `apply_patch` bypasses `PreToolUse`) | `True` |
+| **`supports_content_verified_reads`** | `True` (`PostToolBatch` / `PostToolUse` body verification) | `True` (`postToolUse` read confirmation) | `False` | `False` |
+| **`range_trim` (`"strict"` vs `"bounded"`)** | Active under default `"strict"` (verified reads) | Active under default `"strict"` (verified reads) | `0` trims under default `"strict"`; requires explicit `"bounded"` opt-in | `0` trims under default `"strict"`; requires explicit `"bounded"` opt-in |
+| **`output_spool` delivery** | Inline `PostToolUse` `Bash`/`mcp__*` replacement (`updatedToolOutput`) + `PostToolBatch` `delivery_verified` + `cg-spool` CLI | No in-band `Shell` replacement (`"shadow"` projection; `updated_mcp_tool_output` on MCP calls) + `cursor_spool_mcp` (`cg-spool mcp` stdio) & `cg-spool` CLI (`shadow_or_mcp_cli_only_no_post_tool_replacement`) | Unsupported in-band (`unsupported_no_post_tool_replacement`: `"active"` governor-gated to `"passthrough"`, `"shadow"` projects in-memory, `cg-spool` CLI reads existing workspace spools) | Unsupported in-band (`unsupported_no_post_tool_replacement`: `"active"` governor-gated to `"passthrough"`, `"shadow"` projects in-memory, `cg-spool` CLI reads existing workspace spools) |
+| **CLI rewrite permission gate** | Allowed only in `AUTO_APPROVED_PERMISSION_MODES` (`bypassPermissions`, `dontAsk`, `auto`) | Allowed only in `AUTO_APPROVED_PERMISSION_MODES` (`bypassPermissions`, `dontAsk`, `auto`) | Disabled (`False`) to preserve interactive command-approval prompt integrity | Enabled (`True`) on `run_command` |
+| **Cache telemetry availability** | Measured (`cache_read`, `cache_creation`, fresh tokens; CLI vs Desktop `mcp:ccd_*` split) | `excluded_missing_telemetry` on Cursor CLI (granular cache split absent; never coerced to `0`) | Measured from local Codex session logs (`cached_input_tokens`) | Measured from local Antigravity trajectory logs |
+| **`turn_correlation` ceiling** | `transcript_derived` (`harness_native` when `turn_id` present; `unobserved` without transcript) | `transcript_derived` (`harness_native` when `turn_id` present; `unobserved` without transcript) | `transcript_derived` (`harness_native` when `turn_id` present; `unobserved` without transcript) | `harness_native` (`stepIdx > 0` in hook payload) |
+
+#### Critical Per-Harness Guarantees & Documented Limitations
+
+* **Claude Code (`claude`):** Full `PostToolUse` output replacement and `PostToolBatch` delivery verification (`delivery_verified`); CLI vs Desktop (`mcp:ccd_*`) session attribution stays segregated. **Limitation:** Native `"onFailure": "block"` requires Claude CLI `>= 2.1.295`; older versions degrade `native_fail_closed_supported` to `False` in `probe_runtime_capabilities()` and surface a warning in `cg doctor`. Silent CLI flag rewrites stay off in interactive permission modes.
+* **Cursor (`cursor`):** Native `"failClosed": true` hook enforcement and content-verified reads under `"strict"` policy. **Limitation:** `postToolUse` cannot replace `Shell` tool output in-band (`can_replace_tool_output == False`, leaving `"shadow"` projection for shell and `updated_mcp_tool_output` for MCP calls, with recovery via workspace-pinned `cursor_spool_mcp` stdio or `cg-spool` CLI); Cursor CLI lacks granular prompt-cache read/write counters and reports `cache_attribution_status = "excluded_missing_telemetry"` rather than fabricating `0`.
+* **Google Antigravity (`antigravity`):** Native `stepIdx` (`harness_native` turn correlation), `PreInvocation` `O(delta)` (`80`/`200`-step) compaction warnings, and `PreToolUse` security blocking (`decision="deny"`). **Limitation:** Neither `PostToolUse` output replacement nor content-verified read bodies are exposed (`supports_content_verified_reads == False`); default `"read_confirm_policy": "strict"` intentionally produces `0` `range_trim` interventions as a safety guarantee unless `"bounded"` is explicitly configured.
+* **OpenAI Codex (`codex`):** `PreToolUse` Read/Bash normalization, `PreCompact` state preservation, and `PostToolUse` shell telemetry. **Limitation:** Built-in `apply_patch` file mutations bypass `PreToolUse` (`supports_apply_patch_block == False`); hooks execute only when `[features].hooks = true` is set in `~/.codex/config.toml` and the repository directory is trusted in Codex (`Codex trust / #27833`); silent CLI flag rewrites are disabled so user approval prompts always match the exact executed command.
+
+### 4. Backward-Compatible Migrations & Operational Rollback Paths
+
+#### Backward-Compatible Store & Schema Migrations (`backward_compatible_migrations`)
+
+| Migration ID | Store / Artifact | Upgrade Path & Failure-Safe Behavior |
+| :--- | :--- | :--- |
+| `read_ledger_v1_to_v2` | `.context_guard_state.json` | Automatically upgrades `schema_version: 1` -> `READ_LEDGER_SCHEMA = 2` on access via `state_store.locked_state` while retaining the `json_lock` backend; corrupt JSON resets cleanly to an empty ledger without hook failure. |
+| `outcomes_v3_to_v4` | `outcomes.json` | `outcomes.load_outcomes()` migrates historical `schema_version: 3` files in memory to `SCHEMA_VERSION = 4`, preserving all counters and setting `legacy_v3 = True`. |
+| `spool_index_v1_to_v2` | `spool_index.json` | Upgrades legacy/missing state metadata to `SPOOL_SCHEMA_VERSION = 2` monotonic states (`available`, `evicting`, `evicted`, `corrupt`) and bounded tombstones; missing or corrupted payload blobs report `unexpectedly_missing` / `corrupt` via `inspect_spool_entry()` without raising exceptions. |
+| `token_usage_legacy_to_v3` | `token_usage.json` | `token_usage.restore_usage_state()` normalizes legacy usage ledgers and sanitizes malformed inner rows into `USAGE_SCHEMA_VERSION = 3`. |
+| `receipts_to_evidence_ledger_v1` | `receipts.jsonl` -> `evidence_events.json` | `cg eval --ledger-verify` deduplicates `ContextReceiptV1` (`schema_version = 1`) streams into durable `evidence_events.json` (`EVENT_LEDGER_SCHEMA_VERSION = 1`) for deterministic Outcomes v4 derivation with zero double-counting. |
+
+#### Operational Rollback Paths (`rollback_paths`) & Recovery Commands
+
+| Rollback Path ID | Mechanism | Exact Scope & Guarantee |
+| :--- | :--- | :--- |
+| `staged_pack_transaction_rollback` | `StagedPackTransaction` (`bin/migration_guard.py`) | Stages `*.py` into `.staging-<pack_id>-<pid>`, validates SHA-256 hashes, `POLICY_API_VERSION == 1`, and `preflight_migration_check()` before touching live files; validation or activation failure removes `.staging-*` and restores `config.json` + `policies/<pack_id>` atomically. |
+| `rollback_journal_lifo` | `RollbackJournal` (`bin/migration_guard.py`) | Records pre-mutation file bytes/permissions (`0o600`), directory swaps, and staged directory removals; reverts every operation in strict LIFO order on exception or `--dry-run`. |
+| `ide_updater_git_reset_keep` | `executeManagedUpdate` (`vscode-extension/updater.js`) | Refuses dirty working trees, records `prevHead`, runs `git fetch` + `git merge --ff-only v<latest>` + `install_harnesses.py --install`, and automatically runs `git -C <plugin_root> reset --keep <prevHead>` if any step fails. |
+| `install_harnesses_uninstall` | `python3 bin/install_harnesses.py --uninstall` | Idempotently removes Context-Guard hooks, `statusLine`, `cursor_spool_mcp`, IDE statusbar extensions, CLI shims (`cg`, `cg-outline`, `cg-spool`, `cg-budget`, `cg-eval`), and managed `outline-pull` instruction blocks while preserving unrelated user hooks. |
+| `git_tag_checkout_reinstall` | Git tag checkout + installer re-sync | Downgrades runtime code, shims, and harness configs cleanly to the prior release: `git -C ~/.gemini/config/plugins/context-guard checkout v4.9.0 && python3 ~/.gemini/config/plugins/context-guard/bin/install_harnesses.py --install`. |
+
+* **Automated 10-Gate Conformance Verification (`cg eval --conformance`):** Multi-OS CI continuously verifies `policy_api_v1_frozen`, `core_schema_versions_synced`, `capability_matrix_complete_and_honest`, `adapter_conformance_4_harnesses`, `baseline_security_pack_conformance`, `baseline_optimization_pack_reconciliation`, `tamper_and_unknown_major_fail_closed`, `backward_compatible_migrations_ok`, `rollback_paths_verified`, and `effectiveness_and_limitations_published`.
+
+### 5. Published Effectiveness Evidence & Methodological Limitations
+
+Context-Guard separates deterministic mechanism verification from live stochastic LLM evaluation so token-reduction counters are never misrepresented as causal billing or pass-rate proof.
+
+| Evidence Tier / Command | What It Proves | Explicit Methodological Limitations |
+| :--- | :--- | :--- |
+| **Deterministic Offline Replay** (`cg_status.py --replay`, `cg eval --offline-replay`, `--governor-check`, `--hardening-check`, `--conformance`) | Proves deterministic multi-harness hook decisions (`outline`, `range_trim`, `cli_rewrite`, `output_spool`, security `deny`), SHA-256 spool integrity, Adaptive Governor circuit-breaker invariants, scrubbed explainability/OTel export, and 10-gate platform conformance in isolated temp directories. | Carries **`statistical_proof = false`**. Offline replay evaluates a fixed synthetic tool-call corpus and **does not** simulate multi-turn LLM reasoning trajectories, model retry behavior, prompt-cache TTL dynamics, or autonomous `cg-spool` recovery choices. |
+| **Latency & Storage Backend Benchmark** (`cg_status.py --benchmark`, `BackendBenchmarkContractV1`) | Measures cold/warm hook latency percentiles (`min`, `p50`, `p95`, `p99`) and verifies Read Ledger v2 `json_lock` stays within `p95`/`p99` budgets (`decision = "retain_json_lock"`, `migration_performed = False`), benchmarking `sqlite_wal` and `segmented_jsonl` only when thresholds are exceeded or forced. | Reflects local OS file-locking and filesystem serialization overhead on synthetic ledgers rather than end-to-end LLM API network latency. |
+| **Small Live Pilot** (`cg eval --pilot`, `small_live_pilot`: `6 tasks x 2 configs x 3 repeats = 36 runs`) | Provides a fast, workspace-isolated live smoke gate to catch gross pass-rate drops, broken recovery loops, or runaway turn amplification before full evaluation. | Sample size (`36` runs) is underpowered for narrow confidence intervals and is a regression gate, **not** statistical proof of net cost reduction. |
+| **Release Evaluation** (`cg eval --release`, `release_evaluation`: `12-15 tasks x 3 configs x 2 repeats = 72-90 runs/harness`) | Measures **`Cost per Passed Run`** (`total_cost_usd_all_attempts / passed_runs`, `undefined` at `0` passes) across Baseline, Context-Guard, and Context-Guard + RTK with Wilson pass-rate intervals, bootstrap CIs, and pinned `CapabilityAttestationKey` provenance. | Results hold strictly for the attested `(harness_id, harness_build_id, adapter_version, hook_config_fingerprint, model_id)` tuple and task distribution; upgrading the harness CLI or changing models invalidates prior capability/cost claims. |
+| **Observational Outcomes Attribution** (`cg_status.py --outcomes`, `outcomes.json` v4) | Tracks live per-harness/model intervention counts, targeted vs. full spool recovery, `suspected` vs. `confirmed` regret, 30-day `sunset_verdict`, and `Est. associated model cost`. | **`Estimated Cost Impact` is observational `1/k` step-weighted transcript attribution, never causal counterfactual A/B proof.** Failed attempts (`failed_attempt`) and endogenous prompt-cache `TTL cache misses` are **never** excluded from `Cost per Passed Run`, and missing telemetry (e.g., Cursor CLI `excluded_missing_telemetry`) is never reported as `0`. |

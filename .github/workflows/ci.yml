@@ -76,6 +76,12 @@ jobs:
       - name: Run explainability and hardening gate smoke check
         run: python bin/cg.py eval --hardening-check --json
 
+      - name: Run cohesive doctor contract smoke check
+        run: python bin/cg.py doctor --contracts --json
+
+      - name: Run platform conformance smoke check
+        run: python bin/cg.py eval --conformance --json
+
       - name: Run release hygiene check
         run: python -c "from bin.replay_benchmark import check_release_hygiene; issues = check_release_hygiene(); assert not issues, issues"
 

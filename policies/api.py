@@ -391,19 +391,116 @@ class BackendBenchmarkContractV1(TypedDict):
     alternatives: dict[str, dict[str, Any]]
 
 
+DOCTOR_SCHEMA_VERSION: int = 1
+CONFORMANCE_SCHEMA_VERSION: int = 1
+PLATFORM_MATRIX_SCHEMA_VERSION: int = 1
+DEPRECATION_POLICY_VERSION: int = 1
+MIN_DEPRECATION_MINOR_RELEASES: int = 2
+SUPPORTED_HARNESS_IDS: tuple[str, ...] = ("antigravity", "claude", "cursor", "codex")
+CORE_SCHEMA_VERSIONS: dict[str, int] = {
+    "policy_api": POLICY_API_VERSION,
+    "read_ledger": 2,
+    "mutated_repos": 2,
+    "spool_index": 2,
+    "context_receipt": RECEIPT_SCHEMA_VERSION,
+    "outcomes": 4,
+    "token_usage": 3,
+    "event_ledger": 1,
+    "evidence_report": EVIDENCE_SCHEMA_VERSION,
+    "capability_contract": CAPABILITY_CONTRACT_SCHEMA_VERSION,
+    "governor_state": GOVERNOR_SCHEMA_VERSION,
+    "explain_report": EXPLAIN_SCHEMA_VERSION,
+    "otel_export": OTEL_EXPORT_SCHEMA_VERSION,
+    "backend_benchmark": BACKEND_BENCHMARK_SCHEMA_VERSION,
+    "doctor_report": DOCTOR_SCHEMA_VERSION,
+    "conformance_report": CONFORMANCE_SCHEMA_VERSION,
+    "platform_matrix": PLATFORM_MATRIX_SCHEMA_VERSION,
+}
+
+
+class DeprecationPolicyV1(TypedDict):
+    """Schema v1 Policy API v1 freeze, schema deprecation, migration, and rollback policy."""
+
+    schema_version: int
+    policy_api_version: int
+    policy_api_v2_mandated: bool
+    external_sdk_shipped: bool
+    min_deprecation_minor_releases: int
+    additive_fields_non_breaking: bool
+    unknown_major_policy_pack_behavior: str
+    corrupt_or_future_telemetry_store_behavior: str
+    backward_compatible_migrations: list[str]
+    rollback_paths: list[str]
+    active_deprecations: list[str]
+
+
+class HarnessCapabilityMatrixRowV1(TypedDict):
+    """Schema v1 verified capability and limitation contract row for one supported harness."""
+
+    harness_id: str
+    display_name: str
+    config_surfaces: list[str]
+    lifecycle_hooks: list[str]
+    can_replace_tool_output: bool
+    has_native_fail_closed_hook: bool
+    supports_apply_patch_block: bool
+    supports_content_verified_reads: bool
+    default_range_trim_mode: str
+    output_spool_delivery: str
+    cli_rewrite_gate: str
+    cache_telemetry: str
+    turn_correlation_ceiling: str
+    verified_guarantees: list[str]
+    documented_limitations: list[str]
+
+
+class PlatformMatrixContractV1(TypedDict):
+    """Schema v1 4-harness capability & limitation matrix, schema registry, and effectiveness contract."""
+
+    schema_version: int
+    policy_api_version: int
+    adapter_contract_version: str
+    core_schema_versions: dict[str, int]
+    harnesses: dict[str, HarnessCapabilityMatrixRowV1]
+    deprecation_policy: DeprecationPolicyV1
+    effectiveness_summary: dict[str, Any]
+
+
+class ConformanceContractV1(TypedDict):
+    """Schema v1 10-gate platform conformance report covering adapters, policy packs, migrations, and rollback."""
+
+    schema_version: int
+    ok: bool
+    checked_at: str
+    policy_api_version: int
+    adapter_contract_version: str
+    core_schema_versions: dict[str, int]
+    harnesses_checked: list[str]
+    adapter_conformance: dict[str, dict[str, Any]]
+    baseline_policy_pack_conformance: dict[str, Any]
+    migration_and_rollback_conformance: dict[str, Any]
+    platform_matrix: PlatformMatrixContractV1
+    gates: dict[str, bool]
+    gates_passed: int
+    gates_total: int
+    failed_gates: list[str]
+
+
 __all__ = [
     "ADAPTER_CONTRACT_VERSION", "ALL_SECURITY_SCOPES", "BACKEND_BENCHMARK_SCHEMA_VERSION",
-    "BackendBenchmarkContractV1", "CAPABILITY_CONTRACT_SCHEMA_VERSION", "CapabilityAttestationKey",
-    "CapabilityContractV1", "CapabilityRequirementV1", "CircuitBreakerStateV1",
-    "ContextReceiptV1", "EVIDENCE_SCHEMA_VERSION", "EXPLAIN_SCHEMA_VERSION",
-    "EvidenceContractV1", "EvidenceEnvironmentMetadataV1", "ExplainContractV1",
-    "GOVERNOR_SCHEMA_VERSION", "GovernorContractV1", "HARD_INTEGRITY_FAILURE_REASONS",
-    "HARNESS_OUTPUT_CAPABILITIES", "HarnessOutputCapabilities", "InstallerHookSpec",
-    "NON_TRIPPING_SIGNALS", "OTEL_EXPORT_SCHEMA_VERSION", "OptimizerDecisionV1",
-    "POLICY_API_VERSION", "PolicyContext", "PolicyDecision",
-    "PolicyPackManifest", "PolicyPostContext", "RECEIPT_SCHEMA_VERSION",
-    "RuntimeCapabilities", "SpoolContractV1", "VALID_BREAKER_STATES",
-    "VALID_CAPABILITY_EVIDENCE_LEVELS", "VALID_DELIVERY_EVIDENCE_TIERS", "VALID_EVAL_TIERS",
-    "VALID_EXPLAIN_STATES", "VALID_GOVERNOR_MODES", "VALID_POLICY_KINDS",
-    "VALID_POLICY_MODES", "VALID_RUN_OUTCOME_CLASSES", "VALID_TURN_CORRELATIONS",
+    "BackendBenchmarkContractV1", "CAPABILITY_CONTRACT_SCHEMA_VERSION", "CONFORMANCE_SCHEMA_VERSION",
+    "CORE_SCHEMA_VERSIONS", "CapabilityAttestationKey", "CapabilityContractV1", "CapabilityRequirementV1",
+    "CircuitBreakerStateV1", "ConformanceContractV1", "ContextReceiptV1", "DEPRECATION_POLICY_VERSION",
+    "DOCTOR_SCHEMA_VERSION", "DeprecationPolicyV1", "EVIDENCE_SCHEMA_VERSION", "EXPLAIN_SCHEMA_VERSION",
+    "EvidenceContractV1", "EvidenceEnvironmentMetadataV1", "ExplainContractV1", "GOVERNOR_SCHEMA_VERSION",
+    "GovernorContractV1", "HARD_INTEGRITY_FAILURE_REASONS", "HARNESS_OUTPUT_CAPABILITIES",
+    "HarnessCapabilityMatrixRowV1", "HarnessOutputCapabilities", "InstallerHookSpec",
+    "MIN_DEPRECATION_MINOR_RELEASES", "NON_TRIPPING_SIGNALS", "OTEL_EXPORT_SCHEMA_VERSION",
+    "OptimizerDecisionV1", "PLATFORM_MATRIX_SCHEMA_VERSION", "POLICY_API_VERSION",
+    "PlatformMatrixContractV1", "PolicyContext", "PolicyDecision", "PolicyPackManifest",
+    "PolicyPostContext", "RECEIPT_SCHEMA_VERSION", "RuntimeCapabilities", "SUPPORTED_HARNESS_IDS",
+    "SpoolContractV1", "VALID_BREAKER_STATES", "VALID_CAPABILITY_EVIDENCE_LEVELS",
+    "VALID_DELIVERY_EVIDENCE_TIERS", "VALID_EVAL_TIERS", "VALID_EXPLAIN_STATES",
+    "VALID_GOVERNOR_MODES", "VALID_POLICY_KINDS", "VALID_POLICY_MODES",
+    "VALID_RUN_OUTCOME_CLASSES", "VALID_TURN_CORRELATIONS",
 ]

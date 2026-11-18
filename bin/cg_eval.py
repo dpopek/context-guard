@@ -15,6 +15,12 @@ _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 if str(_PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(_PACKAGE_ROOT))
 
+from evidence.conformance import (  # noqa: E402
+    build_capability_limitation_matrix,
+    render_conformance_markdown,
+    render_platform_matrix_markdown,
+    run_platform_conformance_suite,
+)
 from evidence.ledger import (  # noqa: E402
     DEFAULT_EVENT_LEDGER_FILENAME,
     derive_outcomes_from_ledger,
@@ -131,6 +137,10 @@ def _render_hardening_markdown(res: Mapping[str, Any]) -> str:
 
 def render_evidence_markdown(report: Mapping[str, Any]) -> str:
     """Format an Evidence Engine contract, plan, conformance, governor, hardening, or ledger report as Markdown."""
+    if "adapter_conformance" in report or "migration_and_rollback_conformance" in report:
+        return render_conformance_markdown(report)
+    if "deprecation_policy" in report and "harnesses" in report:
+        return render_platform_matrix_markdown(report)
     if "run_specs" in report and "matrix" in report:
         return _render_plan_markdown(report)
     if "admitted" in report and "checks" in report and report.get("harness_id") == "cursor":
@@ -219,6 +229,8 @@ def _build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--ledger-verify", action="store_true", help="Verify/ingest durable event ledger and derive Outcomes v4.")
     mode.add_argument("--governor-check", action="store_true", help="Replay Adaptive Governor capability, breaker, and security invariants.")
     mode.add_argument("--hardening-check", action="store_true", help="Run 8-gate explainability, off-hot-path OTel, benchmark, and hardening check.")
+    mode.add_argument("--conformance", action="store_true", help="Run 10-gate platform, adapter, policy-pack, migration, and rollback conformance suite.")
+    mode.add_argument("--platform-matrix", action="store_true", help="Emit verified 4-harness capability, limitation, schema, and effectiveness matrix.")
     parser.add_argument("--plan", action="store_true", help="Emit isolated campaign plan without running external LLMs.")
     parser.add_argument("--runs-file", type=Path, default=None, help="JSON file of isolated campaign runs to evaluate.")
     parser.add_argument("--outcomes-baseline", type=Path, default=None, help="Optional Outcomes v4 JSON baseline for --ledger-verify.")
@@ -355,6 +367,22 @@ def main(argv: list[str] | None = None) -> int:
         if (err_rc := _emit_report(res, ns)) is not None:
             return err_rc
         return 0 if res.get("ok") else 1
+
+    if ns.conformance:
+        if ns.runs_file is not None or ns.plan:
+            return _emit_error("invalid_arguments", "--conformance cannot be combined with --plan or --runs-file", as_json)
+        conf_res = run_platform_conformance_suite()
+        if (err_rc := _emit_report(conf_res, ns)) is not None:
+            return err_rc
+        return 0 if conf_res.get("ok") else 1
+
+    if ns.platform_matrix:
+        if ns.runs_file is not None or ns.plan:
+            return _emit_error("invalid_arguments", "--platform-matrix cannot be combined with --plan or --runs-file", as_json)
+        mat_res = build_capability_limitation_matrix(include_live_effectiveness=True)
+        if (err_rc := _emit_report(mat_res, ns)) is not None:
+            return err_rc
+        return 0
 
     tier = "small_live_pilot" if ns.pilot else ("release_evaluation" if ns.release else "offline_replay")
     if ns.plan and ns.runs_file is not None:

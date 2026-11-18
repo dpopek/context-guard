@@ -28,13 +28,15 @@ If Context-Guard is cloned outside `~/.gemini/config/plugins/context-guard`, run
    ```
    Review the v4 (`SCHEMA_VERSION = 4`) 10-column breakdown: `Harness`, `Model`, `Kind`, `Interventions`, `Targeted recovery`, `Full recovery`, `Suspected regret`, `Confirmed regret`, `Weighted steps`, and `Est. associated model cost` (bounded non-counterfactual `1/k` step-weighted attribution). Note regret/attribution telemetry fields (`confirmed_regret_rate`, `suspected_regret_rate`, `unattributed_anon`, `late_unattributed`), 30-day `sunset_verdict` (`net_saved`), and default `"strict"` `read_confirm_policy` asymmetry (`0` `range_trim` savings on Antigravity/Codex unless `"bounded"`).
 
-3. **Run Environment & Security Doctor:**
+3. **Run Environment, Security & Contract Doctor (`cg doctor`):**
    ```bash
    python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg_status.py" --doctor
+   python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg.py" doctor --contracts --json
    ```
    Verify:
    - Python runtime (`>= 3.9`), file locking (`flock`), writable telemetry directory, and harness registration (`antigravity`, `claude`, `cursor`, `codex`).
    - Native fail-closed security sync (`NATIVE_FAIL_CLOSED_DRIFT`, `degraded Claude < 2.1.295`, and `Codex trust / #27833`).
+   - Frozen `POLICY_API_VERSION = 1`, 17-entry `core_schema_versions` registry, `deprecation_policy`, and 4-harness `capability_matrix` summary via `cg.py doctor --contracts --json`.
    - **Skill hygiene:** Report any duplicate skill names detected within `.gemini` or `.claude` ecosystems.
 
 4. **Deterministic Replay, Benchmark & Public JSON (`replay_benchmark.py`):**
@@ -54,15 +56,18 @@ If Context-Guard is cloned outside `~/.gemini/config/plugins/context-guard`, run
    - Always-on instruction, memory-index, and skill bytes, duplicate skills, MCP tool overlaps, and non-mutating `minimal-core` / `full-integrations` profiles (note prompt-cache `cache_read` caveats).
    - Use opt-in `--mcp --probe --probe-timeout 3` only when live local stdio `tools/list` schema probing is explicitly requested.
 
-6. **Evidence Engine & Hardening Gate (`cg eval`):**
+6. **Evidence Engine, Hardening & Platform Conformance (`cg eval`):**
    ```bash
    python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg.py" eval --offline-replay
    python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg.py" eval --cursor-conformance
    python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg.py" eval --governor-check
    python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg.py" eval --hardening-check
+   python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg.py" eval --conformance
+   python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg.py" eval --platform-matrix
    ```
    Review:
    - Deterministic `EvidenceContractV1` offline replay (zero network or live LLM spawns), `CapabilityAttestationKey` provenance, Cursor CLI conformance (`excluded_missing_telemetry` cache handling), 8-gate Adaptive Governor verification (`--governor-check`), and 8-gate explainability, off-hot-path OTel, benchmark, and safe-migration hardening verification (`--hardening-check`).
+   - 10-gate platform conformance (`--conformance`: frozen Policy API v1, 17-entry `CORE_SCHEMA_VERSIONS` sync, 4-harness adapter conformance, baseline security/optimization policy-pack reconciliation, tamper/unknown-major fail-closed checks, store migrations, and LIFO rollback paths) plus the published 4-harness capability, limitation, and effectiveness matrix (`--platform-matrix`).
    - Use `--pilot --plan`, `--release --plan`, or `--ledger-verify` to plan isolated campaigns or verify durable `evidence_events.json` Outcomes v4 derivation.
 
 7. **Intervention Explainability & Off-Hot-Path OTel Export (`cg explain` / `cg export`):**

@@ -1,8 +1,8 @@
-# Context-Guard (v4.9.0)
+# Context-Guard (v5.0.0)
 
-Zero-prompt Policy API v1 host, Read Ledger v2 (`range_trim`), reversible output spooler, artifact unwrapper, budget advisor, Evidence Engine, Adaptive Governor, and off-hot-path OTel exporter for **Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex** (`macOS`, `Linux`, `Windows`).
+Zero-prompt Policy API v1 reliability platform, Read Ledger v2 (`range_trim`), reversible output spooler, artifact unwrapper, budget advisor, Evidence Engine, Adaptive Governor, and off-hot-path OTel exporter for **Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex** (`macOS`, `Linux`, `Windows`).
 
-Pure Python 3.9+ stdlib: `cg-outline` (21 extensions, optional `tree-sitter-language-pack`), `policy_packs`, `cg-spool`, Outcomes v4, `cg budget`, `cg eval`, `cg explain`, and `cg export --otel`.
+Pure Python 3.9+ stdlib: `cg-outline` (21 extensions, optional `tree-sitter-language-pack`), `policy_packs`, `cg-spool`, Outcomes v4, `cg doctor`, `cg budget`, `cg eval`, `cg explain`, and `cg export --otel`.
 
 ---
 
@@ -66,9 +66,10 @@ Trims noisy test/grep boilerplate unless explicit verbosity flags (`-v`/`--verbo
 - **Recovery & GC:** Stores `sp_<12hex>.txt` (`24h` TTL, `64` entries, `32 MB`) across `available`/`evicting`/`evicted`/`corrupt`; verifies SHA-256 and unlinks unlocked.
 - **Scoped Access:** `cg-spool` (`--workspace`/`--workspace-root`, `--session`) and MCP (`roots/list` + `--workspace-root`) enforce `os.path.samefile()` and emit `ContextReceiptV1`.
 
-### 6. Evidence, Governor, Explainability & Hardening (`evidence/`, `bin/cg_explain.py`, `bin/cg_export.py`)
+### 6. Evidence, Governor, Hardening & Platform Conformance (`evidence/`, `bin/cg_explain.py`, `bin/cg_export.py`)
 - **Ledger & Governor:** Deduplicates `evidence_events.json`, derives Outcomes v4, emits `EvidenceContractV1`/`CapabilityAttestationKey`, gates Cursor CLI, and trips hysteresis breakers.
 - **Explain, OTel & Hardening:** `cg explain <event-id>` inspects lifecycles/evictions (`ExplainContractV1`); `cg export --otel` emits off-hot-path stdlib OTLP/JSON; `--hardening-check` verifies 8 gates.
+- **Frozen Platform & Conformance:** Freezes `POLICY_API_VERSION = 1` (no v2/SDK) + 17 `CORE_SCHEMA_VERSIONS`; `cg doctor --contracts` and `cg eval --conformance` / `--platform-matrix` verify 10 gates.
 
 ---
 
@@ -80,7 +81,7 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 
 | Module | Layer | Responsibility |
 | :--- | :--- | :--- |
-| `policies/api.py` | Policy | `POLICY_API_VERSION = 1`, `SpoolContractV1`, `ContextReceiptV1`, `EvidenceContractV1`, `ExplainContractV1`. |
+| `policies/api.py` | Policy | `POLICY_API_VERSION = 1`, `CORE_SCHEMA_VERSIONS`, `DeprecationPolicyV1`, `ConformanceContractV1`, `ExplainContractV1`. |
 | `policies/governor.py` | Policy | Capability-aware governor (`CapabilityAttestationKey`, hysteresis breakers, `replay_governor_decisions`). |
 | `policies/loader.py` | Policy | Verified pack loader (`file_hashes`, `tree_sha256` byte checks). |
 | `integrations/atlassian_twg.py` | Integration | Opt-in CLI rewriter and JSON stdout summarizer (`"atlassian_twg": "active"`). |
@@ -91,6 +92,7 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 | `evidence/ledger.py` | Evidence | Deduplicated `evidence_events.json`, Outcomes v4 derivation, attestation keys, Cursor gate. |
 | `evidence/metrics.py` | Evidence | `Cost per Passed Run`, noise guard, Wilson/bootstrap CIs, Pilot/Release matrix planner. |
 | `evidence/runner.py` | Evidence | Campaign controls, isolated executor, offline replay, 8-gate `run_explainability_hardening_gate`. |
+| `evidence/conformance.py` | Evidence | 4-harness capability matrix, deprecation policy, 10-gate conformance suite. |
 | `hooks/policy_engine.py` | Hooks | Evaluates verified packs, Pass-2 fallbacks, lifecycle dispatch. |
 | `hooks/pre_tool_use.py` | Hooks | Policy API v1 passes, `range_trim`, CLI rewrites, regret tracking, telemetry. |
 | `hooks/pre_invocation.py` | Hooks | Antigravity incremental `O(delta)` transcript scanner and auto-compact sensor. |
@@ -111,8 +113,8 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 | `hooks/outcomes.py` | Telemetry | `O(1)` Outcomes v4 (`outcomes.json`) for `output_spool`, `cli_rewrite`, `range_trim`. |
 | `hooks/shell_output.py` | Telemetry | Extracts shell stdout/stderr, classifies command families, updates `stats.json`. |
 | `hooks/model_identity.py` | Telemetry | Canonical model slugs (Antigravity, Claude, Codex) and `model_labels` overrides. |
-| `bin/cg.py` | CLI | Unified `cg` dispatcher (`budget`, `doctor`, `eval`, `explain`, `export`, `status`, `spool`, `outline`). |
-| `bin/cg_eval.py` | CLI | Evidence Engine CLI (`cg-eval`) for replay, plans, conformance, governor, `--hardening-check`. |
+| `bin/cg.py` | CLI | Unified `cg` dispatcher (`budget`, `doctor`, `eval`, `explain`, `export`, `status`, `spool`, `outline`, `help`). |
+| `bin/cg_eval.py` | CLI | Evidence Engine CLI (`cg-eval`) for replay, `--conformance`, `--platform-matrix`, governor, `--hardening-check`. |
 | `bin/cg_explain.py` | CLI | Scrubbed intervention explainer (`cg explain <event-id>`) across receipts, spools, and ledger. |
 | `bin/cg_export.py` | CLI | Off-hot-path stdlib OTLP/JSON exporter (`cg export --otel`, `--ndjson`, `--endpoint`). |
 | `bin/cg_budget.py` | CLI | Budget Advisor CLI (`cg-budget`) for `--preamble`, `--mcp`, `--recommendations`, `--probe`. |
@@ -147,47 +149,48 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 Clone anywhere (`~/.gemini/config/plugins/context-guard` for Antigravity; `CONTEXT_GUARD_HOME` overrides):
 
 ```bash
-CG_DIR=~/tools/context-guard  # or unpack dist/context-guard-v4.9.0.zip
+CG_DIR=~/tools/context-guard  # or unpack dist/context-guard-v5.0.0.zip
 git clone https://github.com/dpopek/context-guard.git "$CG_DIR"
-python3 "$CG_DIR/bin/install_harnesses.py" --install  # hooks + advox.context-guard-statusbar-4.9.0
+python3 "$CG_DIR/bin/install_harnesses.py" --install  # hooks + advox.context-guard-statusbar-5.0.0
 python3 "$CG_DIR/bin/install_harnesses.py" --status   # also: --dry-run, --pack-source <dir>, --uninstall
 ```
 
 ---
 
-## CLI Reference (`cg`, `cg_eval.py`, `cg_explain.py`, `cg_export.py`, `cg_status.py` & `cg_spool.py`)
+## CLI Reference
 
 ```bash
-cg eval --offline-replay                  # EvidenceContractV1 replay; --governor-check, --cursor-conformance
-cg eval --hardening-check                 # verify 8 explainability, OTel & hardening gates (--ledger-verify, --pilot/--release --plan)
-cg explain <event-id>                     # scrubbed spool lifecycle, eviction/corrupt & tier (--json)
-cg export --otel --output /tmp/otel.json  # off-hot-path stdlib OTLP/JSON (--ndjson, --endpoint)
-cg budget --preamble --mcp --recommendations  # passive audit; opt-in: --probe --probe-timeout 3
-cg status --short                         # or: cg doctor, cg spool list --json, cg outline <file>
+cg doctor --contracts --json                  # env, security & Policy API v1 contracts
+cg eval --conformance                         # 10-gate suite (--platform-matrix, --offline-replay)
+cg eval --hardening-check                     # 8 gates (--governor-check, --cursor-conformance, --ledger-verify, --pilot/--release --plan)
+cg explain <event-id>                         # scrubbed spool lifecycle & tier (--json)
+cg export --otel --output /tmp/otel.json      # off-hot-path OTLP/JSON (--ndjson, --endpoint)
+cg budget --preamble --mcp --recommendations  # passive audit (--probe --probe-timeout 3)
+cg status --short                             # or: cg help [cmd], cg spool list --json, cg outline <file>
 python3 "$CG_DIR/bin/cg_status.py" --short    # --claude-hud, --markdown, --json, --outcomes, --usage
 python3 "$CG_DIR/bin/cg_status.py" --doctor   # --replay, --benchmark, --public-json
 python3 "$CG_DIR/bin/cg_status.py" --json --stats-path /tmp/stats.json --outcomes-path /tmp/outcomes.json --usage-path /tmp/token_usage.json --update-path /tmp/update.json
-cg-outline path/to/file.py                # or python3 "$CG_DIR/bin/outline.py"
-cg-spool list --workspace . --json        # slice/grep (--workspace/--workspace-root, --session), gc
+cg-outline path/to/file.py                    # or python3 "$CG_DIR/bin/outline.py"
+cg-spool list --workspace . --json            # slice/grep (--workspace/--workspace-root, --session), gc
 ```
 
 ---
 
 ## Configuration Reference (`~/.config/context-guard/config.json`)
 
-Optional (`CONTEXT_GUARD_CONFIG_PATH`). Absent = universal optimizers only; malformed = fail closed on scoped tool calls.
+Optional (`CONTEXT_GUARD_CONFIG_PATH`). Absent = universal optimizers only; malformed = scoped fail-closed.
 
 | Key | Default | Description |
 | :--- | :--- | :--- |
 | `"read_confirm_policy"` | `"strict"` | Read confirmation mode (`"strict"` or `"bounded"`). |
-| `"optimizers"` | `{"range_trim": "active", "auto_outline": "active", "cli_rewrites": "auto", "output_spool": "off"}` | Optimizer modes (`active`/`shadow`/`off`; `cli_rewrites`: `auto`/`force`/`shadow`/`off`). |
+| `"optimizers"` | `{"range_trim": "active", "auto_outline": "active", "cli_rewrites": "auto", "output_spool": "off"}` | Modes (`active`/`shadow`/`off`; `cli_rewrites`: `auto`/`force`/`shadow`/`off`). |
 | `"integrations"` | `{"atlassian_twg": "off", "cursor_spool_mcp": "off"}` | Opt-in adapters (`"atlassian_twg"`, `"cursor_spool_mcp"`: `"active"`/`"off"`). |
 | `"spool"` | `{"isolation": "workspace", "max_spool_entry_bytes": 4194304}` | Spool isolation (`"workspace"`/`"session"`/`"global"`) and byte cap. |
 | `"regret_window_steps"` | `2` | Positive integer regret attribution horizon across steps. |
-| `"policy_packs"` | `[]` | Verified Policy API v1 packs pinned by `file_hashes` + `tree_sha256` and `scopes`. |
+| `"policy_packs"` | `[]` | Verified Policy API v1 packs (`file_hashes`, `tree_sha256`, `scopes`). |
 | `"model_labels"` | `{}` | Harness-to-model overrides (`antigravity`, `claude`, `cursor`, `codex`). |
-| `"workspace_root"` | `null` | Optional workspace root passed to `InstallerHookSpec` templates and packs. |
-| `"repo_map_path"` | `null` | Optional repository map path exposed to external verified packs. |
+| `"workspace_root"` | `null` | Optional workspace root passed to `InstallerHookSpec` and packs. |
+| `"repo_map_path"` | `null` | Optional repository map path exposed to verified packs. |
 
 ---
 
@@ -202,4 +205,4 @@ pytest tests/ -q
 
 ## Roadmap & License
 
-See [ROADMAP.md](ROADMAP.md) for `v4.5.2`–`v5.0.0` Architectural Freeze details. [MIT License](LICENSE).
+See [ROADMAP.md](ROADMAP.md) (Part III) for frozen Policy API v1, 4-harness capability matrix, migrations, rollback, and `v4.5.2`–`v5.0.0` freeze details. [MIT License](LICENSE).

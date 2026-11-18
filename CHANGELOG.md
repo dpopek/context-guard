@@ -5,6 +5,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 
 ## [Unreleased]
 
+## [5.0.0] - 2026-11-18
+
+### Added
+- **Platform contracts (`policies/api.py`):** Exported `CORE_SCHEMA_VERSIONS`, `DeprecationPolicyV1`, and `ConformanceContractV1`.
+- **Platform conformance (`evidence/conformance.py`):** Added 4-harness capability matrix and 10-gate adapter/pack/rollback suite.
+- **Eval conformance CLI (`bin/cg_eval.py`, `ci.yml`):** Added `--conformance` and `--platform-matrix` modes plus Multi-OS CI gates.
+- **Cohesive CLI help & doctor (`bin/cg.py`):** Added `cg help [cmd]` and `cg doctor` `--json`/`--markdown`/`--contracts` support.
+- **Conformance & CLI tests (`tests/`):** Added `test_platform_conformance.py` and `test_cli_cohesion.py` contract test suites.
+- **Platform reference (`ROADMAP.md`):** Added Part III covering CLI contracts, 4-harness matrix, migrations, rollback, and evidence.
+
+### Changed
+- **Policy API v1 freeze (`policies/`):** Synced `policies.__all__` exports and froze `POLICY_API_VERSION = 1` without SDK bloat.
+- **Release docs & audit skill (`README.md`, `SKILL.md`):** Synced `v5.0.0` CLI ergonomics, conformance checks, and module docs.
+
 ## [4.9.0] - 2026-11-18
 
 ### Added

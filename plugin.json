@@ -1,9 +1,9 @@
 {
   "name": "context-guard",
   "displayName": "Context-Guard",
-  "version": "4.9.0",
+  "version": "5.0.0",
   "license": "MIT",
-  "description": "Zero-prompt Policy API v1 and token-optimization plugin for Antigravity, Claude Code, Cursor, and Codex: Read Ledger v2, reversible output spooling, outlining, policy_packs, Outcomes v4, budget advisor, Evidence Engine, Adaptive Governor, cg explain, and OTel export.",
+  "description": "Zero-prompt Policy API v1 reliability platform for Antigravity, Claude Code, Cursor, and Codex: Read Ledger v2, reversible output spooling, outlining, policy_packs, Outcomes v4, budget advisor, Evidence Engine, Adaptive Governor, cg explain, OTel export, and 4-harness conformance.",
   "logo": "assets/logo.svg",
   "author": {
     "name": "Advox",
