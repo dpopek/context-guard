@@ -637,6 +637,42 @@ def gc_spools(
     avail = [e for e in final_index["entries"].values() if e.get("state", "available") == "available"]
     return {"ok": True, "removed_count": rc, "removed_bytes": rb, "remaining_count": len(avail), "remaining_bytes": sum(max(0, int(e.get("total_bytes") or 0)) for e in avail)}
 
+def inspect_spool_entry(spool_id: str, *, spool_dir: Path | None = None) -> dict[str, Any]:
+    """Pure read-only inspection of one `spool_id` without locks, writes, warnings, or blob reads."""
+    base: dict[str, Any] = {
+        "spool_id": str(spool_id or ""), "found": False, "current_state": "unknown", "eviction_reason": None,
+        "corrupt_reason": None, "created_at": None, "last_accessed_at": None, "evicted_at": None,
+        "corrupted_at": None, "total_bytes": 0, "total_lines": 0, "blob_present": False, "workspace_id": "", "session_id": "",
+    }
+    eff_dir, idx_path = (sd := spool_dir or resolve_spool_dir()), sd / "spool_index.json"
+    if check_unsafe_link(eff_dir) or (eff_dir.exists() and not eff_dir.is_dir()) or (eff_dir.is_dir() and check_unsafe_link(idx_path)):
+        return {**base, "corrupt_reason": "unsafe_path"}
+    if not eff_dir.is_dir() or not isinstance(spool_id, str) or not SPOOL_ID_RE.fullmatch(spool_id):
+        return base
+    raw_bytes, err = read_blob_bytes(idx_path)
+    if err == "unsafe_path": return {**base, "corrupt_reason": "unsafe_path"}
+    try: parsed = parse_spool_index(json.loads(raw_bytes.decode("utf-8"))) if raw_bytes is not None else None
+    except (UnicodeDecodeError, ValueError, TypeError): parsed = None
+    if parsed is None: return base
+    blob_path, blob_unsafe, blob_is_reg = eff_dir / f"{spool_id}.txt", check_unsafe_link(eff_dir / f"{spool_id}.txt"), False
+    if not blob_unsafe:
+        try: blob_is_reg, blob_unsafe = (is_r := stat.S_ISREG(os.lstat(str(blob_path)).st_mode)), not is_r
+        except FileNotFoundError: blob_is_reg = False
+        except OSError: blob_unsafe = True
+    def _f(d: Mapping[str, Any], k: str) -> float | None:
+        return float(d[k]) if isinstance(d.get(k), (int, float)) and not isinstance(d.get(k), bool) else None
+    def _i(d: Mapping[str, Any], k: str) -> int:
+        return max(0, int(d[k])) if isinstance(d.get(k), int) and not isinstance(d.get(k), bool) else 0
+    if isinstance((ent := parsed["entries"].get(spool_id)), dict):
+        raw_st, ent_cr = str(ent.get("state") or "available"), ent.get("corrupt_reason")
+        cur_st = "corrupt" if (raw_st == "corrupt" or (raw_st == "available" and (blob_unsafe or not blob_is_reg))) else ("available" if raw_st == "available" else "unknown")
+        c_rsn = (str(ent_cr) if isinstance(ent_cr, str) and ent_cr else ("unsafe_path" if blob_unsafe else ("unexpectedly_missing" if not blob_is_reg else "corrupt"))) if cur_st == "corrupt" else None
+        return {**base, "spool_id": spool_id, "found": True, "current_state": cur_st, "corrupt_reason": c_rsn, "created_at": _f(ent, "created_at"), "last_accessed_at": _f(ent, "last_accessed_at"), "corrupted_at": _f(ent, "corrupted_at"), "total_bytes": _i(ent, "total_bytes"), "total_lines": _i(ent, "total_lines"), "blob_present": blob_is_reg, "workspace_id": str(ent.get("workspace_id") or ""), "session_id": str(ent.get("session_id") or "")}
+    if isinstance((tomb := parsed["tombstones"].get(spool_id)), dict):
+        t_st = str(tomb.get("state") or "evicted")
+        return {**base, "spool_id": spool_id, "found": True, "current_state": t_st if t_st in ("evicting", "evicted") else "evicted", "eviction_reason": str(tomb.get("reason") or "ttl_expired"), "evicted_at": _f(tomb, "evicted_at"), "total_bytes": _i(tomb, "total_bytes"), "blob_present": blob_is_reg, "workspace_id": str(tomb.get("workspace_id") or ""), "session_id": str(tomb.get("session_id") or "")}
+    return base
+
 def inspect_spool_health(spool_dir: Path | None = None, *, receipts_path: Path | None = None, now_ts: float | None = None) -> dict[str, Any]:
     """Pure read-only spool health summary for `cg_status --doctor` (no locks/writes/warnings)."""
     eff_dir = spool_dir or resolve_spool_dir()

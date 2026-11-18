@@ -372,6 +372,11 @@ def _normalize_receipt_row(r: Mapping[str, Any]) -> ContextReceiptV1 | None:
     )
 
 
+def normalize_receipt_row(row: Mapping[str, Any]) -> ContextReceiptV1 | None:
+    """Validate and normalize a raw mapping into `ContextReceiptV1` without mutating state."""
+    return _normalize_receipt_row(row)
+
+
 def _read_receipt_rows(eff_path: Path) -> list[ContextReceiptV1]:
     if check_unsafe_link(eff_path.parent) or check_unsafe_link(eff_path) or not eff_path.is_file():
         return []
@@ -427,6 +432,11 @@ def append_receipt(receipt: Mapping[str, Any], receipts_path: Path | None = None
         return True
     except (OSError, ValueError, TypeError):
         return False
+
+def load_receipt_rows(receipts_path: Path | None = None) -> list[ContextReceiptV1]:
+    """Load normalized `ContextReceiptV1` rows purely read-only without locks or writes."""
+    return _read_receipt_rows(receipts_path or receipts_path_for())
+
 
 def find_created_receipt(spool_id: str, *, session_id: str | None = None, call_id: str | None = None, receipts_path: Path | None = None) -> ContextReceiptV1 | None:
     """Return the latest matching `spool_created` receipt without mutating state."""
@@ -542,13 +552,15 @@ def summarize_spool_lifecycle(
     spool_id: str | None = None,
     window_seconds: float | None = None,
     now_ts: float | None = None,
+    extra_rows: Sequence[ContextReceiptV1] | None = None,
 ) -> dict[str, Any]:
     """Compute deduplicated per-spool and aggregate lifecycle metrics from `receipts.jsonl`."""
     eff_now = float(now_ts) if now_ts is not None else time.time()
     seen_ids: set[str] = set()
     deduped: list[ContextReceiptV1] = []
     by_sid_events: dict[str, list[ContextReceiptV1]] = {}
-    for row in _read_receipt_rows(receipts_path or receipts_path_for()):
+    source_rows = (*_read_receipt_rows(receipts_path or receipts_path_for()), *(extra_rows or ()))
+    for row in source_rows:
         if spool_id is not None and row["spool_id"] != spool_id:
             continue
         if window_seconds is not None:

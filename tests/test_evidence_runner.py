@@ -19,6 +19,7 @@ from evidence.runner import (
     evaluate_campaign_runs,
     execute_isolated_campaign,
     plan_isolated_campaign,
+    run_explainability_hardening_gate,
     run_offline_evidence_replay,
     verify_campaign_controls,
 )
@@ -26,7 +27,7 @@ from hooks import config as hooks_config, outcomes, post_tool_use
 from policies.api import EVIDENCE_SCHEMA_VERSION, EvidenceContractV1
 from policies.governor import is_optimizer_tripped, reset_circuit_breaker
 from spool import receipts as spool_receipts
-from spool.store import slice_spool
+from spool.store import slice_spool, spool_tool_output
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 
@@ -132,9 +133,12 @@ def test_offline_evidence_replay_is_isolated_deterministic_and_non_causal(tmp_pa
         "durable_ledger_ok": True,
         "cursor_conformance_ok": True,
         "governor_replay_ok": True,
+        "hardening_gate_ok": True,
     }
     assert rep_a["gate_verdict"]["governor_replay"]["ok"] is True
     assert rep_a["gate_verdict"]["governor_replay"]["checks_passed"] == 8
+    assert rep_a["gate_verdict"]["hardening_gate"]["ok"] is True
+    assert rep_a["gate_verdict"]["hardening_gate"]["gates_passed"] == 8
     assert rep_a["gate_verdict"]["ledger_outcomes"]["completeness"] == "complete"
     assert rep_a["gate_verdict"]["ledger_outcomes"]["totals"]["created"] >= 1
     assert rep_a["gate_verdict"]["ledger_outcomes"]["totals"]["recoveries"] >= 1
@@ -557,3 +561,81 @@ def test_spool_integrity_failure_trips_governor_breaker_and_recovers_with_hyster
     assert good_reset["ok"] is True and is_optimizer_tripped("output_spool", state_dir=state_dir) is False
     res4 = post_tool_use.handle_post_tool_use("claude", _bash_payload("call_4", "d"), state_dir=str(state_dir))
     assert "hookSpecificOutput" in res4
+
+
+def test_run_explainability_hardening_gate_and_cg_eval_hardening_check_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gate_res = run_explainability_hardening_gate(work_dir=tmp_path / "hardening_wd")
+    assert gate_res["schema_version"] == 1
+    assert gate_res["ok"] is True and gate_res["gates_passed"] == 8 and gate_res["gates_total"] == 8
+    expected_gates = {
+        "explain_lifecycle_complete", "explain_eviction_and_corrupt_reasons", "explain_zero_prompt_leakage",
+        "otel_off_hot_path_export_ok", "otel_zero_prompt_leakage", "latency_percentiles_measured",
+        "zero_unrequested_ledger_migration", "safe_migrations_and_resilience_ok",
+    }
+    assert set(gate_res["gates"]) == expected_gates
+    assert all(gate_res["gates"].values())
+    lat = gate_res["latency_ms"]
+    assert 0.0 <= lat["p50_ms"] <= lat["p95_ms"] <= lat["p99_ms"]
+    assert gate_res["backend_benchmark"]["migration_performed"] is False
+    assert gate_res["backend_benchmark"]["read_ledger_schema"] == 2
+
+    assert cg.main(["eval", "--hardening-check", "--json"]) == 0
+    cli_json = json.loads(capsys.readouterr().out)
+    assert cli_json["ok"] is True and cli_json["gates_passed"] == 8 and cli_json["gates_total"] == 8
+
+    assert cg_eval.main(["--hardening-check", "--markdown"]) == 0
+    cli_md = capsys.readouterr().out
+    assert "# Context-Guard Explainability & Operational Hardening Gate" in cli_md
+    assert "PASS" in cli_md and "8/8" in cli_md and "zero_unrequested_ledger_migration" in cli_md
+
+    assert cg_eval.main(["--hardening-check", "--plan", "--json"]) == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "invalid_arguments"
+    assert cg_eval.main(["--hardening-check", "--runs-file", str(tmp_path / "r.json"), "--json"]) == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "invalid_arguments"
+
+    monkeypatch.setattr(
+        cg_eval, "run_explainability_hardening_gate",
+        lambda: {"schema_version": 1, "ok": False, "gates_passed": 7, "gates_total": 8, "gates": {"explain_lifecycle_complete": False}},
+    )
+    assert cg_eval.main(["--hardening-check", "--json"]) == 1
+    assert json.loads(capsys.readouterr().out)["ok"] is False
+
+
+def test_unified_cg_cli_dispatches_explain_and_export_subcommands(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cg.main(["--help"]) == 0
+    help_text = capsys.readouterr().out
+    assert "explain" in help_text and "export" in help_text
+
+    ws = tmp_path / "ws"
+    (ws / ".git").mkdir(parents=True)
+    state_dir = tmp_path / "state"
+    spool_dir = state_dir / "spool"
+    rcpt_path = spool_receipts.receipts_path_for(spool_dir)
+    spooled = spool_tool_output(
+        "\n".join(f"dispatch_line_{i:04d}: " + ("z" * 72) for i in range(240)) + "\n",
+        session_id="sess_dispatch", call_id="call_dispatch", harness="claude", tool_name="Bash",
+        workspace_root=ws, isolation="workspace", spool_dir=spool_dir, receipts_path=rcpt_path,
+    )
+    assert spooled is not None
+    ev_id = spool_receipts.load_receipt_rows(rcpt_path)[0]["event_id"]
+
+    assert cg.main([
+        "explain", ev_id, "--receipts-path", str(rcpt_path),
+        "--spool-dir", str(spool_dir), "--state-dir", str(state_dir), "--json",
+    ]) == 0
+    exp_out = json.loads(capsys.readouterr().out)
+    assert exp_out["ok"] is True and exp_out["current_state"] == "available" and exp_out["privacy_scrubbed"] is True
+
+    assert cg.main(["explain", "ev_missing_000000", "--receipts-path", str(rcpt_path), "--spool-dir", str(spool_dir), "--json"]) == 1
+    assert json.loads(capsys.readouterr().out)["error"] == "event_not_found"
+
+    otel_file = tmp_path / "otel_bundle.json"
+    assert cg.main(["export", "--otel", "--receipts-path", str(rcpt_path), "--output", str(otel_file)]) == 0
+    capsys.readouterr()
+    otel_doc = json.loads(otel_file.read_text(encoding="utf-8"))
+    assert otel_doc["ok"] is True and otel_doc["exported_events"] == 1 and otel_doc["privacy_scrubbed"] is True
+    assert len(otel_doc["resourceSpans"]) == 1

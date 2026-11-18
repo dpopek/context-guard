@@ -54,12 +54,20 @@ If Context-Guard is cloned outside `~/.gemini/config/plugins/context-guard`, run
    - Always-on instruction, memory-index, and skill bytes, duplicate skills, MCP tool overlaps, and non-mutating `minimal-core` / `full-integrations` profiles (note prompt-cache `cache_read` caveats).
    - Use opt-in `--mcp --probe --probe-timeout 3` only when live local stdio `tools/list` schema probing is explicitly requested.
 
-6. **Evidence Engine (`cg eval`):**
+6. **Evidence Engine & Hardening Gate (`cg eval`):**
    ```bash
    python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg.py" eval --offline-replay
    python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg.py" eval --cursor-conformance
    python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg.py" eval --governor-check
+   python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg.py" eval --hardening-check
    ```
    Review:
-   - Deterministic `EvidenceContractV1` offline replay (zero network or live LLM spawns), `CapabilityAttestationKey` provenance, Cursor CLI conformance (`excluded_missing_telemetry` cache handling), and 8-gate Adaptive Governor verification (`--governor-check`).
+   - Deterministic `EvidenceContractV1` offline replay (zero network or live LLM spawns), `CapabilityAttestationKey` provenance, Cursor CLI conformance (`excluded_missing_telemetry` cache handling), 8-gate Adaptive Governor verification (`--governor-check`), and 8-gate explainability, off-hot-path OTel, benchmark, and safe-migration hardening verification (`--hardening-check`).
    - Use `--pilot --plan`, `--release --plan`, or `--ledger-verify` to plan isolated campaigns or verify durable `evidence_events.json` Outcomes v4 derivation.
+
+7. **Intervention Explainability & Off-Hot-Path OTel Export (`cg explain` / `cg export`):**
+   ```bash
+   python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg.py" explain <event-id>
+   python3 "${CONTEXT_GUARD_HOME:-~/.gemini/config/plugins/context-guard}/bin/cg.py" export --otel
+   ```
+   Inspect scrubbed per-intervention spool lifecycle states (`available`, `evicting`, `evicted`, `corrupt`, `receipt_only`, `not_spool_backed`), exact eviction/corruption reasons, and delivery evidence tiers via `cg.py explain <event-id>` (`--json`), or export privacy-scrubbed 100% stdlib OTLP/JSON telemetry strictly off the hook hot path via `cg.py export --otel` (`--output`, `--ndjson`, `--endpoint`).

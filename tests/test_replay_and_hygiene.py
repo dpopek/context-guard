@@ -350,3 +350,85 @@ def test_doctor_warns_on_reliability_failures_and_outcomes_receipt_scoping(
     out_default = capsys.readouterr().out
     assert "Spool Receipts & Integrity" in out_default
     assert out_default.splitlines()[-1].startswith("_Schema: v4")
+
+
+def test_compute_latency_percentiles_monotonic_and_benchmark_includes_p50_p95_p99() -> None:
+    empty = replay_benchmark.compute_latency_percentiles([])
+    assert empty == {
+        "count": 0, "min_ms": 0.0, "p50_ms": 0.0, "p95_ms": 0.0,
+        "p99_ms": 0.0, "max_ms": 0.0, "mean_ms": 0.0,
+    }
+
+    single = replay_benchmark.compute_latency_percentiles([4.25])
+    assert single["count"] == 1
+    assert single["min_ms"] == single["p50_ms"] == single["p95_ms"] == single["p99_ms"] == single["max_ms"] == 4.25
+    assert single["mean_ms"] == 4.25
+
+    raw_samples = [12.5, 1.2, 3.4, 8.9, 45.0, 2.1, 5.6, 9.8, 15.3, 100.0]
+    pct = replay_benchmark.compute_latency_percentiles(raw_samples)
+    assert raw_samples[0] == 12.5
+    assert pct["count"] == 10
+    assert pct["min_ms"] == 1.2
+    assert pct["max_ms"] == 100.0
+    assert 0.0 <= pct["min_ms"] <= pct["p50_ms"] <= pct["p95_ms"] <= pct["p99_ms"] <= pct["max_ms"]
+
+    bench = replay_benchmark.run_deterministic_benchmark(iterations=2)
+    assert bench["ok"] is True
+    for key in ("in_process_latency_ms", "subprocess_latency_ms"):
+        lat = bench[key]
+        assert lat["count"] >= 1
+        assert 0.0 <= lat["min_ms"] <= lat["p50_ms"] <= lat["p95_ms"] <= lat["p99_ms"] <= lat["max_ms"]
+    assert bench["backend_evaluation"]["migration_performed"] is False
+    assert bench["backend_evaluation"]["read_ledger_schema"] == 2
+
+    md = replay_benchmark.render_benchmark_report(bench)
+    assert "In-process warm p50 / p95 / p99" in md
+    assert "Read Ledger backend decision" in md
+    assert "json_lock (schema v2, migration=False)" in md
+
+
+def test_backend_storage_benchmark_skips_alternatives_until_limits_exposed_and_never_migrates(tmp_path: Path) -> None:
+    calm = replay_benchmark.run_backend_storage_benchmark(
+        operations=12, force_compare=False, p95_budget_ms=5000.0, p99_budget_ms=5000.0,
+    )
+    assert calm["schema_version"] == 1
+    assert calm["ok"] is True
+    assert calm["active_backend"] == "json_lock"
+    assert calm["read_ledger_schema"] == 2
+    assert calm["operations"] == 12
+    assert calm["limits_exposed"] is False
+    assert calm["alternatives_evaluated"] is False
+    assert calm["alternatives"] == {}
+    assert calm["migration_performed"] is False
+    assert calm["decision"] == "retain_json_lock"
+    jl = calm["json_lock"]
+    assert jl["count"] == 12
+    assert 0.0 <= jl["min_ms"] <= jl["p50_ms"] <= jl["p95_ms"] <= jl["p99_ms"] <= jl["max_ms"]
+
+    forced = replay_benchmark.run_backend_storage_benchmark(
+        operations=18, force_compare=True, p95_budget_ms=5000.0, p99_budget_ms=5000.0,
+    )
+    assert forced["ok"] is True
+    assert forced["limits_exposed"] is False
+    assert forced["alternatives_evaluated"] is True
+    assert forced["migration_performed"] is False
+    assert forced["read_ledger_schema"] == 2
+    assert forced["decision"] == "retain_json_lock"
+    assert set(forced["alternatives"]) == {"sqlite_wal", "segmented_jsonl"}
+    assert forced["alternatives"]["segmented_jsonl"]["compactions"] >= 1
+    for alt in forced["alternatives"].values():
+        assert alt["count"] == 18
+        assert 0.0 <= alt["min_ms"] <= alt["p50_ms"] <= alt["p95_ms"] <= alt["p99_ms"] <= alt["max_ms"]
+
+    exposed = replay_benchmark.run_backend_storage_benchmark(
+        operations=10, force_compare=False, p95_budget_ms=-1.0, p99_budget_ms=5000.0,
+    )
+    assert exposed["ok"] is True
+    assert exposed["limits_exposed"] is True
+    assert exposed["alternatives_evaluated"] is True
+    assert exposed["migration_performed"] is False
+    assert exposed["read_ledger_schema"] == 2
+    assert exposed["decision"] == "evaluate_migration_proposal"
+    assert set(exposed["alternatives"]) == {"sqlite_wal", "segmented_jsonl"}
+    assert list(tmp_path.iterdir()) == []
+

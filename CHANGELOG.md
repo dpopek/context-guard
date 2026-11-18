@@ -5,6 +5,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 
 ## [Unreleased]
 
+## [4.9.0] - 2026-11-18
+
+### Added
+- **Explain & bench contracts (`policies/api.py`):** Exported `ExplainContractV1`, `BackendBenchmarkContractV1`, and tier/state enums.
+- **Intervention explainer (`bin/cg_explain.py`, `spool/`):** Added `cg explain <event-id>` for lifecycles, evictions, and tiers.
+- **Off-hot-path OTel export (`bin/cg_export.py`):** Added 100% stdlib `cg export --otel` OTLP/JSON exporter with zero prompt leaks.
+- **Latency & backend eval (`bin/replay_benchmark.py`):** Added `p50`/`p95`/`p99` percentiles and conditional backend benchmark.
+- **Hardening gate & CLI (`evidence/runner.py`, `bin/cg_eval.py`, `ci.yml`):** Added 8-gate `cg eval --hardening-check` and CI step.
+- **Operational hardening tests (`tests/test_operational_hardening.py`):** Added 6-domain resilience and safe-migration contracts.
+
+### Changed
+- **Unified `cg` CLI (`bin/cg.py`):** Wired `explain` and `export` subcommands into the `cg` dispatcher while keeping `hooks/*` untouched.
+- **Offline replay & docs (`evidence/runner.py`, `README.md`, `ROADMAP.md`):** Wired `hardening_gate_ok` and synced `v4.9.0` docs.
+
 ## [4.8.0] - 2026-11-16
 
 ### Added

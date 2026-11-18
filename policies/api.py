@@ -335,40 +335,75 @@ class GovernorContractV1(TypedDict):
     effective_optimizers: dict[str, str]
 
 
+EXPLAIN_SCHEMA_VERSION: int = 1
+OTEL_EXPORT_SCHEMA_VERSION: int = 1
+BACKEND_BENCHMARK_SCHEMA_VERSION: int = 1
+VALID_DELIVERY_EVIDENCE_TIERS: tuple[str, ...] = ("delivery_verified", "replacement_emitted", "unverified")
+VALID_EXPLAIN_STATES: tuple[str, ...] = (
+    "available", "evicting", "evicted", "corrupt", "receipt_only", "not_spool_backed", "unknown",
+)
+
+
+class ExplainContractV1(TypedDict):
+    """Schema v1 intervention and spool lifecycle explanation contract."""
+
+    schema_version: int
+    ok: bool
+    error: str | None
+    query_id: str
+    matched_by: str
+    event_id: str | None
+    receipt_id: str | None
+    spool_id: str | None
+    event_type: str | None
+    intervention: str | None
+    harness: str | None
+    session_id: str | None
+    workspace_id: str | None
+    mode: str | None
+    status: str | None
+    current_state: str
+    eviction_reason: str | None
+    corrupt_reason: str | None
+    delivery_evidence_tier: str
+    completeness: str
+    privacy_scrubbed: bool
+    spool_lifecycle: dict[str, Any]
+    timeline: list[dict[str, Any]]
+    governor_context: dict[str, Any]
+
+
+class BackendBenchmarkContractV1(TypedDict):
+    """Schema v1 Read Ledger storage backend benchmark and migration-gate contract."""
+
+    schema_version: int
+    ok: bool
+    active_backend: str
+    read_ledger_schema: int
+    operations: int
+    p95_budget_ms: float
+    p99_budget_ms: float
+    limits_exposed: bool
+    alternatives_evaluated: bool
+    migration_performed: bool
+    decision: str
+    json_lock: dict[str, Any]
+    alternatives: dict[str, dict[str, Any]]
+
+
 __all__ = [
-    "ADAPTER_CONTRACT_VERSION",
-    "ALL_SECURITY_SCOPES",
-    "CAPABILITY_CONTRACT_SCHEMA_VERSION",
-    "CapabilityAttestationKey",
-    "CapabilityContractV1",
-    "CapabilityRequirementV1",
-    "CircuitBreakerStateV1",
-    "ContextReceiptV1",
-    "EVIDENCE_SCHEMA_VERSION",
-    "EvidenceContractV1",
-    "EvidenceEnvironmentMetadataV1",
-    "GOVERNOR_SCHEMA_VERSION",
-    "GovernorContractV1",
-    "HARD_INTEGRITY_FAILURE_REASONS",
-    "HARNESS_OUTPUT_CAPABILITIES",
-    "HarnessOutputCapabilities",
-    "InstallerHookSpec",
-    "NON_TRIPPING_SIGNALS",
-    "OptimizerDecisionV1",
-    "POLICY_API_VERSION",
-    "PolicyContext",
-    "PolicyDecision",
-    "PolicyPackManifest",
-    "PolicyPostContext",
-    "RECEIPT_SCHEMA_VERSION",
-    "RuntimeCapabilities",
-    "SpoolContractV1",
-    "VALID_BREAKER_STATES",
-    "VALID_CAPABILITY_EVIDENCE_LEVELS",
-    "VALID_EVAL_TIERS",
-    "VALID_GOVERNOR_MODES",
-    "VALID_POLICY_KINDS",
-    "VALID_POLICY_MODES",
-    "VALID_RUN_OUTCOME_CLASSES",
-    "VALID_TURN_CORRELATIONS",
+    "ADAPTER_CONTRACT_VERSION", "ALL_SECURITY_SCOPES", "BACKEND_BENCHMARK_SCHEMA_VERSION",
+    "BackendBenchmarkContractV1", "CAPABILITY_CONTRACT_SCHEMA_VERSION", "CapabilityAttestationKey",
+    "CapabilityContractV1", "CapabilityRequirementV1", "CircuitBreakerStateV1",
+    "ContextReceiptV1", "EVIDENCE_SCHEMA_VERSION", "EXPLAIN_SCHEMA_VERSION",
+    "EvidenceContractV1", "EvidenceEnvironmentMetadataV1", "ExplainContractV1",
+    "GOVERNOR_SCHEMA_VERSION", "GovernorContractV1", "HARD_INTEGRITY_FAILURE_REASONS",
+    "HARNESS_OUTPUT_CAPABILITIES", "HarnessOutputCapabilities", "InstallerHookSpec",
+    "NON_TRIPPING_SIGNALS", "OTEL_EXPORT_SCHEMA_VERSION", "OptimizerDecisionV1",
+    "POLICY_API_VERSION", "PolicyContext", "PolicyDecision",
+    "PolicyPackManifest", "PolicyPostContext", "RECEIPT_SCHEMA_VERSION",
+    "RuntimeCapabilities", "SpoolContractV1", "VALID_BREAKER_STATES",
+    "VALID_CAPABILITY_EVIDENCE_LEVELS", "VALID_DELIVERY_EVIDENCE_TIERS", "VALID_EVAL_TIERS",
+    "VALID_EXPLAIN_STATES", "VALID_GOVERNOR_MODES", "VALID_POLICY_KINDS",
+    "VALID_POLICY_MODES", "VALID_RUN_OUTCOME_CLASSES", "VALID_TURN_CORRELATIONS",
 ]

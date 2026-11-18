@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -253,10 +255,164 @@ def render_replay_report(result: Mapping[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def compute_latency_percentiles(samples_ms: Sequence[float]) -> dict[str, float]:
+    """Compute monotonic latency percentiles (`min`, `p50`, `p95`, `p99`, `max`, `mean`) in ms."""
+    ordered = sorted(
+        max(0.0, float(val)) for val in samples_ms
+        if not isinstance(val, bool) and isinstance(val, (int, float)) and math.isfinite(float(val))
+    )
+    count = len(ordered)
+    if count == 0:
+        return {"count": 0, "min_ms": 0.0, "p50_ms": 0.0, "p95_ms": 0.0, "p99_ms": 0.0, "max_ms": 0.0, "mean_ms": 0.0}
+    min_v, max_v, mean_v = round(ordered[0], 4), round(ordered[-1], 4), round(sum(ordered) / count, 4)
+
+    def _quantile(q: float) -> float:
+        pos = q * (count - 1)
+        lo, hi = int(math.floor(pos)), min(count - 1, int(math.floor(pos)) + 1)
+        return round(ordered[lo] + (ordered[hi] - ordered[lo]) * (pos - lo), 4)
+
+    p50_v = min(max_v, max(min_v, _quantile(0.50)))
+    p95_v = min(max_v, max(p50_v, _quantile(0.95)))
+    p99_v = min(max_v, max(p95_v, _quantile(0.99)))
+    return {"count": count, "min_ms": min_v, "p50_ms": p50_v, "p95_ms": p95_v, "p99_ms": p99_v, "max_ms": max_v, "mean_ms": mean_v}
+
+
+def _seed_ledger_entries(file_count: int = 30) -> dict[str, dict[str, Any]]:
+    return {
+        f"repo/src/mod_{idx:02d}.py": {
+            "sha256": hashlib.sha256(f"seed-mod-{idx}".encode("utf-8")).hexdigest(),
+            "reads": [[1, 120, idx + 1, 2], [160, 260, idx + 2, 2]],
+        }
+        for idx in range(file_count)
+    }
+
+
+def _bench_json_lock_backend(work_dir: Path, operations: int) -> dict[str, Any]:
+    with state_store.locked_state(work_dir) as txn:
+        txn.state["files"], txn.dirty = _seed_ledger_entries(30), True
+    samples_ms: list[float] = []
+    for op_i in range(operations):
+        key, iv = f"repo/src/mod_{op_i % 30:02d}.py", [1 + (op_i % 8) * 25, 30 + (op_i % 8) * 25, 100 + op_i, 2]
+        t0 = time.perf_counter()
+        with state_store.locked_state(work_dir) as txn:
+            ent = txn.state.setdefault("files", {}).setdefault(key, {"sha256": "", "reads": []})
+            ent["reads"] = state_store.merge_intervals([*list(ent.get("reads") or []), iv])
+            txn.state["auto_step_seq"], txn.dirty = 100 + op_i, True
+        samples_ms.append((time.perf_counter() - t0) * 1000.0)
+    sf, snap = state_store.state_file_in(work_dir), state_store.read_state_snapshot(work_dir)
+    return {
+        "backend": "json_lock", "read_ledger_schema": int(snap.get("read_ledger_schema", 0) or 0),
+        "final_bytes": sf.stat().st_size if sf.is_file() else 0, **compute_latency_percentiles(samples_ms),
+    }
+
+
+def _bench_sqlite_wal_backend(work_dir: Path, operations: int) -> dict[str, Any]:
+    work_dir.mkdir(parents=True, exist_ok=True)
+    db_path, samples_ms, journal_mode = work_dir / "read_ledger_bench.sqlite3", [], "wal"
+    conn = sqlite3.connect(str(db_path), timeout=5.0)
+    try:
+        j_row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        if j_row and j_row[0]:
+            journal_mode = str(j_row[0]).lower()
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("CREATE TABLE IF NOT EXISTS ledger_files (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, reads_json TEXT NOT NULL, step_seq INTEGER NOT NULL)")
+        for path_k, entry in _seed_ledger_entries(30).items():
+            conn.execute("INSERT OR REPLACE INTO ledger_files VALUES (?, ?, ?, ?)", (path_k, str(entry["sha256"]), json.dumps(entry["reads"], separators=(",", ":")), 1))
+        conn.commit()
+        for op_i in range(operations):
+            key, iv = f"repo/src/mod_{op_i % 30:02d}.py", [1 + (op_i % 8) * 25, 30 + (op_i % 8) * 25, 100 + op_i, 2]
+            t0 = time.perf_counter()
+            row = conn.execute("SELECT sha256, reads_json FROM ledger_files WHERE path = ?", (key,)).fetchone()
+            sha, reads = (str(row[0]), json.loads(str(row[1]))) if row else ("", [])
+            merged = state_store.merge_intervals([*reads, iv])
+            conn.execute("INSERT OR REPLACE INTO ledger_files VALUES (?, ?, ?, ?)", (key, sha, json.dumps(merged, separators=(",", ":")), 100 + op_i))
+            conn.commit()
+            samples_ms.append((time.perf_counter() - t0) * 1000.0)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
+    finally:
+        conn.close()
+    final_bytes = sum(p.stat().st_size for p in work_dir.iterdir() if p.is_file())
+    return {"backend": "sqlite_wal", "journal_mode": journal_mode, "final_bytes": final_bytes, **compute_latency_percentiles(samples_ms)}
+
+
+def _bench_segmented_jsonl_backend(work_dir: Path, operations: int) -> dict[str, Any]:
+    work_dir.mkdir(parents=True, exist_ok=True)
+    snap_path, seg_path, lock_path = work_dir / "ledger_snapshot.json", work_dir / "segment_active.jsonl", work_dir / "segment.lock"
+    snap_path.write_text(json.dumps({"read_ledger_schema": state_store.READ_LEDGER_SCHEMA, "files": _seed_ledger_entries(30)}, separators=(",", ":")), encoding="utf-8")
+    seg_path.write_text("", encoding="utf-8")
+    samples_ms: list[float] = []
+    compactions = 0
+    for op_i in range(operations):
+        key, iv = f"repo/src/mod_{op_i % 30:02d}.py", [1 + (op_i % 8) * 25, 30 + (op_i % 8) * 25, 100 + op_i, 2]
+        t0 = time.perf_counter()
+        with open(lock_path, "a+", encoding="utf-8") as lock_fh:
+            state_store.fcntl.flock(lock_fh.fileno(), state_store.fcntl.LOCK_EX)
+            try:
+                doc = json.loads(snap_path.read_text(encoding="utf-8"))
+                files_map: dict[str, Any] = doc.setdefault("files", {})
+                for line in seg_path.read_text(encoding="utf-8").splitlines():
+                    if line.strip():
+                        rec = json.loads(line)
+                        files_map[str(rec["path"])] = {"sha256": str(rec["sha256"]), "reads": rec["reads"]}
+                ent = files_map.setdefault(key, {"sha256": "", "reads": []})
+                merged = state_store.merge_intervals([*list(ent.get("reads") or []), iv])
+                ent["reads"], doc["auto_step_seq"] = merged, 100 + op_i
+                with open(seg_path, "a", encoding="utf-8") as seg_fh:
+                    seg_fh.write(json.dumps({"path": key, "sha256": ent.get("sha256", ""), "reads": merged, "step": 100 + op_i}, separators=(",", ":")) + "\n")
+                    seg_fh.flush()
+                if (op_i + 1) % 16 == 0:
+                    fd, tmp_name = tempfile.mkstemp(prefix=".seg_snap.", suffix=".tmp", dir=str(work_dir))
+                    try:
+                        with os.fdopen(fd, "w", encoding="utf-8") as tmp_fh:
+                            json.dump(doc, tmp_fh, separators=(",", ":"))
+                        os.replace(tmp_name, str(snap_path))
+                    except OSError:
+                        Path(tmp_name).unlink(missing_ok=True)
+                        raise
+                    seg_path.write_text("", encoding="utf-8")
+                    compactions += 1
+            finally:
+                state_store.fcntl.flock(lock_fh.fileno(), state_store.fcntl.LOCK_UN)
+        samples_ms.append((time.perf_counter() - t0) * 1000.0)
+    final_bytes = (snap_path.stat().st_size if snap_path.is_file() else 0) + (seg_path.stat().st_size if seg_path.is_file() else 0)
+    return {"backend": "segmented_jsonl", "compactions": compactions, "final_bytes": final_bytes, **compute_latency_percentiles(samples_ms)}
+
+
+def run_backend_storage_benchmark(
+    *, operations: int = 40, force_compare: bool = False, p95_budget_ms: float = 25.0, p99_budget_ms: float = 50.0,
+) -> dict[str, Any]:
+    """Benchmark Read Ledger v2 `json_lock` and conditionally compare alternatives in a temp dir."""
+    ops, b_p95, b_p99 = max(1, int(operations)), float(p95_budget_ms), float(p99_budget_ms)
+    with tempfile.TemporaryDirectory(prefix="cg_backend_bench_") as td:
+        root = Path(td).resolve()
+        json_lock = _bench_json_lock_backend(root / "json_lock", ops)
+        limits_exposed = bool(float(json_lock["p95_ms"]) > b_p95 or float(json_lock["p99_ms"]) > b_p99)
+        evaluate_alts = bool(limits_exposed or force_compare)
+        alternatives: dict[str, dict[str, Any]] = (
+            {"sqlite_wal": _bench_sqlite_wal_backend(root / "sqlite_wal", ops),
+             "segmented_jsonl": _bench_segmented_jsonl_backend(root / "segmented_jsonl", ops)}
+            if evaluate_alts else {}
+        )
+    schema_v = int(json_lock.get("read_ledger_schema") or state_store.READ_LEDGER_SCHEMA)
+    return {
+        "schema_version": 1, "ok": schema_v == state_store.READ_LEDGER_SCHEMA, "active_backend": "json_lock",
+        "read_ledger_schema": state_store.READ_LEDGER_SCHEMA, "operations": ops,
+        "p95_budget_ms": b_p95, "p99_budget_ms": b_p99, "limits_exposed": limits_exposed,
+        "alternatives_evaluated": evaluate_alts, "migration_performed": False,
+        "decision": "evaluate_migration_proposal" if limits_exposed else "retain_json_lock",
+        "json_lock": json_lock, "alternatives": alternatives,
+    }
+
+
 def run_deterministic_benchmark(iterations: int = 3) -> dict[str, Any]:
     """Measure isolated cold/warm latency and byte/token savings over synthetic corpus."""
     iters = max(1, int(iterations))
     cfg = {"read_confirm_policy": "bounded", "optimizers": {"range_trim": "active", "auto_outline": "active", "output_spool": "active", "cli_rewrites": "auto"}, "regret_window_steps": 2, "policy_packs": []}
+    warm_samples_ms: list[float] = []
+    sub_samples_ms: list[float] = []
     with tempfile.TemporaryDirectory(prefix="cg_bench_") as td:
         root = Path(td).resolve()
         with _isolated_runtime(root, cfg) as paths:
@@ -281,12 +437,14 @@ def run_deterministic_benchmark(iterations: int = 3) -> dict[str, Any]:
             t1 = time.perf_counter()
             for rep_i in range(iters):
                 for idx, (harness, payload) in enumerate(corpus):
+                    call_t0 = time.perf_counter()
                     if harness == "antigravity":
                         ov = {"toolCall": {"name": "view_file", "args": {"AbsolutePath": str(large_py), "StartLine": 1, "EndLine": 200}, "id": f"w-{rep_i}"}, "conversationId": "bench-ag"}
                         pre_tool_use.evaluate_hook(ov, state_dir=sdir, cli_harness="antigravity")
                         post_tool_use.handle_post_tool_use("antigravity", {**ov, "toolResponse": overlap_text}, stats_path=stats_p, state_dir=sdir)
                     else:
                         pre_tool_use.evaluate_hook({**payload, "call_id": f"w-{rep_i}-{idx}", "tool_use_id": f"w-{rep_i}-{idx}"}, state_dir=sdir, cli_harness=harness)
+                    warm_samples_ms.append((time.perf_counter() - call_t0) * 1000.0)
             warm_ms = (time.perf_counter() - t1) * 1000.0
             repo_root = Path(__file__).resolve().parent.parent
             pre_tool_script = repo_root / "hooks" / "pre_tool_use.py"
@@ -319,6 +477,7 @@ def run_deterministic_benchmark(iterations: int = 3) -> dict[str, Any]:
             t2 = time.perf_counter()
             for sub_i in range(sub_iters):
                 call_payload = {**sub_payload, "call_id": f"bench-sub-{sub_i}", "tool_use_id": f"bench-sub-{sub_i}"}
+                sub_t0 = time.perf_counter()
                 proc = subprocess.run(
                     [sys.executable, str(pre_tool_script), "--harness", "claude"],
                     input=json.dumps(call_payload),
@@ -328,6 +487,7 @@ def run_deterministic_benchmark(iterations: int = 3) -> dict[str, Any]:
                     env=sub_env,
                     check=False,
                 )
+                sub_samples_ms.append((time.perf_counter() - sub_t0) * 1000.0)
                 if proc.returncode != 0:
                     sub_ok = False
             sub_ms = (time.perf_counter() - t2) * 1000.0
@@ -338,10 +498,13 @@ def run_deterministic_benchmark(iterations: int = 3) -> dict[str, Any]:
             delivered = max(0, total_raw - saved_bytes)
             pct = round(min(100.0, (saved_bytes / total_raw) * 100.0), 2)
             warm_calls = max(1, iters * len(corpus))
+    backend_eval = run_backend_storage_benchmark(operations=20, force_compare=False)
+    in_proc_pct = compute_latency_percentiles(warm_samples_ms)
+    sub_pct = compute_latency_percentiles(sub_samples_ms)
     in_cold_ms, in_warm_ms = round(cold_ms, 3), round(warm_ms, 3)
     in_warm_per_call = round(warm_ms / warm_calls, 4)
     return {
-        "ok": sub_ok,
+        "ok": sub_ok and bool(backend_eval.get("ok", True)),
         "isolated": True,
         "measurement_scope": "synthetic_corpus",
         "iterations": iters,
@@ -352,7 +515,10 @@ def run_deterministic_benchmark(iterations: int = 3) -> dict[str, Any]:
         "in_process_cold_ms": in_cold_ms,
         "in_process_warm_ms": in_warm_ms,
         "in_process_warm_ms_per_call": in_warm_per_call,
+        "in_process_latency_ms": in_proc_pct,
         "subprocess_hook_ms_per_call": round(sub_ms / sub_iters, 3),
+        "subprocess_latency_ms": sub_pct,
+        "backend_evaluation": backend_eval,
         "raw_bytes": total_raw,
         "delivered_bytes": delivered,
         "saved_bytes": saved_bytes,
@@ -367,6 +533,14 @@ def render_benchmark_report(result: Mapping[str, Any]) -> str:
     in_warm = result.get("in_process_warm_ms", result.get("warm_ms", 0))
     in_warm_pc = result.get("in_process_warm_ms_per_call", result.get("warm_ms_per_call", 0))
     sub_pc = result.get("subprocess_hook_ms_per_call", 0)
+    raw_in_lat = result.get("in_process_latency_ms")
+    in_lat: Mapping[str, Any] = raw_in_lat if isinstance(raw_in_lat, Mapping) else {}
+    raw_be = result.get("backend_evaluation")
+    be: Mapping[str, Any] = raw_be if isinstance(raw_be, Mapping) else {}
+    be_act = be.get("active_backend", "json_lock")
+    be_sch = be.get("read_ledger_schema", state_store.READ_LEDGER_SCHEMA)
+    be_mig = be.get("migration_performed", False)
+    be_dec = be.get("decision", "retain_json_lock")
     return "\n".join([
         "## Context-Guard Deterministic Benchmark",
         "",
@@ -376,7 +550,9 @@ def render_benchmark_report(result: Mapping[str, Any]) -> str:
         "| Benchmark scope | `synthetic corpus (not live session A/B)` |",
         f"| In-process engine cold latency | `{in_cold} ms` |",
         f"| In-process engine warm latency (`{result.get('iterations', 0)}`x) | `{in_warm} ms` (`{in_warm_pc} ms/call`) |",
+        f"| In-process warm p50 / p95 / p99 | `{in_lat.get('p50_ms', 0.0)} / {in_lat.get('p95_ms', 0.0)} / {in_lat.get('p99_ms', 0.0)} ms` |",
         f"| Subprocess E2E hook latency (`PreToolUse`) | `{sub_pc} ms/call` |",
+        f"| Read Ledger backend decision | `{be_act} (schema v{be_sch}, migration={be_mig})` — `{be_dec}` |",
         f"| Bytes saved (synthetic corpus) | `{result.get('saved_bytes', 0)}` (`{result.get('savings_pct', 0)}%`) |",
         f"| Tokens saved (synthetic est.) | `{result.get('saved_tokens', 0)}` |",
         "",

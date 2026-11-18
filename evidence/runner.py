@@ -2,76 +2,54 @@
 
 from __future__ import annotations
 
+import ast
 from datetime import datetime, timezone
 import hashlib
+import json
 import os
 from pathlib import Path
 import tempfile
+import time
 from typing import Any, Callable, Mapping, Sequence
 import uuid
 
-from bin.replay_benchmark import run_deterministic_benchmark, run_deterministic_replay
-from evidence.ledger import (
-    DEFAULT_EVENT_LEDGER_FILENAME,
-    collect_environment_metadata,
-    derive_outcomes_from_ledger,
-    ingest_context_receipts,
-    run_cursor_cli_conformance,
-)
+from bin.cg_explain import explain_intervention, render_explain_markdown
+from bin.cg_export import build_otel_export_bundle
+from bin.migration_guard import StagedPackTransaction
+from bin.replay_benchmark import run_backend_storage_benchmark, run_deterministic_benchmark, run_deterministic_replay
+from evidence.ledger import DEFAULT_EVENT_LEDGER_FILENAME, collect_environment_metadata, derive_outcomes_from_ledger, ingest_context_receipts, run_cursor_cli_conformance
 from evidence.metrics import compute_arm_summary, compute_paired_comparison, plan_evaluation_matrix
+from hooks import config as hooks_config, outcomes
+from hooks.policy_engine import PolicyPackLoadError
+from hooks.state_store import resolve_plugin_root
 from policies.api import EVIDENCE_SCHEMA_VERSION, EvidenceContractV1, VALID_EVAL_TIERS
-from policies.governor import replay_governor_decisions
-from spool.receipts import check_unsafe_link, receipts_path_for
-from spool.store import slice_spool, spool_tool_output
+from policies.governor import GOVERNED_CAPABILITIES, attest_capability, evaluate_governor, replay_governor_decisions
+from spool.receipts import check_unsafe_link, load_receipt_rows, persist_spool_delivery_verification, receipts_path_for
+from spool.store import gc_spools, slice_spool, spool_tool_output
 
 _TASK_SPECS_RAW: tuple[tuple[str, str, str], ...] = (
-    ("task_01", "Fix off-by-one boundary in parser", "bugfix"),
-    ("task_02", "Deduplicate config normalization helper", "refactor"),
-    ("task_03", "Triage flaky fixture isolation test", "test_triage"),
-    ("task_04", "Summarize structured error log stream", "log_analysis"),
-    ("task_05", "Enforce strict schema validation on API input", "api_contract"),
-    ("task_06", "Reject path traversal in file loader", "security_audit"),
-    ("task_07", "Add JSON flag to CLI subcommand", "cli_feature"),
-    ("task_08", "Eliminate quadratic loop in index lookup", "performance"),
-    ("task_09", "Guard shared state updates with file lock", "concurrency"),
-    ("task_10", "Verify cross-platform path joining in bundler", "packaging"),
-    ("task_11", "Validate backward-compatible ledger migration", "schema_validation"),
-    ("task_12", "Return explicit exit code on malformed input", "error_handling"),
-    ("task_13", "Parse nested CLI flags with quoted arguments", "parsing"),
-    ("task_14", "Invalidate stale cache on config change", "caching"),
+    ("task_01", "Fix off-by-one boundary in parser", "bugfix"), ("task_02", "Deduplicate config normalization helper", "refactor"),
+    ("task_03", "Triage flaky fixture isolation test", "test_triage"), ("task_04", "Summarize structured error log stream", "log_analysis"),
+    ("task_05", "Enforce strict schema validation on API input", "api_contract"), ("task_06", "Reject path traversal in file loader", "security_audit"),
+    ("task_07", "Add JSON flag to CLI subcommand", "cli_feature"), ("task_08", "Eliminate quadratic loop in index lookup", "performance"),
+    ("task_09", "Guard shared state updates with file lock", "concurrency"), ("task_10", "Verify cross-platform path joining in bundler", "packaging"),
+    ("task_11", "Validate backward-compatible ledger migration", "schema_validation"), ("task_12", "Return explicit exit code on malformed input", "error_handling"),
+    ("task_13", "Parse nested CLI flags with quoted arguments", "parsing"), ("task_14", "Invalidate stale cache on config change", "caching"),
     ("task_15", "Report missing runtime dependency in diagnostics", "diagnostics"),
 )
 _DEFAULT_BUDGET: dict[str, Any] = {"max_turns": 20, "timeout_s": 300.0, "max_cost_usd": 2.0}
-
 DEFAULT_BENCHMARK_TASKS: tuple[dict[str, Any], ...] = tuple(
-    {
-        "task_id": tid, "title": title, "category": cat, "pass_criterion_id": f"criterion_{idx:02d}",
-        "max_turns": int(_DEFAULT_BUDGET["max_turns"]), "timeout_s": float(_DEFAULT_BUDGET["timeout_s"]),
-        "max_cost_usd": float(_DEFAULT_BUDGET["max_cost_usd"]),
-    }
+    {"task_id": tid, "title": title, "category": cat, "pass_criterion_id": f"criterion_{idx:02d}", "max_turns": int(_DEFAULT_BUDGET["max_turns"]), "timeout_s": float(_DEFAULT_BUDGET["timeout_s"]), "max_cost_usd": float(_DEFAULT_BUDGET["max_cost_usd"])}
     for idx, (tid, title, cat) in enumerate(_TASK_SPECS_RAW, 1)
 )
-
-_OFFLINE_CLAIM = (
-    "offline_contract_replay_only: verifies deterministic transforms, integrity, "
-    "latency, and durability; does NOT prove live model trajectories."
-)
+_OFFLINE_CLAIM = "offline_contract_replay_only: verifies deterministic transforms, integrity, latency, and durability; does NOT prove live model trajectories."
 _PILOT_CLAIM = "small_live_pilot_regression_gate: isolated regression gate; not powered for causal release proof."
-_RELEASE_CLAIM = (
-    "controlled_isolated_ab_evaluation: compares Cost per Passed Run under pinned "
-    "versions, budgets, and pass criteria."
-)
+_RELEASE_CLAIM = "controlled_isolated_ab_evaluation: compares Cost per Passed Run under pinned versions, budgets, and pass criteria."
 _UNVERIFIED_RELEASE_CLAIM = "unverified_release_evaluation: control or completeness violations prevent causal claim."
 _UNPINNED_SENTINELS = frozenset({"unpinned", "latest", "auto", "unknown"})
-_ISO_ENV_KEYS = (
-    "CONTEXT_GUARD_HOME", "CONTEXT_GUARD_STATE_DIR", "CONTEXT_GUARD_SPOOL_DIR",
-    "CONTEXT_GUARD_CONFIG_PATH", "CONTEXT_GUARD_WORKSPACE_ROOT",
-)
+_ISO_ENV_KEYS = ("CONTEXT_GUARD_HOME", "CONTEXT_GUARD_STATE_DIR", "CONTEXT_GUARD_SPOOL_DIR", "CONTEXT_GUARD_CONFIG_PATH", "CONTEXT_GUARD_WORKSPACE_ROOT")
 
-__all__ = [
-    "DEFAULT_BENCHMARK_TASKS", "evaluate_campaign_runs", "execute_isolated_campaign",
-    "plan_isolated_campaign", "run_offline_evidence_replay", "verify_campaign_controls",
-]
+__all__ = ["DEFAULT_BENCHMARK_TASKS", "evaluate_campaign_runs", "execute_isolated_campaign", "plan_isolated_campaign", "run_explainability_hardening_gate", "run_offline_evidence_replay", "verify_campaign_controls"]
 
 
 def _utc_now_iso_z() -> str:
@@ -389,6 +367,7 @@ def run_offline_evidence_replay(
         ingest_res = ingest_context_receipts(ledger_path, receipts_path)
         derived_res = derive_outcomes_from_ledger(ledger_path)
         cursor_conf = run_cursor_cli_conformance(work_dir=cursor_dir)
+        hardening_gate = run_explainability_hardening_gate(work_dir=root / "hardening")
     governor_replay = replay_governor_decisions()
 
     env_meta = collect_environment_metadata(clean_harness, model_id=clean_model, harness_build_id=clean_build, runtime_cfg={})
@@ -406,8 +385,8 @@ def run_offline_evidence_replay(
         bool(cursor_conf.get("ok")) and bool(cursor_conf.get("admitted"))
         and cursor_conf.get("cache_attribution_status") == "excluded_missing_telemetry"
     )
-    governor_ok = bool(governor_replay.get("ok"))
-    all_ok = replay_ok and bench_ok and spool_ok and ledger_ok and cursor_ok and governor_ok
+    governor_ok, hardening_ok = bool(governor_replay.get("ok")), bool(hardening_gate.get("ok"))
+    all_ok = replay_ok and bench_ok and spool_ok and ledger_ok and cursor_ok and governor_ok and hardening_ok
 
     is_cursor = clean_harness == "cursor"
     slice_bytes = len(str(slice_res.get("content") or "").encode("utf-8")) if spool_ok else 0
@@ -455,11 +434,19 @@ def run_offline_evidence_replay(
     report["gate_verdict"]["checks"] = {
         "deterministic_replay_ok": replay_ok, "deterministic_benchmark_ok": bench_ok,
         "spool_and_slice_ok": spool_ok, "durable_ledger_ok": ledger_ok, "cursor_conformance_ok": cursor_ok,
-        "governor_replay_ok": governor_ok,
+        "governor_replay_ok": governor_ok, "hardening_gate_ok": hardening_ok,
     }
     report["gate_verdict"]["ledger_outcomes"] = derived_res
     report["gate_verdict"]["cursor_conformance"] = cursor_conf
     report["gate_verdict"]["governor_replay"] = governor_replay
+    hg_bb_raw = hardening_gate.get("backend_benchmark")
+    hg_bb: Mapping[str, Any] = hg_bb_raw if isinstance(hg_bb_raw, Mapping) else {}
+    report["gate_verdict"]["hardening_gate"] = {
+        "schema_version": hardening_gate.get("schema_version"), "ok": hardening_ok,
+        "gates_passed": hardening_gate.get("gates_passed"), "gates_total": hardening_gate.get("gates_total"),
+        "gates": dict(hardening_gate.get("gates") or {}),
+        "backend_benchmark": {k: hg_bb.get(k) for k in ("schema_version", "ok", "active_backend", "read_ledger_schema", "operations", "limits_exposed", "alternatives_evaluated", "migration_performed", "decision")},
+    }
     report["gate_verdict"]["benchmark"] = {
         k: bench_res.get(k) for k in ("ok", "isolated", "measurement_scope", "iterations", "corpus_calls", "raw_bytes", "delivered_bytes", "saved_bytes", "saved_tokens", "savings_pct")
     }
@@ -565,3 +552,110 @@ def execute_isolated_campaign(
             plan, executor_fn, Path(td), runtime_cfg=runtime_cfg,
             runtime_verifications=runtime_verifications, seed=seed, bootstrap_iters=bootstrap_iters,
         )
+
+
+def _scan_hot_path_imports() -> bool:
+    root, bad_any, bad_net = resolve_plugin_root(), ("cg_export", "opentelemetry", "http", "socket"), ("urllib.request", "urllib.error", "urllib.robotparser")
+    for pkg in ("hooks", "spool", "policies", "integrations"):
+        for py_p in sorted((root / pkg).glob("*.py")):
+            for node in ast.walk(ast.parse(py_p.read_text(encoding="utf-8"), filename=py_p.name)):
+                mods = [a.name for a in node.names] if isinstance(node, ast.Import) else ([node.module or "", *(f"{node.module or ''}.{a.name}".strip(".") for a in node.names)] if isinstance(node, ast.ImportFrom) else [])
+                for m in mods:
+                    parts = m.split(".")
+                    if any(t in parts for t in bad_any) or any(m == n or m.startswith(f"{n}.") for n in bad_net) or (pkg != "spool" and parts[0] == "urllib"):
+                        return False
+    return True
+
+
+def _verify_safe_migrations(root: Path) -> bool:
+    mig_cfg, v1_dir, bad_dir = root / "mig" / "config.json", root / "mig_v1", root / "mig_bad"
+    for d in (mig_cfg.parent, v1_dir, bad_dir):
+        d.mkdir(parents=True, exist_ok=True)
+    tpl = "from __future__ import annotations\nfrom policies.api import ALL_SECURITY_SCOPES, PolicyPackManifest\ndef evaluate(ctx):\n    return None\nPACK_MANIFEST = PolicyPackManifest(pack_id='hg_pack', api_version={v}, kind='security', covered_domains=ALL_SECURITY_SCOPES, evaluate=evaluate, harness_matchers={{}})\n"
+    (v1_dir / "pack.py").write_text(tpl.format(v=1), encoding="utf-8")
+    (bad_dir / "pack.py").write_text(tpl.format(v=99), encoding="utf-8")
+    tx1 = StagedPackTransaction(v1_dir, config_path=mig_cfg)
+    tx1.prepare()
+    tx1.validate()
+    tx1.activate()
+    tx1.commit()
+    orig_cfg, tx_bad, rolled_back = mig_cfg.read_bytes(), StagedPackTransaction(bad_dir, config_path=mig_cfg), False
+    tx_bad.prepare()
+    try:
+        tx_bad.validate()
+    except PolicyPackLoadError:
+        rolled_back = True
+    pack_ok = rolled_back and mig_cfg.read_bytes() == orig_cfg and not [p.name for p in (mig_cfg.parent / "policies").iterdir() if p.name.startswith(".staging-")]
+    out_v3 = root / "outcomes_v3.json"
+    out_v3.write_text(json.dumps({"schema_version": 3, "by_key": {"claude|sonnet|outline": {"total": 4, "applied": 4, "targeted_followup": 1, "full_bypass": 1, "shell_bypass": 0}}}), encoding="utf-8")
+    v4_doc = outcomes.load_outcomes(out_v3)
+    out_ok = v4_doc.get("schema_version") == 4 and bool((v4_doc.get("by_key") or {}).get("claude|sonnet|outline", {}).get("legacy_v3"))
+    gov_dir, cfg_b1 = root / "gov_state", {"read_confirm_policy": "strict", "optimizers": {"output_spool": "active"}, "governor": {"harness_build_id": "build_100", "require_runtime_verified": True}}
+    for cap_id in GOVERNED_CAPABILITIES:
+        attest_capability("claude", cap_id, verification_evidence="probe:ok", harness_build_id="build_100", runtime_cfg=cfg_b1, state_dir=gov_dir)
+    g1 = evaluate_governor("claude", runtime_cfg=cfg_b1, state_dir=gov_dir)
+    g2 = evaluate_governor("claude", runtime_cfg={**cfg_b1, "governor": {"harness_build_id": "build_200", "require_runtime_verified": True}}, state_dir=gov_dir)
+    return bool(pack_ok and out_ok and g1["decisions"]["output_spool"]["selected_mode"] == "active" and not g2["capabilities"]["output_replacement"]["runtime_verified"] and g2["capabilities"]["output_replacement"]["invalidated_reason"] == "build_changed" and not g1["security_enforcement_lowered"] and not g2["security_enforcement_lowered"])
+
+
+def _run_hardening_in_dir(root: Path) -> dict[str, Any]:
+    ws_dir, state_dir = root / "ws", root / "state"
+    (ws_dir / ".git").mkdir(parents=True, exist_ok=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    spool_dir, cfg_path = state_dir / "spool", root / "config.json"
+    rcpt_path = receipts_path_for(spool_dir)
+    cfg_path.write_text(json.dumps({"read_confirm_policy": "strict", "optimizers": {"output_spool": "active"}}), encoding="utf-8")
+    env_keys = ("CONTEXT_GUARD_CONFIG_PATH", "CONTEXT_GUARD_STATE_DIR", "CONTEXT_GUARD_SPOOL_DIR")
+    saved_env = {k: os.environ.get(k) for k in env_keys}
+    os.environ["CONTEXT_GUARD_CONFIG_PATH"], os.environ["CONTEXT_GUARD_STATE_DIR"], os.environ["CONTEXT_GUARD_SPOOL_DIR"] = str(cfg_path), str(state_dir), str(spool_dir)
+    hooks_config.clear_config_cache()
+    try:
+        secret_blob, secret_home = "SECRET_BLOB_PAYLOAD_DO_NOT_LEAK_490", "/".join(("", "Users", "alice", "secret"))
+        sess_sec, t0 = f"sess:{secret_home}", time.time()
+        sp1 = spool_tool_output("\n".join(f"hg_line_{i:04d}: {secret_blob} " + ("x" * 52) for i in range(240)) + "\n", session_id=sess_sec, call_id="call_hg1", harness="claude", tool_name="Bash", workspace_root=ws_dir, isolation="workspace", turn_key="turn_hg1", turn_correlation="harness_native", spool_dir=spool_dir, receipts_path=rcpt_path, now_ts=t0 - 30.0)
+        assert sp1 is not None
+        persist_spool_delivery_verification({"tool_calls": [{"tool_use_id": "call_hg1", "tool_response": sp1[1]}]}, harness="claude", session_id=sess_sec, workspace_root=ws_dir, turn_key="turn_hg1", spool_dir=spool_dir, receipts_path=rcpt_path)
+        slice_spool(sp1[0].spool_id, start_line=1, limit=20, workspace_root=ws_dir, session_id=sess_sec, isolation="workspace", harness="claude", receipts_path=rcpt_path, spool_dir=spool_dir, call_id="call_hg1_sl")
+        ev_id = load_receipt_rows(rcpt_path)[0]["event_id"]
+        exp1 = explain_intervention(ev_id, receipts_path=rcpt_path, spool_dir=spool_dir, state_dir=state_dir)
+        exp1_json, exp1_md = json.dumps(exp1), render_explain_markdown(exp1)
+        otel = build_otel_export_bundle(receipts_path=rcpt_path)
+        otel_json, spans = json.dumps(otel), (((otel.get("resourceSpans") or [{}])[0].get("scopeSpans") or [{}])[0].get("spans") or [])
+        gc_spools(max_age_seconds=0.0, spool_dir=spool_dir, now_ts=t0 + 10.0)
+        exp_ev = explain_intervention(ev_id, receipts_path=rcpt_path, spool_dir=spool_dir, state_dir=state_dir)
+        sp2 = spool_tool_output("\n".join(f"hg_cor_{i:04d}: " + ("y" * 72) for i in range(240)) + "\n", session_id="sess_hg2", call_id="call_hg2", harness="claude", tool_name="Bash", workspace_root=ws_dir, isolation="workspace", spool_dir=spool_dir, receipts_path=rcpt_path)
+        assert sp2 is not None
+        (spool_dir / f"{sp2[0].spool_id}.txt").unlink()
+        exp_cor = explain_intervention(sp2[0].spool_id, receipts_path=rcpt_path, spool_dir=spool_dir, state_dir=state_dir)
+        mig_ok = _verify_safe_migrations(root)
+    finally:
+        for k, prev in saved_env.items():
+            os.environ.pop(k, None) if prev is None else os.environ.__setitem__(k, prev)
+        hooks_config.clear_config_cache()
+    bench1 = run_deterministic_benchmark(iterations=1)
+    lat_raw = bench1.get("in_process_latency_ms")
+    lat: dict[str, Any] = dict(lat_raw) if isinstance(lat_raw, Mapping) else {}
+    calm_bb = run_backend_storage_benchmark(operations=12, force_compare=False, p95_budget_ms=5000.0, p99_budget_ms=5000.0)
+    forced_bb = run_backend_storage_benchmark(operations=12, force_compare=True, p95_budget_ms=5000.0, p99_budget_ms=5000.0)
+    gates = {
+        "explain_lifecycle_complete": bool(exp1["ok"] and exp1["current_state"] == "available" and exp1["delivery_evidence_tier"] == "delivery_verified" and exp1["completeness"] == "complete"),
+        "explain_eviction_and_corrupt_reasons": bool(exp_ev["current_state"] == "evicted" and exp_ev["eviction_reason"] == "ttl_expired" and exp_cor["current_state"] == "corrupt" and exp_cor["corrupt_reason"] == "unexpectedly_missing"),
+        "explain_zero_prompt_leakage": bool(exp1["privacy_scrubbed"] and secret_blob not in exp1_json and secret_blob not in exp1_md and secret_home not in exp1_json and secret_home not in exp1_md and "canon_root" not in exp1_json),
+        "otel_off_hot_path_export_ok": bool(otel.get("ok") and int(otel.get("exported_events") or 0) >= 1 and len(spans) >= 1 and len(str(spans[0].get("traceId") or "")) == 32 and len(str(spans[0].get("spanId") or "")) == 16 and _scan_hot_path_imports()),
+        "otel_zero_prompt_leakage": bool(otel.get("privacy_scrubbed") and secret_blob not in otel_json and secret_home not in otel_json and "canon_root" not in otel_json),
+        "latency_percentiles_measured": bool(bench1.get("ok") and all(k in lat for k in ("p50_ms", "p95_ms", "p99_ms")) and 0.0 <= float(lat["p50_ms"]) <= float(lat["p95_ms"]) <= float(lat["p99_ms"])),
+        "zero_unrequested_ledger_migration": bool(calm_bb.get("ok") and forced_bb.get("ok") and calm_bb.get("migration_performed") is False and forced_bb.get("migration_performed") is False and calm_bb.get("read_ledger_schema") == 2 and forced_bb.get("read_ledger_schema") == 2 and calm_bb.get("limits_exposed") is False and calm_bb.get("alternatives_evaluated") is False and calm_bb.get("alternatives") == {} and forced_bb.get("alternatives_evaluated") is True and set(forced_bb.get("alternatives") or ()) == {"sqlite_wal", "segmented_jsonl"}),
+        "safe_migrations_and_resilience_ok": mig_ok,
+    }
+    passed = sum(1 for v in gates.values() if v)
+    return {"schema_version": 1, "ok": passed == 8, "gates_passed": passed, "gates_total": 8, "gates": gates, "latency_ms": dict(lat), "backend_benchmark": calm_bb}
+
+
+def run_explainability_hardening_gate(work_dir: Path | None = None) -> dict[str, Any]:
+    """Deterministically verify all 8 explainability, off-hot-path OTel, benchmark, and hardening gates."""
+    if work_dir is not None:
+        wd = Path(work_dir).resolve()
+        wd.mkdir(parents=True, exist_ok=True)
+        return _run_hardening_in_dir(wd)
+    with tempfile.TemporaryDirectory(prefix="cg_hardening_gate_") as td:
+        return _run_hardening_in_dir(Path(td).resolve())

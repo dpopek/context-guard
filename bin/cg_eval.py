@@ -24,6 +24,7 @@ from evidence.ledger import (  # noqa: E402
 from evidence.runner import (  # noqa: E402
     evaluate_campaign_runs,
     plan_isolated_campaign,
+    run_explainability_hardening_gate,
     run_offline_evidence_replay,
 )
 from hooks.state_store import resolve_plugin_root  # noqa: E402
@@ -109,8 +110,27 @@ def _render_governor_markdown(res: Mapping[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _render_hardening_markdown(res: Mapping[str, Any]) -> str:
+    gates = _as_map(res.get("gates"))
+    lat = _as_map(res.get("latency_ms"))
+    bb = _as_map(res.get("backend_benchmark"))
+    lines = [
+        "# Context-Guard Explainability & Operational Hardening Gate",
+        "",
+        f"- Status: `{'PASS' if res.get('ok') else 'FAIL'}` | Gates passed: `{int(res.get('gates_passed', 0) or 0)}/{int(res.get('gates_total', len(gates)) or 0)}`",
+        f"- In-process latency (ms): `p50={lat.get('p50_ms', 0.0)}`, `p95={lat.get('p95_ms', 0.0)}`, `p99={lat.get('p99_ms', 0.0)}`",
+        f"- Read Ledger backend: `{bb.get('active_backend', 'json_lock')}` (`schema={bb.get('read_ledger_schema', 2)}`, `migration_performed={bool(bb.get('migration_performed', False))}`, `decision={bb.get('decision', 'retain_json_lock')}`)",
+        "",
+        "| Gate | Passed |",
+        "|---|---|",
+    ]
+    for name, passed in gates.items():
+        lines.append(f"| `{name}` | `{bool(passed)}` |")
+    return "\n".join(lines) + "\n"
+
+
 def render_evidence_markdown(report: Mapping[str, Any]) -> str:
-    """Format an Evidence Engine contract, plan, conformance, governor, or ledger report as Markdown."""
+    """Format an Evidence Engine contract, plan, conformance, governor, hardening, or ledger report as Markdown."""
     if "run_specs" in report and "matrix" in report:
         return _render_plan_markdown(report)
     if "admitted" in report and "checks" in report and report.get("harness_id") == "cursor":
@@ -119,6 +139,8 @@ def render_evidence_markdown(report: Mapping[str, Any]) -> str:
         return _render_ledger_markdown(report)
     if "gates" in report and "checks_passed" in report:
         return _render_governor_markdown(report)
+    if "gates" in report and "gates_passed" in report:
+        return _render_hardening_markdown(report)
 
     env = _as_map(report.get("environment"))
     verdict = _as_map(report.get("gate_verdict"))
@@ -196,6 +218,7 @@ def _build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--cursor-conformance", action="store_true", help="Run isolated Cursor CLI hook conformance gate.")
     mode.add_argument("--ledger-verify", action="store_true", help="Verify/ingest durable event ledger and derive Outcomes v4.")
     mode.add_argument("--governor-check", action="store_true", help="Replay Adaptive Governor capability, breaker, and security invariants.")
+    mode.add_argument("--hardening-check", action="store_true", help="Run 8-gate explainability, off-hot-path OTel, benchmark, and hardening check.")
     parser.add_argument("--plan", action="store_true", help="Emit isolated campaign plan without running external LLMs.")
     parser.add_argument("--runs-file", type=Path, default=None, help="JSON file of isolated campaign runs to evaluate.")
     parser.add_argument("--outcomes-baseline", type=Path, default=None, help="Optional Outcomes v4 JSON baseline for --ledger-verify.")
@@ -321,6 +344,14 @@ def main(argv: list[str] | None = None) -> int:
         if ns.runs_file is not None or ns.plan:
             return _emit_error("invalid_arguments", "--governor-check cannot be combined with --plan or --runs-file", as_json)
         res = replay_governor_decisions()
+        if (err_rc := _emit_report(res, ns)) is not None:
+            return err_rc
+        return 0 if res.get("ok") else 1
+
+    if ns.hardening_check:
+        if ns.runs_file is not None or ns.plan:
+            return _emit_error("invalid_arguments", "--hardening-check cannot be combined with --plan or --runs-file", as_json)
+        res = run_explainability_hardening_gate()
         if (err_rc := _emit_report(res, ns)) is not None:
             return err_rc
         return 0 if res.get("ok") else 1
