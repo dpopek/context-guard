@@ -521,7 +521,7 @@ def test_build_post_tool_spool_response_cursor_mcp_redacted_and_shadow_parity(tm
         now_ts=2_000.0,
     )
     assert act_meta is not None
-    assert act_resp["updated_mcp_tool_output"].startswith("[CONTEXT-GUARD OUTPUT SPOOL:")
+    assert isinstance(act_resp["updated_mcp_tool_output"], dict) and act_resp["updated_mcp_tool_output"]["text"].startswith("[CONTEXT-GUARD OUTPUT SPOOL:")
     assert shadow_meta["spool_id"] == act_meta["spool_id"]
     assert shadow_meta["workspace_id"] == act_meta["workspace_id"]
     assert shadow_meta["total_bytes"] == act_meta["total_bytes"]
@@ -770,7 +770,7 @@ def test_spool_post_tool_output_domain_contract(tmp_path: Path) -> None:
     )
     assert isinstance(dec_cu, SpoolDecision) and meta_cu is not None
     assert dec_cu.harness == "cursor" and dec_cu.shape == "text"
-    assert isinstance(dec_cu.updated_output, str) and meta_cu["spool_id"] in dec_cu.updated_output
+    assert isinstance(dec_cu.updated_output, dict) and meta_cu["spool_id"] in dec_cu.updated_output["text"]
     assert "updated_mcp_tool_output" not in meta_cu
 
     dec_sh, meta_sh = spool_post_tool_output(

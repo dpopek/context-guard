@@ -42,13 +42,19 @@ _HARD_REASONS = frozenset(HARD_INTEGRITY_FAILURE_REASONS)
 _DEFAULT_MODES: dict[str, str] = {
     "range_trim": "active", "auto_outline": "active", "cli_rewrites": "auto", "output_spool": "off",
 }
+_KNOWN_HOOK_EVENTS = frozenset({
+    "PreToolUse", "PostToolUse", "PostToolUseFailure", "PostToolBatch",
+    "PreCompact", "SessionEnd", "PreInvocation",
+    "preToolUse", "postToolUse", "postToolUseFailure", "preCompact", "sessionEnd",
+})
 
 __all__ = [
     "DEFAULT_GOVERNOR_STATE_FILENAME", "GOVERNED_CAPABILITIES", "GOVERNED_OPTIMIZERS",
     "OPTIMIZER_REQUIRED_CAPABILITIES", "apply_runtime_governor", "attest_capability",
     "build_capability_attestation_key", "compute_hook_config_fingerprint",
     "evaluate_capability_contract", "evaluate_governor", "is_optimizer_tripped",
-    "record_governor_signal", "reset_circuit_breaker", "resolve_governor_state_path",
+    "is_provider_only_evidence", "record_governor_signal", "reset_circuit_breaker",
+    "resolve_governor_state_path",
 ]
 
 
@@ -56,7 +62,8 @@ def _norm_harness(harness_id: str | None) -> str:
     return scrub_home_paths(str(harness_id or "").strip().lower()) or "unknown"
 
 
-def _is_provider_evidence(evidence: str | None) -> bool:
+def is_provider_only_evidence(evidence: str | None) -> bool:
+    """Return True when evidence references only an upstream model or provider API."""
     return isinstance(evidence, str) and evidence.strip().lower().startswith(_PROVIDER_PREFIXES)
 
 
@@ -316,7 +323,7 @@ def evaluate_capability_contract(
     stored_ev = _clean_evidence(stored_attestation.get("verification_evidence") if isinstance(stored_attestation, Mapping) else None)
     stored_rej = bool(stored_attestation.get("provider_only_rejected")) if isinstance(stored_attestation, Mapping) else False
     inv_reason = _check_stored_invalidation(key, stored_attestation, payload_known)
-    ev_is_prov = _is_provider_evidence(clean_ev) or (clean_ev is None and _is_provider_evidence(stored_ev))
+    ev_is_prov = is_provider_only_evidence(clean_ev) or (clean_ev is None and is_provider_only_evidence(stored_ev))
     if not payload_known:
         is_prov_rej = bool(claimed_level == "provider_supported" or ev_is_prov or key.capability_id == "dynamic_tool_mutation")
         return _cap_contract(key, level="unsupported", provider_only_rejected=is_prov_rej, invalidated_reason="unknown_payload")
@@ -326,7 +333,7 @@ def evaluate_capability_contract(
             provider_only_rejected=bool(claimed_level == "provider_supported" or ev_is_prov),
             invalidated_reason=inv_reason,
         )
-    if claimed_level == "provider_supported" or _is_provider_evidence(clean_ev) or (clean_ev is None and (stored_rej or _is_provider_evidence(stored_ev))):
+    if claimed_level == "provider_supported" or is_provider_only_evidence(clean_ev) or (clean_ev is None and (stored_rej or is_provider_only_evidence(stored_ev))):
         return _cap_contract(
             key, level="provider_supported", evidence=clean_ev or stored_ev,
             provider_only_rejected=True, invalidated_reason=inv_reason,
@@ -455,7 +462,7 @@ def reset_circuit_breaker(
     opt_id = str(optimizer_id or "").strip() or "unknown"
     has_ver = (
         bool(verification_passed) and isinstance(verification_evidence, str)
-        and bool(verification_evidence.strip()) and not _is_provider_evidence(verification_evidence)
+        and bool(verification_evidence.strip()) and not is_provider_only_evidence(verification_evidence)
     )
     has_op = bool(operator_reset) and isinstance(operator_reason, str) and bool(operator_reason.strip())
     if not (has_ver or has_op):
@@ -612,13 +619,55 @@ def evaluate_governor(
     )
 
 
+def _is_known_hook_payload(payload: Any) -> bool:
+    if payload is None:
+        return True
+    if not isinstance(payload, Mapping):
+        return False
+    for key in ("tool_name", "toolName"):
+        val = payload.get(key)
+        if isinstance(val, str) and bool(val.strip()):
+            return True
+    tc = payload.get("toolCall")
+    if isinstance(tc, Mapping):
+        tc_name = tc.get("name")
+        if isinstance(tc_name, str) and bool(tc_name.strip()):
+            return True
+    for key in ("hook_event_name", "event"):
+        ev_val = payload.get(key)
+        if isinstance(ev_val, str) and ev_val in _KNOWN_HOOK_EVENTS:
+            return True
+    for key in ("results", "items", "batch", "tool_calls", "toolCalls"):
+        if isinstance(payload.get(key), list):
+            return True
+    return any(isinstance(payload.get(key), Mapping) for key in ("hooks", "hook_payload"))
+
+
+def _extract_payload_build_id(payload: Mapping[str, Any] | None) -> str:
+    if not isinstance(payload, Mapping):
+        return "unavailable"
+    for key in (
+        "harness_build_id", "cursor_version", "claude_version",
+        "codex_version", "antigravity_version", "client_version",
+    ):
+        val = payload.get(key)
+        if isinstance(val, str) and (clean := val.strip()):
+            return clean
+    return "unavailable"
+
+
 def apply_runtime_governor(
     runtime_cfg: Mapping[str, Any], harness_id: str, *,
     state_dir: str | Path | None = None, payload: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Apply governor decisions to `runtime_cfg['optimizers']` with O(1) static parity fast path."""
-    payload_known = payload is None or isinstance(payload, Mapping)
-    if payload_known and not isinstance(runtime_cfg.get("governor"), Mapping):
+    payload_known = _is_known_hook_payload(payload)
+    raw_opts = runtime_cfg.get("optimizers")
+    has_dyn = (
+        isinstance(raw_opts, Mapping)
+        and str(raw_opts.get("dynamic_tool_mutation") or "off").strip().lower() not in ("off", "passthrough", "")
+    )
+    if payload_known and not has_dyn and not isinstance(runtime_cfg.get("governor"), Mapping):
         if _path_absent(resolve_governor_state_path(state_dir)):
             return dict(runtime_cfg)
     hook_payload: Mapping[str, Any] | None = None
@@ -629,10 +678,10 @@ def apply_runtime_governor(
             hook_payload = payload["hook_payload"]
     contract = evaluate_governor(
         harness_id, runtime_cfg=runtime_cfg, state_dir=state_dir,
+        harness_build_id=_extract_payload_build_id(payload),
         hook_payload=hook_payload, payload_known=payload_known,
     )
     out = dict(runtime_cfg)
-    raw_opts = runtime_cfg.get("optimizers")
     new_opts = dict(raw_opts) if isinstance(raw_opts, Mapping) else {}
     new_opts.update(contract["effective_optimizers"])
     out["optimizers"] = new_opts

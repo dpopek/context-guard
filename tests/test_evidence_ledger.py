@@ -505,3 +505,43 @@ def test_cursor_cli_conformance_gate_admits_cursor_with_missing_cache_excluded(t
     assert by_cap["output_replacement"]["evidence_level"] == "unsupported"
     assert by_cap["prompt_cache_telemetry"]["evidence_level"] == "unsupported"
     assert ev_ledger.EVENT_LEDGER_SCHEMA_VERSION == 1
+
+
+def test_provider_only_evidence_rejected_in_requirement_and_environment_metadata() -> None:
+    """Reject provider-only evidence prefixes even when runtime_probe_passed=True."""
+    fp = compute_hook_config_fingerprint("claude", {"optimizers": {"output_spool": "active"}})
+    claude_out_key = build_capability_attestation_key("claude", "output_replacement", hook_config_fingerprint=fp)
+    cursor_out_key = build_capability_attestation_key("cursor", "output_replacement", hook_config_fingerprint=fp)
+
+    for ev in ("provider_api:tool_search", "model_api:tools", "upstream_provider:beta", "  provider_api:/Users/alice/probe  "):
+        req = resolve_capability_requirement(
+            claude_out_key, claimed_level="runtime_verified", runtime_probe_passed=True, verification_evidence=ev,
+        )
+        assert req["runtime_verified"] is False
+        assert req["evidence_level"] == "provider_supported"
+        assert req["verification_source"].startswith("provider_only_rejected:claude:")
+        assert "alice" not in req["verification_source"]
+
+        unsup = resolve_capability_requirement(
+            cursor_out_key, claimed_level="runtime_verified", runtime_probe_passed=True, verification_evidence=ev,
+        )
+        assert unsup["runtime_verified"] is False
+        assert unsup["evidence_level"] == "unsupported"
+
+        meta = collect_environment_metadata(
+            "claude",
+            model_id="claude-sonnet-4-6",
+            runtime_verifications={"output_replacement": ev, "pre_tool_interception": "client_hook_verified"},
+        )
+        by_cap = {cap["capability_id"]: cap for cap in meta["required_capabilities"]}
+        assert by_cap["output_replacement"]["runtime_verified"] is False
+        assert by_cap["output_replacement"]["evidence_level"] == "provider_supported"
+        assert by_cap["output_replacement"]["verification_source"].startswith("provider_only_rejected:claude:")
+        assert "alice" not in by_cap["output_replacement"]["verification_source"]
+        assert by_cap["pre_tool_interception"]["runtime_verified"] is True
+        assert by_cap["pre_tool_interception"]["evidence_level"] == "runtime_verified"
+
+    claimed_only = resolve_capability_requirement(claude_out_key, claimed_level="provider_supported")
+    assert claimed_only["runtime_verified"] is False
+    assert claimed_only["evidence_level"] == "provider_supported"
+    assert claimed_only["verification_source"] == "provider_only_rejected:claude:provider_supported"

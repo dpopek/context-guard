@@ -242,18 +242,20 @@ def test_hooks_total_loc_ceiling() -> None:
 
 
 MAX_PROD_FILE_LOC = 800
+MAX_BIN_FILE_LOC = 350
 MAX_JS_FILE_LOC = 500
 
 
 def test_production_module_loc_ceilings() -> None:
-    """Every production Python module across all 8 production packages must stay <= 800 LOC."""
+    """Every production Python module across all 8 production packages must stay <= 800 LOC (bin <= 350)."""
     violations: list[str] = []
     for folder in _PROD_PACKAGES:
+        ceiling = MAX_BIN_FILE_LOC if folder == "bin" else MAX_PROD_FILE_LOC
         for path in sorted((ROOT / folder).glob("*.py")):
             loc = len(path.read_text(encoding="utf-8").splitlines())
-            if loc > MAX_PROD_FILE_LOC:
+            if loc > ceiling:
                 violations.append(
-                    f"{path.relative_to(ROOT)}: {loc} LOC exceeds {MAX_PROD_FILE_LOC} LOC ceiling"
+                    f"{path.relative_to(ROOT)}: {loc} LOC exceeds {ceiling} LOC ceiling"
                 )
     assert violations == [], f"Production module LOC ceiling violations: {violations}"
 

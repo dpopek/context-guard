@@ -178,6 +178,33 @@ def default_runtime_config() -> dict[str, Any]:
     }
 
 
+def _parse_governor_config(raw_gov: Any) -> tuple[dict[str, Any] | None, str | None]:
+    """Validate optional `governor` config object and normalize string fields."""
+    if raw_gov is None:
+        return None, None
+    if not isinstance(raw_gov, dict):
+        return None, "invalid 'governor': expected object"
+    gov_out: dict[str, Any] = {}
+    for key in ("harness_build_id", "adapter_version"):
+        val = raw_gov.get(key)
+        if val is not None:
+            if not isinstance(val, str) or not val.strip():
+                return None, f"invalid 'governor.{key}'"
+            gov_out[key] = val.strip()
+    for key in ("require_runtime_verified", "evidence_gate_required"):
+        val = raw_gov.get(key)
+        if val is not None:
+            if not isinstance(val, bool):
+                return None, f"invalid 'governor.{key}'"
+            gov_out[key] = val
+    rep_val = raw_gov.get("evidence_report")
+    if rep_val is not None:
+        if not isinstance(rep_val, dict):
+            return None, "invalid 'governor.evidence_report'"
+        gov_out["evidence_report"] = dict(rep_val)
+    return gov_out, None
+
+
 def load_runtime_config(config_path: Path | None = None) -> dict[str, Any]:
     """Pure loader validating universal config.json schema without writing state or emitting warnings."""
     defaults = default_runtime_config()
@@ -197,7 +224,7 @@ def load_runtime_config(config_path: Path | None = None) -> dict[str, Any]:
     if raw_opts is not None:
         if not isinstance(raw_opts, dict):
             return {**defaults, "config_path": str(eff_path), "config_error": "invalid 'optimizers': expected object"}
-        for key in ("range_trim", "auto_outline", "output_spool"):
+        for key in ("range_trim", "auto_outline", "output_spool", "dynamic_tool_mutation"):
             if key in raw_opts:
                 val = raw_opts[key]
                 if not isinstance(val, str) or val not in OPTIMIZER_MODES:
@@ -257,7 +284,11 @@ def load_runtime_config(config_path: Path | None = None) -> dict[str, Any]:
                 return {**defaults, "config_path": str(eff_path), "config_error": "invalid 'spool'"}
             spool_out["max_spool_entry_bytes"] = mval
 
-    return {
+    gov_out, gov_err = _parse_governor_config(raw.get("governor"))
+    if gov_err is not None:
+        return {**defaults, "config_path": str(eff_path), "config_error": gov_err}
+
+    out: dict[str, Any] = {
         "read_confirm_policy": read_policy_raw,
         "optimizers": opt_out,
         "integrations": int_out,
@@ -271,6 +302,9 @@ def load_runtime_config(config_path: Path | None = None) -> dict[str, Any]:
         "config_path": str(eff_path),
         "config_error": None,
     }
+    if gov_out is not None:
+        out["governor"] = gov_out
+    return out
 
 
 _RTK_CMD_RE = re.compile(r"(?:^|[\s;|&(/\\])rtk(?:\.exe)?(?=$|[\s;|&)])")

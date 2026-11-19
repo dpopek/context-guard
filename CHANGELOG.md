@@ -6,6 +6,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 ## [Unreleased]
 
 ### Fixed
+- **Governor config & payloads (`hooks/`, `policies/`, `evidence/`):** Keep `governor`/`dynamic_tool_mutation`, payload & provider gates.
+- **Cursor MCP spool (`spool/`, `hooks/harness_adapter.py`):** Decode Cursor JSON payloads, skip errors/redacted, emit dict output.
+- **Lock-free read ledger (`hooks/file_io.py`, `hooks/read_planner.py`):** Check SHA-256 pre-lock and `(dev, ino, size, mtime_ns)` in lock.
+- **Boundary gate & roadmap (`tests/`, `ROADMAP.md`):** Enforce `bin/*.py <= 350` LOC ceiling and update moved `services/` references.
 - **Spool dedup integrity (`P1-01`):** Verify existing dedup blobs outside lock, quarantine corrupt blobs, and write fresh generations.
 - **Spool GC epoch & inode safety (`P1-02`):** Bump `id_epoch` on prune and verify `(dev, ino, mtime_ns)` before GC unlinks.
 - **Lock-free orphan GC (`P2-01`):** Stage expired orphans under lock via rename, unlink outside lock, and count `0 B` for missing blobs.

@@ -433,6 +433,19 @@ def resolve_capability_requirement(
             verification_source=source,
             runtime_verified=False,
         )
+    if eff_claim == "provider_supported" or policies_governor.is_provider_only_evidence(verification_evidence):
+        ev_label = (
+            scrub_home_paths(verification_evidence.strip())
+            if (has_evidence and verification_evidence is not None)
+            else "provider_supported"
+        )
+        return CapabilityRequirementV1(
+            capability_id=key.capability_id,
+            evidence_level="provider_supported",
+            attestation_key=asdict(key),
+            verification_source=f"provider_only_rejected:{key.harness_id}:{ev_label}",
+            runtime_verified=False,
+        )
     if eff_claim == "runtime_verified" and bool(runtime_probe_passed) and has_evidence:
         evidence_level, runtime_verified = "runtime_verified", True
         source = scrub_home_paths(verification_evidence.strip()) if verification_evidence is not None else "runtime_probe"
@@ -467,7 +480,9 @@ def collect_environment_metadata(
     for cap_id in REQUIRED_EVIDENCE_CAPABILITIES:
         key = build_capability_attestation_key(clean_harness, cap_id, harness_build_id=clean_build, adapter_version=ADAPTER_CONTRACT_VERSION, hook_config_fingerprint=fingerprint)
         ev_str = verifications.get(cap_id)
-        if isinstance(ev_str, str) and ev_str.strip():
+        if isinstance(ev_str, str) and policies_governor.is_provider_only_evidence(ev_str):
+            reqs.append(resolve_capability_requirement(key, claimed_level="provider_supported", runtime_probe_passed=False, verification_evidence=ev_str.strip()))
+        elif isinstance(ev_str, str) and ev_str.strip():
             reqs.append(resolve_capability_requirement(key, claimed_level="runtime_verified", runtime_probe_passed=True, verification_evidence=ev_str.strip()))
         else:
             reqs.append(resolve_capability_requirement(key, claimed_level="harness_exposed"))

@@ -505,6 +505,142 @@ def test_harness_adapter_delete_file_and_notebook_read_cell_id() -> None:
         "hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": {"k": 1}}
     }
     assert harness_adapter.format_post_tool_spool_response("cursor", SpoolDecision("cursor", "sp", "text", {})) == {
-        "updated_mcp_tool_output": "sp"
+        "updated_mcp_tool_output": {"content": [{"type": "text", "text": "sp"}]}
+    }
+    assert harness_adapter.format_post_tool_spool_response("cursor", SpoolDecision("cursor", {"text": "sp"}, "text", {})) == {
+        "updated_mcp_tool_output": {"text": "sp"}
     }
     assert harness_adapter.format_post_tool_spool_response("claude", None) == {}
+
+
+def test_commit_planned_file_read_avoids_in_lock_hashing_and_plain_rehash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sdir = tmp_path / "state"
+    target = tmp_path / "ledger_perf.py"
+    target.write_text("\n".join(f"val_{i} = {i}" for i in range(1, 140)) + "\n", encoding="utf-8")
+
+    lock_held = [False]
+    hash_calls: list[tuple[str, str, bool]] = []
+    real_compute = file_io.compute_file_sha256
+    real_stat_sha = file_io.stat_and_compute_file_sha256
+
+    def _spy_compute(path: str) -> str | None:
+        hash_calls.append(("compute", os.path.realpath(path), lock_held[0]))
+        return real_compute(path)
+
+    def _spy_stat_sha(path: str) -> tuple[str | None, file_io.FileStatIdentity | None]:
+        hash_calls.append(("stat_sha", os.path.realpath(path), lock_held[0]))
+        return real_stat_sha(path)
+
+    @contextmanager
+    def _tracking_lock(p: Path) -> Iterator[Any]:
+        with state_store.locked_state(p) as txn:
+            lock_held[0] = True
+            try:
+                yield txn
+            finally:
+                lock_held[0] = False
+
+    monkeypatch.setattr(file_io, "compute_file_sha256", _spy_compute)
+    monkeypatch.setattr(file_io, "stat_and_compute_file_sha256", _spy_stat_sha)
+
+    # 1) Plain untrimmed read hashes once in plan and 0 times in commit
+    hash_calls.clear()
+    pl_plain = read_planner.plan_file_read_verdict(
+        sdir, str(target), 1, 40, 0, 1, min_tier=1, call_id="c1", locked_state_fn=_tracking_lock,
+    )
+    assert len(hash_calls) == 1 and hash_calls[0][2] is False
+    hash_calls.clear()
+    res_plain = read_planner.commit_planned_file_read(pl_plain)
+    assert res_plain.decision == {"decision": "allow"}
+    assert hash_calls == []
+    post_tool_use.handle_post_tool_use(
+        "antigravity",
+        {"conversationId": "s-lock", "stepIdx": 1, "toolCall": {"id": "c1", "name": "read_file", "args": {"Path": str(target), "StartLine": 1, "EndLine": 40}}},
+        state_dir=str(sdir),
+    )
+
+    # 2) Trimmed read hashes pre-lock in commit, 0 times inside lock
+    hash_calls.clear()
+    pl_trim = read_planner.plan_file_read_verdict(
+        sdir, str(target), 1, 80, 0, 2, min_tier=1, call_id="c2", locked_state_fn=_tracking_lock,
+    )
+    assert pl_trim.outcome.decision == {"decision": "allow", "overwrite": {"StartLine": 41, "EndLine": 80}}
+    res_trim = read_planner.commit_planned_file_read(pl_trim)
+    assert res_trim.decision == {"decision": "allow", "overwrite": {"StartLine": 41, "EndLine": 80}}
+    assert [c for c in hash_calls if c[2]] == [] and len(hash_calls) == 2
+
+    # 3) Redirected read against existing unwrapped artifact performs 0 hashes inside lock
+    mcp_dir = tmp_path / ".system_generated" / "steps" / "91"
+    mcp_dir.mkdir(parents=True)
+    mcp_file = mcp_dir / "output.txt"
+    inner_py = mcp_dir / "inner_redir.py"
+    code = "\n".join(f"def f_{i}() -> int:\n    return {i}" for i in range(150))
+    mcp_file.write_text(json.dumps({"file_name": "inner_redir.py", "content": code}) + (" " * 17000), encoding="utf-8")
+    assert read_planner.handle_file_read_verdict(sdir, str(mcp_file), 1, -1, 0, 3, call_id="c-ol").decision["decision"] == "deny"
+    assert inner_py.is_file()
+
+    hash_calls.clear()
+    pl_redir = read_planner.plan_file_read_verdict(
+        sdir, str(mcp_file), 1, 30, 0, 4, call_id="c3", locked_state_fn=_tracking_lock,
+    )
+    assert pl_redir.outcome.decision.get("overwrite", {}).get("Path") == os.path.realpath(str(inner_py))
+    res_redir = read_planner.commit_planned_file_read(pl_redir)
+    assert res_redir.decision.get("overwrite", {}).get("Path") == os.path.realpath(str(inner_py))
+    assert [c for c in hash_calls if c[2]] == []
+
+
+def test_commit_planned_file_read_catches_race_in_lock_and_same_stat_trim_mutation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    sdir = tmp_path / "state"
+    target = tmp_path / "stale_race.py"
+    original = "\n".join(f"aa_{i:03d} = {i:04d}" for i in range(1, 130)) + "\n"
+    target.write_text(original, encoding="utf-8")
+    canon = os.path.realpath(str(target))
+
+    assert read_planner.handle_file_read_verdict(sdir, str(target), 1, 40, 0, 1, min_tier=1, call_id="c1").decision == {"decision": "allow"}
+    post_tool_use.handle_post_tool_use(
+        "antigravity",
+        {"conversationId": "s-race", "stepIdx": 1, "toolCall": {"id": "c1", "name": "read_file", "args": {"Path": str(target), "StartLine": 1, "EndLine": 40}}},
+        state_dir=str(sdir),
+    )
+
+    # 1) Same-size, preserved-mtime_ns mutation between plan and commit on a trimmed plan
+    st_before = os.stat(target)
+    pl_same = read_planner.plan_file_read_verdict(sdir, str(target), 1, 90, 0, 2, min_tier=1, call_id="c-same")
+    assert pl_same.outcome.decision == {"decision": "allow", "overwrite": {"StartLine": 41, "EndLine": 90}}
+    mutated_same = original.replace("aa_", "bb_")
+    assert len(mutated_same.encode("utf-8")) == len(original.encode("utf-8"))
+    target.write_text(mutated_same, encoding="utf-8")
+    os.utime(target, ns=(st_before.st_atime_ns, st_before.st_mtime_ns))
+    assert pl_same.meta is not None and file_io.stat_file_identity(str(target)) == pl_same.meta.target_stat
+    res_same = read_planner.commit_planned_file_read(pl_same)
+    assert res_same.decision == {"decision": "allow"} and res_same.intervention is None
+    assert "aborted stale plan" in capsys.readouterr().err
+    saved = json.loads(state_store.state_file_in(sdir).read_text(encoding="utf-8"))
+    assert "c-same" not in (saved["files"][canon].get("pending_reads") or {})
+
+    # 2) Concurrent mutation right before lock entry caught inside lock by stat_file_identity
+    assert read_planner.handle_file_read_verdict(sdir, str(target), 1, 40, 0, 3, min_tier=1, call_id="c2").decision == {"decision": "allow"}
+    post_tool_use.handle_post_tool_use(
+        "antigravity",
+        {"conversationId": "s-race", "stepIdx": 3, "toolCall": {"id": "c2", "name": "read_file", "args": {"Path": str(target), "StartLine": 1, "EndLine": 40}}},
+        state_dir=str(sdir),
+    )
+
+    @contextmanager
+    def _mutating_before_lock_body(p: Path) -> Iterator[Any]:
+        target.write_text(mutated_same + "extra_race_line = 999\n", encoding="utf-8")
+        with state_store.locked_state(p) as txn:
+            yield txn
+
+    pl_race = read_planner.plan_file_read_verdict(sdir, str(target), 1, 80, 0, 4, min_tier=1, call_id="c-race")
+    assert pl_race.outcome.decision == {"decision": "allow", "overwrite": {"StartLine": 41, "EndLine": 80}}
+    pl_race = pl_race._replace(locked_state_fn=_mutating_before_lock_body)
+    res_race = read_planner.commit_planned_file_read(pl_race)
+    assert res_race.decision == {"decision": "allow"} and res_race.intervention is None
+    assert "aborted stale plan" in capsys.readouterr().err
+    saved_after = json.loads(state_store.state_file_in(sdir).read_text(encoding="utf-8"))
+    assert "c-race" not in (saved_after["files"][canon].get("pending_reads") or {})

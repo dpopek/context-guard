@@ -405,7 +405,7 @@ All operator workflows route through `bin/cg.py` (`cg <command> [args...]`, `-h`
 | `"spool_index"` | `2` | `spool.store.SPOOL_SCHEMA_VERSION` | `spool_index.json` lifecycle states & eviction tombstones |
 | `"context_receipt"` | `1` | `policies.api.RECEIPT_SCHEMA_VERSION` | `ContextReceiptV1` rows in `receipts.jsonl` |
 | `"outcomes"` | `4` | `hooks.outcomes.SCHEMA_VERSION` | `outcomes.json` intervention/regret/attribution ledger |
-| `"token_usage"` | `3` | `bin.token_usage.USAGE_SCHEMA_VERSION` | `token_usage.json` per-harness/model transcript ledger |
+| `"token_usage"` | `3` | `services.token_usage.USAGE_SCHEMA_VERSION` | `token_usage.json` per-harness/model transcript ledger |
 | `"event_ledger"` | `1` | `evidence.ledger.EVENT_LEDGER_SCHEMA_VERSION` | Deduplicated `evidence_events.json` durable event log |
 | `"evidence_report"` | `1` | `policies.api.EVIDENCE_SCHEMA_VERSION` | `EvidenceContractV1` offline/pilot/release evaluation output |
 | `"capability_contract"` | `1` | `policies.api.CAPABILITY_CONTRACT_SCHEMA_VERSION` | `CapabilityContractV1` & `CapabilityAttestationKey` records |
@@ -465,8 +465,8 @@ Boolean capability flags in `PlatformMatrixContractV1` derive directly from `HAR
 
 | Rollback Path ID | Mechanism | Exact Scope & Guarantee |
 | :--- | :--- | :--- |
-| `staged_pack_transaction_rollback` | `StagedPackTransaction` (`bin/migration_guard.py`) | Stages `*.py` into `.staging-<pack_id>-<pid>`, validates SHA-256 hashes, `POLICY_API_VERSION == 1`, and `preflight_migration_check()` before touching live files; validation or activation failure removes `.staging-*` and restores `config.json` + `policies/<pack_id>` atomically. |
-| `rollback_journal_lifo` | `RollbackJournal` (`bin/migration_guard.py`) | Records pre-mutation file bytes/permissions (`0o600`), directory swaps, and staged directory removals; reverts every operation in strict LIFO order on exception or `--dry-run`. |
+| `staged_pack_transaction_rollback` | `StagedPackTransaction` (`services/migration_guard.py`) | Stages `*.py` into `.staging-<pack_id>-<pid>`, validates SHA-256 hashes, `POLICY_API_VERSION == 1`, and `preflight_migration_check()` before touching live files; validation or activation failure removes `.staging-*` and restores `config.json` + `policies/<pack_id>` atomically. |
+| `rollback_journal_lifo` | `RollbackJournal` (`services/migration_guard.py`) | Records pre-mutation file bytes/permissions (`0o600`), directory swaps, and staged directory removals; reverts every operation in strict LIFO order on exception or `--dry-run`. |
 | `ide_updater_git_reset_keep` | `executeManagedUpdate` (`vscode-extension/updater.js`) | Refuses dirty working trees, records `prevHead`, runs `git fetch` + `git merge --ff-only v<latest>` + `install_harnesses.py --install`, and automatically runs `git -C <plugin_root> reset --keep <prevHead>` if any step fails. |
 | `install_harnesses_uninstall` | `python3 bin/install_harnesses.py --uninstall` | Idempotently removes Context-Guard hooks, `statusLine`, `cursor_spool_mcp`, IDE statusbar extensions, CLI shims (`cg`, `cg-outline`, `cg-spool`, `cg-budget`, `cg-eval`), and managed `outline-pull` instruction blocks while preserving unrelated user hooks. |
 | `git_tag_checkout_reinstall` | Git tag checkout + installer re-sync | Downgrades runtime code, shims, and harness configs cleanly to the prior release: `git -C ~/.gemini/config/plugins/context-guard checkout v4.9.0 && python3 ~/.gemini/config/plugins/context-guard/bin/install_harnesses.py --install`. |

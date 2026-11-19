@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Any
 import pytest
 
 from evidence.conformance import replay_governor_decisions
+from hooks import config as hooks_config, policy_engine, post_tool_use, pre_tool_use
 import policies
 from policies import api as policies_api, governor as policies_governor
 from policies.api import (
@@ -37,6 +39,7 @@ from policies.governor import (
     evaluate_capability_contract,
     evaluate_governor,
     is_optimizer_tripped,
+    is_provider_only_evidence,
     record_governor_signal,
     reset_circuit_breaker,
     resolve_governor_state_path,
@@ -106,6 +109,9 @@ def test_policies_exports_and_governor_constants(tmp_path: Path, monkeypatch: py
     assert resolve_governor_state_path(tmp_path / "custom") == tmp_path / "custom" / "governor_state.json"
     monkeypatch.setenv("CONTEXT_GUARD_STATE_DIR", str(tmp_path / "env_state"))
     assert resolve_governor_state_path() == tmp_path / "env_state" / "governor_state.json"
+    assert "is_provider_only_evidence" in policies_governor.__all__
+    assert is_provider_only_evidence("provider_api:tools") is True
+    assert is_provider_only_evidence("client_probe_ok") is False
 
 
 def test_capability_contract_evidence_levels_and_provider_only_rejection(tmp_path: Path) -> None:
@@ -549,3 +555,229 @@ def test_resolve_governor_state_path_unifies_spool_subdir(
     assert not (spool_dir / DEFAULT_GOVERNOR_STATE_FILENAME).exists()
     assert is_optimizer_tripped("output_spool", state_dir=state_dir) is True
     assert is_optimizer_tripped("output_spool", state_dir=spool_dir) is True
+
+
+def _write_cfg_file(home_dir: Path, payload: dict[str, Any]) -> Path:
+    cfg_path = home_dir / ".config" / "context-guard" / "config.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    hooks_config.clear_config_cache()
+    policy_engine.clear_pack_cache()
+    return cfg_path
+
+
+def _write_sec_pack(home_dir: Path, pack_id: str, blocked_token: str) -> dict[str, Any]:
+    pack_dir = home_dir / ".config" / "context-guard" / "policies" / pack_id
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    src = (
+        "from __future__ import annotations\n"
+        "from policies.api import ALL_SECURITY_SCOPES, PolicyDecision, PolicyPackManifest\n\n"
+        "def evaluate(ctx):\n"
+        "    cmd = str(ctx.canonical_args.get('CommandLine') or ctx.canonical_args.get('command') or '')\n"
+        f"    return PolicyDecision(decision='deny', reason='blocked by {pack_id}') if {blocked_token!r} in cmd else None\n\n"
+        "PACK_MANIFEST = PolicyPackManifest(\n"
+        f"    pack_id={pack_id!r}, api_version=1, kind='security',\n"
+        "    covered_domains=ALL_SECURITY_SCOPES, evaluate=evaluate, harness_matchers={},\n"
+        ")\n"
+    ).encode("utf-8")
+    entry_file = pack_dir / "pack.py"
+    entry_file.write_bytes(src)
+    fh = hashlib.sha256(src).hexdigest()
+    return {
+        "id": pack_id, "path": str(entry_file), "enabled": True, "kind": "security",
+        "scopes": ["file_mutation", "shell_command", "mcp_call"],
+        "file_hashes": {"pack.py": fh},
+        "tree_sha256": hashlib.sha256(f"pack.py:{fh}\n".encode("utf-8")).hexdigest(),
+    }
+
+
+def test_load_runtime_config_validates_governor_and_dynamic_tool_mutation(isolated_user_env: Path) -> None:
+    cfg_path = _write_cfg_file(isolated_user_env, {"read_confirm_policy": "strict"})
+    plain = hooks_config.load_runtime_config(cfg_path)
+    assert plain["config_error"] is None
+    assert "governor" not in plain
+    assert "dynamic_tool_mutation" not in plain["optimizers"]
+    assert "governor" not in hooks_config.REQUIRED_CONFIG_KEYS
+
+    _write_cfg_file(
+        isolated_user_env,
+        {
+            "optimizers": {"output_spool": "active", "dynamic_tool_mutation": "active"},
+            "governor": {
+                "harness_build_id": " 2.1.0 ", "adapter_version": " harness_adapter_v1 ",
+                "require_runtime_verified": True, "evidence_gate_required": False,
+                "evidence_report": {"gate_verdict": {"ok": True}},
+            },
+        },
+    )
+    valid = hooks_config.load_runtime_config(cfg_path)
+    assert valid["config_error"] is None
+    assert valid["optimizers"]["dynamic_tool_mutation"] == "active"
+    assert valid["governor"] == {
+        "harness_build_id": "2.1.0", "adapter_version": "harness_adapter_v1",
+        "require_runtime_verified": True, "evidence_gate_required": False,
+        "evidence_report": {"gate_verdict": {"ok": True}},
+    }
+
+    _write_cfg_file(isolated_user_env, {"governor": {"harness_build_id": None, "require_runtime_verified": True}})
+    nullable = hooks_config.load_runtime_config(cfg_path)
+    assert nullable["config_error"] is None and nullable["governor"] == {"require_runtime_verified": True}
+
+    bad_cases: tuple[tuple[dict[str, Any], str], ...] = (
+        ({"governor": "bad"}, "invalid 'governor': expected object"),
+        ({"governor": {"harness_build_id": "   "}}, "invalid 'governor.harness_build_id'"),
+        ({"governor": {"adapter_version": 123}}, "invalid 'governor.adapter_version'"),
+        ({"governor": {"require_runtime_verified": "true"}}, "invalid 'governor.require_runtime_verified'"),
+        ({"governor": {"evidence_gate_required": 1}}, "invalid 'governor.evidence_gate_required'"),
+        ({"governor": {"evidence_report": ["bad"]}}, "invalid 'governor.evidence_report'"),
+        ({"optimizers": {"dynamic_tool_mutation": "bogus"}}, "invalid 'optimizers.dynamic_tool_mutation'"),
+    )
+    for raw_cfg, expected_err in bad_cases:
+        _write_cfg_file(isolated_user_env, raw_cfg)
+        assert hooks_config.load_runtime_config(cfg_path)["config_error"] == expected_err
+
+
+def test_e2e_config_governor_downgrades_hooks_while_enforcing_security_packs(
+    isolated_user_env: Path, tmp_path: Path,
+) -> None:
+    ws = tmp_path / "ws"
+    (ws / ".git").mkdir(parents=True)
+    pack_entry = _write_sec_pack(isolated_user_env, "gov_sec", "forbidden_gov_cmd")
+    big_out = "\n".join(f"line {i}: " + ("x" * 80) for i in range(260))
+
+    # 1. require_runtime_verified=True + dynamic_tool_mutation=active with empty state_dir
+    _write_cfg_file(
+        isolated_user_env,
+        {
+            "optimizers": {"output_spool": "active", "dynamic_tool_mutation": "active"},
+            "governor": {"require_runtime_verified": True},
+            "policy_packs": [pack_entry],
+        },
+    )
+    loaded_rt = hooks_config.load_runtime_config()
+    assert loaded_rt["config_error"] is None
+    assert loaded_rt["optimizers"]["dynamic_tool_mutation"] == "active"
+    assert loaded_rt["governor"]["require_runtime_verified"] is True
+
+    empty_rt = tmp_path / "empty_rt"
+    empty_rt.mkdir()
+    gov_rt = apply_runtime_governor(loaded_rt, "claude", state_dir=empty_rt, payload={"tool_name": "Bash"})
+    assert gov_rt["optimizers"]["output_spool"] == "shadow"
+    assert gov_rt["optimizers"]["dynamic_tool_mutation"] == "shadow"
+    ev_rt = evaluate_governor("claude", runtime_cfg=loaded_rt, state_dir=empty_rt)
+    assert ev_rt["decisions"]["dynamic_tool_mutation"]["downgraded"] is True
+
+    pre_deny = pre_tool_use.evaluate_hook(
+        {"tool_name": "Bash", "tool_input": {"command": "echo forbidden_gov_cmd"}, "session_id": "s-rt", "cwd": str(ws)},
+        state_dir=str(empty_rt), cli_harness="claude",
+    )
+    assert pre_deny["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "blocked by gov_sec" in pre_deny["hookSpecificOutput"]["permissionDecisionReason"]
+    post_rt = post_tool_use.handle_post_tool_use(
+        "claude",
+        {
+            "hook_event_name": "PostToolUse", "tool_name": "Bash",
+            "tool_input": {"command": "pytest"}, "tool_response": {"stdout": big_out},
+            "session_id": "s-rt", "cwd": str(ws),
+        },
+        state_dir=str(empty_rt),
+    )
+    assert post_rt == {}
+    assert (empty_rt / "shadow.json").is_file()
+
+    # 2. evidence_gate_required=True without evidence_report downgrades output_spool -> shadow
+    _write_cfg_file(
+        isolated_user_env,
+        {
+            "optimizers": {"output_spool": "active"},
+            "governor": {"evidence_gate_required": True},
+            "policy_packs": [pack_entry],
+        },
+    )
+    loaded_ev = hooks_config.load_runtime_config()
+    assert loaded_ev["governor"]["evidence_gate_required"] is True
+    empty_ev = tmp_path / "empty_ev"
+    empty_ev.mkdir()
+    pre_deny_ev = pre_tool_use.evaluate_hook(
+        {"tool_name": "Bash", "tool_input": {"command": "echo forbidden_gov_cmd"}, "session_id": "s-ev", "cwd": str(ws)},
+        state_dir=str(empty_ev), cli_harness="claude",
+    )
+    assert pre_deny_ev["hookSpecificOutput"]["permissionDecision"] == "deny"
+    post_ev = post_tool_use.handle_post_tool_use(
+        "claude",
+        {
+            "hook_event_name": "PostToolUse", "tool_name": "Bash",
+            "tool_input": {"command": "pytest"}, "tool_response": {"stdout": big_out},
+            "session_id": "s-ev", "cwd": str(ws),
+        },
+        state_dir=str(empty_ev),
+    )
+    assert post_ev == {}
+    assert (empty_ev / "shadow.json").is_file()
+
+    # Passing evidence_report ok=True activates output_spool through config.json
+    _write_cfg_file(
+        isolated_user_env,
+        {
+            "optimizers": {"output_spool": "active"},
+            "governor": {"evidence_gate_required": True, "evidence_report": {"gate_verdict": {"ok": True}}},
+        },
+    )
+    post_pass = post_tool_use.handle_post_tool_use(
+        "claude",
+        {
+            "hook_event_name": "PostToolUse", "tool_name": "Bash",
+            "tool_input": {"command": "pytest"}, "tool_response": {"stdout": big_out},
+            "session_id": "s-ev-ok", "cwd": str(ws),
+        },
+        state_dir=str(tmp_path / "empty_ev_ok"),
+    )
+    assert "CONTEXT-GUARD OUTPUT SPOOL" in post_pass["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+
+
+def test_unknown_dict_payloads_and_client_build_version_invalidation(tmp_path: Path) -> None:
+    sec_cfg: dict[str, Any] = {
+        "read_confirm_policy": "strict",
+        "optimizers": {"range_trim": "active", "auto_outline": "active", "cli_rewrites": "auto", "output_spool": "active"},
+        "policy_packs": [{"id": "corp_guard", "enabled": True, "kind": "security", "scopes": ["shell_command"]}],
+        "legacy_security_keys": ("restricted_bq_datasets",),
+    }
+    att_dir = tmp_path / "att_unk"
+    for cap_id in ("pre_tool_interception", "output_replacement", "content_verified_reads"):
+        attest_capability("claude", cap_id, verification_evidence=f"ok:{cap_id}", runtime_cfg=sec_cfg, state_dir=att_dir)
+
+    assert apply_runtime_governor(sec_cfg, "claude", state_dir=att_dir, payload={"tool_name": "Bash"})["optimizers"]["output_spool"] == "active"
+    for bad_payload in ({}, {"unknown_schema": 1}, {"tool_name": 123}, {"tool_name": "   "}, {"toolCall": {"name": 99}}, {"hook_event_name": "BogusEvent"}):
+        out = apply_runtime_governor(sec_cfg, "claude", state_dir=att_dir, payload=bad_payload)
+        assert all(v == "off" for v in out["optimizers"].values())
+        assert out["policy_packs"] == sec_cfg["policy_packs"]
+        assert out["legacy_security_keys"] == sec_cfg["legacy_security_keys"]
+
+    # Client build versions (cursor_version and claude_version) invalidate prior build attestations
+    cur_cfg: dict[str, Any] = {
+        "read_confirm_policy": "strict",
+        "optimizers": {"range_trim": "active"},
+        "governor": {"require_runtime_verified": True},
+    }
+    cur_dir = tmp_path / "cur_build"
+    for cap_id in ("pre_tool_interception", "content_verified_reads"):
+        attest_capability("cursor", cap_id, verification_evidence=f"probe:{cap_id}", harness_build_id="2.1.0", runtime_cfg=cur_cfg, state_dir=cur_dir)
+    cur_same = apply_runtime_governor(cur_cfg, "cursor", state_dir=cur_dir, payload={"tool_name": "Read", "cursor_version": "2.1.0"})
+    assert cur_same["optimizers"]["range_trim"] == "active"
+    cur_upg = apply_runtime_governor(cur_cfg, "cursor", state_dir=cur_dir, payload={"tool_name": "Read", "cursor_version": "2.2.0"})
+    assert cur_upg["optimizers"]["range_trim"] == "shadow"
+    assert evaluate_governor("cursor", runtime_cfg=cur_cfg, state_dir=cur_dir, harness_build_id="2.2.0")["capabilities"]["content_verified_reads"]["invalidated_reason"] == "build_changed"
+
+    cl_cfg: dict[str, Any] = {
+        "read_confirm_policy": "strict",
+        "optimizers": {"output_spool": "active"},
+        "governor": {"require_runtime_verified": True},
+    }
+    cl_dir = tmp_path / "cl_build"
+    for cap_id in ("pre_tool_interception", "output_replacement"):
+        attest_capability("claude", cap_id, verification_evidence=f"probe:{cap_id}", harness_build_id="2.1.0", runtime_cfg=cl_cfg, state_dir=cl_dir)
+    cl_same = apply_runtime_governor(cl_cfg, "claude", state_dir=cl_dir, payload={"tool_name": "Bash", "claude_version": "2.1.0"})
+    assert cl_same["optimizers"]["output_spool"] == "active"
+    cl_upg = apply_runtime_governor(cl_cfg, "claude", state_dir=cl_dir, payload={"tool_name": "Bash", "claude_version": "2.2.0"})
+    assert cl_upg["optimizers"]["output_spool"] == "shadow"
+    assert evaluate_governor("claude", runtime_cfg=cl_cfg, state_dir=cl_dir, harness_build_id="2.2.0")["capabilities"]["output_replacement"]["invalidated_reason"] == "build_changed"

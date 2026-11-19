@@ -459,24 +459,54 @@ def has_tool_error_signal(payload: Mapping[str, Any], resp: Any) -> bool:
     return False
 
 
+def _decode_cursor_tool_output(resp: Any) -> Any:
+    if not isinstance(resp, str) or not resp.lstrip().startswith(("{", "[")):
+        return resp
+    try:
+        parsed = json.loads(resp)
+    except ValueError:
+        return resp
+    return parsed if isinstance(parsed, (Mapping, list)) else resp
+
+
+def _is_text_block_list(val: Any) -> bool:
+    return bool(
+        isinstance(val, list) and val
+        and all(isinstance(b, Mapping) and b.get("type") == "text" and isinstance(b.get("text"), str) for b in val)
+    )
+
+
 def extract_tool_payload_text(harness: str, resp: Any, is_shell: bool) -> tuple[str | bytes | None, str | None]:
     """Extract raw tool output text/bytes and its structural shape from a PostToolUse response."""
-    if harness == "cursor" and isinstance(resp, str) and is_shell:
-        try:
-            if isinstance((parsed := json.loads(resp)), Mapping):
-                resp = parsed
-        except ValueError:
-            pass
+    if harness == "cursor" and isinstance(resp, str):
+        resp = _decode_cursor_tool_output(resp)
     if isinstance(resp, (str, bytes)):
         return resp, ("bytes" if isinstance(resp, bytes) else "str")
     if isinstance(resp, Mapping):
-        if harness == "cursor" and (resp.get("redacted") is True or has_tool_error_signal({}, resp)):
+        if harness == "cursor" and (any(resp.get(k) is True for k in ("redacted", "truncated", "is_truncated", "unavailable")) or has_tool_error_signal({}, resp)):
             return None, None
+        if isinstance((content := resp.get("content")), list):
+            return ("\n".join(b["text"] for b in content), "mcp_content") if _is_text_block_list(content) else (None, None)
         keys = ("text", "output", "content", "stdout") if harness == "cursor" else ("output", "stdout")
         return next(((resp[k], k) for k in keys if isinstance(resp.get(k), (str, bytes))), (None, None))
-    if isinstance(resp, list) and resp and all(isinstance(b, Mapping) and b.get("type") == "text" and isinstance(b.get("text"), str) for b in resp):
+    if isinstance(resp, list) and _is_text_block_list(resp):
         return "\n".join(b["text"] for b in resp), "blocks"
     return None, None
+
+
+def format_spooled_tool_output(harness: str, shape: str | None, raw_resp: Any, summary: str) -> Any:
+    """Shape a spooled summary back into the harness's native tool-output structure."""
+    if shape == "mcp_content" and isinstance(raw_resp, Mapping):
+        return {**{k: v for k, v in raw_resp.items() if k not in ("content", "structuredContent")}, "content": [{"type": "text", "text": summary}]}
+    if harness == "cursor":
+        if isinstance(raw_resp, Mapping) and shape in ("text", "output", "content", "stdout"):
+            return {**raw_resp, str(shape): summary}
+        return {"content": [{"type": "text", "text": summary}]}
+    if shape in ("str", "bytes", None):
+        return summary
+    if shape == "blocks":
+        return [{"type": "text", "text": summary}]
+    return {**raw_resp, str(shape): summary} if isinstance(raw_resp, Mapping) else summary
 
 
 def byte_offset_for_line(lines: list[str], idx: int) -> int:
@@ -545,6 +575,8 @@ def prepare_post_tool_spool_candidate(
     shell_cmd = rc if isinstance(rc, str) else (" ".join(str(x) for x in rc) if isinstance(rc, list) else "")
     inner = str(raw_in.get("name") or raw_in.get("tool_name") or "") if tool_name == "call_mcp_tool" else tool_name
     raw_resp = payload.get("tool_output") if harness == "cursor" else payload.get("tool_response", payload.get("tool_output"))
+    if harness == "cursor":
+        raw_resp = _decode_cursor_tool_output(raw_resp)
     eligible = is_shell or tool_name.startswith(("mcp__", "MCP:")) or tool_name == "call_mcp_tool"
     is_self = inner.rsplit("__", 1)[-1].rsplit(":", 1)[-1] in _SELF_MCP_LEAVES or (is_shell and bool(_SELF_CLI_RE.search(shell_cmd)))
     if not tool_name or tool_name in _SKIP_SPOOL_TOOLS or not eligible or is_self or has_tool_error_signal(payload, raw_resp):
@@ -556,6 +588,8 @@ def prepare_post_tool_spool_candidate(
     if raw_text is not None and shape is None:
         shape = "bytes" if isinstance(raw_text, bytes) else "str"
     up_trunc = bool(payload.get("truncated") or payload.get("is_truncated") or (isinstance(raw_resp, Mapping) and (raw_resp.get("truncated") or raw_resp.get("is_truncated"))))
+    if harness == "cursor" and up_trunc:
+        return None
     return tool_name, raw_in, is_shell, shell_cmd, raw_resp, eff_raw, shape, up_trunc
 
 
