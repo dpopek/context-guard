@@ -10,7 +10,8 @@ import time
 from typing import Any
 import pytest
 
-from bin.cg_explain import explain_intervention, main as explain_main, render_explain_markdown
+from bin.cg_explain import main as explain_main
+from services.explain_service import explain_intervention, render_explain_markdown
 from evidence.ledger import ingest_context_receipts
 from policies import (
     BACKEND_BENCHMARK_SCHEMA_VERSION,

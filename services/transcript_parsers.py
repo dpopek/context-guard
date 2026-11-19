@@ -3,17 +3,11 @@
 from __future__ import annotations
 
 import re
-import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any
 
-_PACKAGE_ROOT = Path(__file__).resolve().parent.parent
-if str(_PACKAGE_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PACKAGE_ROOT))
-
-from hooks.model_identity import (  # noqa: E402
+from hooks.model_identity import (
     UNKNOWN_MODEL,
     extract_antigravity_model_change,
     normalize_model_label,

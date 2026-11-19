@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 import bin.cg_status as cg_status
-from bin import token_usage
+from services import harness_status, status_service, token_usage
 
 
 def seed_claude_transcript() -> None:
@@ -113,7 +113,7 @@ def test_cg_status_doctor_reports_healthy_environment_and_harnesses(
         encoding="utf-8",
     )
 
-    report = cg_status.run_doctor(
+    report = status_service.run_doctor(
         plugin_root=plugin_root,
         claude_settings_path=claude_cfg,
         cursor_hooks_path=cursor_cfg,
@@ -129,11 +129,11 @@ def test_cg_status_doctor_reports_healthy_environment_and_harnesses(
         "cursor": True,
         "codex": True,
     }
-    rendered = cg_status.render_doctor_report(report)
+    rendered = status_service.render_doctor_report(report)
     assert "# Context-Guard Doctor" in rendered
     assert "OK" in rendered
 
-    monkeypatch.setattr(cg_status, "ROOT", plugin_root)
+    monkeypatch.setattr(status_service, "ROOT", plugin_root)
     assert cg_status.main(["--doctor"]) == 0
     cli_out = capsys.readouterr().out
     assert "# Context-Guard Doctor" in cli_out
@@ -146,14 +146,14 @@ def test_cg_status_doctor_detects_unwritable_telemetry_dir(
     # Create telemetry as a regular file so mkdir(telemetry) fails with OSError
     plugin_root.mkdir(parents=True)
     (plugin_root / "telemetry").write_text("not a dir", encoding="utf-8")
-    report = cg_status.run_doctor(plugin_root=plugin_root)
+    report = status_service.run_doctor(plugin_root=plugin_root)
     assert report["telemetry_dir"]["ok"] is False
     assert report["harnesses"]["antigravity"] is False
     assert report["ok"] is False
-    rendered = cg_status.render_doctor_report(report)
+    rendered = status_service.render_doctor_report(report)
     assert "FAIL" in rendered
 
-    monkeypatch.setattr(cg_status, "ROOT", plugin_root)
+    monkeypatch.setattr(status_service, "ROOT", plugin_root)
     assert cg_status.main(["--doctor"]) == 1
     assert "FAIL" in capsys.readouterr().out
 
@@ -174,9 +174,9 @@ def test_bin_modules_bootstrap_sys_path_independently(tmp_path: Path) -> None:
     import sys
 
     repo_root = Path(__file__).resolve().parent.parent
-    for rel in ("bin/harness_status.py", "bin/usage_report.py"):
+    for rel in ("bin/cg_status.py", "bin/install_harnesses.py"):
         proc = subprocess.run(
-            [sys.executable, str(repo_root / rel)],
+            [sys.executable, str(repo_root / rel), "--help"],
             cwd=str(tmp_path),
             capture_output=True,
             text=True,
@@ -201,9 +201,9 @@ def test_checkout_without_local_stats_warns_when_installed_telemetry_exists(
     monkeypatch.setenv("HOME", str(fake_home))
     monkeypatch.setenv("USERPROFILE", str(fake_home))
     monkeypatch.delenv("CONTEXT_GUARD_HOME", raising=False)
-    monkeypatch.setattr(cg_status, "resolve_plugin_root", lambda default_root=None: checkout_root)
+    monkeypatch.setattr(status_service, "resolve_plugin_root", lambda default_root=None: checkout_root)
 
-    msg = cg_status.detect_checkout_telemetry_mismatch()
+    msg = status_service.detect_checkout_telemetry_mismatch()
     assert msg is not None
     assert str(checkout_root.resolve()) in msg
     assert "CONTEXT_GUARD_HOME" in msg
@@ -228,11 +228,11 @@ def test_checkout_warning_suppressed_with_env_explicit_paths_or_local_stats(
 
     monkeypatch.setenv("HOME", str(fake_home))
     monkeypatch.setenv("USERPROFILE", str(fake_home))
-    monkeypatch.setattr(cg_status, "resolve_plugin_root", lambda default_root=None: checkout_root)
+    monkeypatch.setattr(status_service, "resolve_plugin_root", lambda default_root=None: checkout_root)
 
     # 1. Suppressed when CONTEXT_GUARD_HOME is explicitly set.
     monkeypatch.setenv("CONTEXT_GUARD_HOME", str(checkout_root))
-    assert cg_status.detect_checkout_telemetry_mismatch() is None
+    assert status_service.detect_checkout_telemetry_mismatch() is None
 
     # 2. Suppressed when explicit CLI path flag is passed.
     monkeypatch.delenv("CONTEXT_GUARD_HOME", raising=False)
@@ -241,11 +241,11 @@ def test_checkout_warning_suppressed_with_env_explicit_paths_or_local_stats(
     assert capsys.readouterr().err == ""
 
     # 3. Suppressed when active root IS the installed plugin root.
-    assert cg_status.detect_checkout_telemetry_mismatch(plugin_root=installed_root, home_dir=fake_home) is None
+    assert status_service.detect_checkout_telemetry_mismatch(plugin_root=installed_root, home_dir=fake_home) is None
 
     # 4. Suppressed once checkout has its own stats.json.
     (checkout_root / "telemetry" / "stats.json").write_text('{"saved_tokens": 1}', encoding="utf-8")
-    assert cg_status.detect_checkout_telemetry_mismatch() is None
+    assert status_service.detect_checkout_telemetry_mismatch() is None
 
 
 def test_refresh_usage_migrates_legacy_antigravity_and_codex_preserving_claude(tmp_path: Path) -> None:
@@ -377,7 +377,6 @@ def test_refresh_usage_migrates_legacy_antigravity_and_codex_preserving_claude(t
 
 def test_harness_status_validates_json_and_verifies_targets_on_disk(tmp_path: Path) -> None:
     import os
-    from bin import harness_status
 
     real_hook = tmp_path / "dir with spaces" / "hooks" / "pre_tool_use.py"
     real_hook.parent.mkdir(parents=True)
@@ -446,12 +445,12 @@ def test_read_nonblocking_stdin_json_hybrid_zero_thread_leak_and_fallbacks(
             with os.fdopen(r_fd, "r", encoding="utf-8") as r_stream:
                 monkeypatch.setattr(sys, "stdin", r_stream)
                 # Empty open pipe: times out in select without spawning any thread
-                assert cg_status.read_nonblocking_stdin_json(timeout_s=0.01) == {}
+                assert status_service.read_nonblocking_stdin_json(timeout_s=0.01) == {}
                 assert spawned == []
 
                 # Write JSON without closing write fd: reads immediately without hanging or spawning threads
                 os.write(w_fd, b'{"model": {"display_name": "Opus"}}')
-                assert cg_status.read_nonblocking_stdin_json(timeout_s=0.05) == {
+                assert status_service.read_nonblocking_stdin_json(timeout_s=0.05) == {
                     "model": {"display_name": "Opus"}
                 }
                 assert spawned == []
@@ -460,7 +459,7 @@ def test_read_nonblocking_stdin_json_hybrid_zero_thread_leak_and_fallbacks(
 
     # StringIO raises UnsupportedOperation in select -> falls back to daemon thread
     monkeypatch.setattr(sys, "stdin", io.StringIO('{"session_id": "s1"}'))
-    assert cg_status.read_nonblocking_stdin_json(timeout_s=0.05) == {"session_id": "s1"}
+    assert status_service.read_nonblocking_stdin_json(timeout_s=0.05) == {"session_id": "s1"}
     assert len(spawned) == 1
     assert spawned[0].daemon is True
 
@@ -472,12 +471,12 @@ def test_read_nonblocking_stdin_json_hybrid_zero_thread_leak_and_fallbacks(
         lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("select must not be called on win32")),
     )
     monkeypatch.setattr(sys, "stdin", io.StringIO('{"ok": true}'))
-    assert cg_status.read_nonblocking_stdin_json(timeout_s=0.05) == {"ok": True}
+    assert status_service.read_nonblocking_stdin_json(timeout_s=0.05) == {"ok": True}
     assert len(spawned) == 2
 
     # Invalid / non-dict JSON returns {}
     monkeypatch.setattr(sys, "stdin", io.StringIO("[1, 2, 3]"))
-    assert cg_status.read_nonblocking_stdin_json(timeout_s=0.05) == {}
+    assert status_service.read_nonblocking_stdin_json(timeout_s=0.05) == {}
 
 
 def test_run_doctor_subprocess_timeout_harness_details_and_win32_python3_stub(
@@ -517,7 +516,7 @@ def test_run_doctor_subprocess_timeout_harness_details_and_win32_python3_stub(
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr(shutil, "which", lambda cmd: str(stub_py3) if cmd == "python3" else None)
 
-    report = cg_status.run_doctor(
+    report = status_service.run_doctor(
         plugin_root=plugin_root,
         claude_settings_path=claude_cfg,
         cursor_hooks_path=cursor_cfg,
@@ -528,14 +527,14 @@ def test_run_doctor_subprocess_timeout_harness_details_and_win32_python3_stub(
     assert report["harness_details"]["claude"]["target_exists"] is False
     assert report["python"]["python3_available"] is False
     assert report["python"]["python3_stub"] is True
-    rendered = cg_status.render_doctor_report(report)
+    rendered = status_service.render_doctor_report(report)
     assert "missing target" in rendered
 
     real_py3 = tmp_path / "Python312" / "python3.exe"
     real_py3.parent.mkdir(parents=True)
     real_py3.write_bytes(b"MZ")
     monkeypatch.setattr(shutil, "which", lambda cmd: str(real_py3) if cmd == "python3" else None)
-    report_ok = cg_status.run_doctor(
+    report_ok = status_service.run_doctor(
         plugin_root=plugin_root,
         claude_settings_path=claude_cfg,
         cursor_hooks_path=cursor_cfg,

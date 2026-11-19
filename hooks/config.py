@@ -5,12 +5,11 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Mapping
 
-from hooks.state_store import warn
+from core.platform_io import warn
 
 DEFAULT_USER_CONFIG_PATH = Path.home() / ".config" / "context-guard" / "config.json"
 KNOWN_HARNESSES = ("antigravity", "claude", "cursor", "codex")
@@ -267,66 +266,46 @@ def load_runtime_config(config_path: Path | None = None) -> dict[str, Any]:
         "model_labels": model_labels,
         "repo_map_path": repo_map_path,
         "workspace_root": workspace_root,
-        "legacy_security_keys": legacy_keys, "spool": spool_out,
+        "legacy_security_keys": legacy_keys,
+        "spool": spool_out,
         "config_path": str(eff_path),
         "config_error": None,
     }
 
 
-def _rjson(p: Path) -> dict[str, Any]:
-    try: return d if isinstance((d := json.loads(p.read_text(encoding="utf-8"))), dict) else {}
-    except (OSError, ValueError): return {}
-def _cg_hooks(p: Path, key: str) -> list[Mapping[str, Any]]:
-    hm = _rjson(p).get("hooks")
-    raw = hm.get(key) if isinstance(hm, Mapping) else []
-    subs = [h for g in (raw if isinstance(raw, list) else []) if isinstance(g, Mapping)
-            for hs in (g.get("hooks"),) for h in (hs if isinstance(hs, list) else [g])]
-    toks = ("pre_tool_use", "context-guard", "context_guard")
-    return [h for h in subs if isinstance(h, Mapping) and any(t in str(h.get("command") or "") for t in toks)]
-def probe_claude_cli_version(
-    claude_bin: str = "claude", *, env: Mapping[str, str] | None = None, runner: Callable[..., Any] | None = None,
-) -> tuple[int, int, int] | None:
-    """Run `[claude_bin, '--version']` (timeout=2) and return `(major, minor, patch)` or None."""
+_RTK_CMD_RE = re.compile(r"(?:^|[\s;|&(/\\])rtk(?:\.exe)?(?=$|[\s;|&)])")
+
+
+def _parse_hooks_section_for_rtk(cfg_file: Path) -> Any:
     try:
-        kw: dict[str, Any] = {"capture_output": True, "text": True, "timeout": 2, "check": False}
-        if env is not None: kw["env"] = dict(env)
-        p = (runner or subprocess.run)([claude_bin, "--version"], **kw)
-        out = f"{getattr(p, 'stdout', '') or ''}\n{getattr(p, 'stderr', '') or ''}"
-        m = re.search(r"(\d+)\.(\d+)\.(\d+)", out) if getattr(p, "returncode", 0) == 0 else None
-        return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
-    except (subprocess.SubprocessError, OSError, ValueError): return None
-def inspect_native_security_drift(
-    runtime_cfg: Mapping[str, Any] | None = None, *, claude_settings_path: Path | None = None,
-    cursor_hooks_path: Path | None = None, codex_hooks_path: Path | None = None,
-    codex_config_path: Path | None = None, claude_version: tuple[int, int, int] | None = None, probe_claude: bool = False,
-) -> dict[str, Any]:
-    """Inspect Claude, Cursor, and Codex native configs for fail-closed security drift."""
-    cfg = runtime_cfg if runtime_cfg is not None else load_runtime_config()
-    packs, h = cfg.get("policy_packs"), Path.home()
-    sec = bool(cfg.get("config_error") or cfg.get("legacy_security_keys") or (isinstance(packs, list) and any(
-        isinstance(e, Mapping) and e.get("enabled", True) and str(e.get("kind") or "security") == "security" for e in packs)))
-    c_h = _cg_hooks(claude_settings_path or (h / ".claude" / "settings.json"), "PreToolUse")
-    cu_h = _cg_hooks(cursor_hooks_path or (h / ".cursor" / "hooks.json"), "preToolUse")
-    cx_h = _cg_hooks(codex_hooks_path or (h / ".codex" / "hooks.json"), "PreToolUse")
-    c_fc, cu_fc = bool(c_h) and all(x.get("onFailure") == "block" for x in c_h), bool(cu_h) and all(x.get("failClosed") is True for x in cu_h)
-    ver = probe_claude_cli_version() if (claude_version is None and probe_claude and sec) else claude_version
-    try: toml = (codex_config_path or (h / ".codex" / "config.toml")).read_text(encoding="utf-8")
-    except OSError: toml = ""
-    drift = ["NATIVE_FAIL_CLOSED_DRIFT"] if sec and ((cu_h and not cu_fc) or (c_h and ver is not None and ver >= (2, 1, 295) and not c_fc)) else []
-    notice = ["Codex needs [features].hooks=true & trust_level; apply_patch: openai/codex#27833."] if sec else []
-    return {
-        "security_active": sec, "ok": not drift, "drift_codes": drift, "remediation": "Re-run install_harnesses.py for failClosed/onFailure=block." if drift else None,
-        "claude": {"registered": bool(c_h), "on_failure_block": c_fc, "degraded_older_cli": bool(sec and c_h and ver is not None and ver < (2, 1, 295)), "version": ".".join(map(str, ver)) if ver is not None else None},
-        "cursor": {"registered": bool(cu_h), "fail_closed": cu_fc},
-        "codex": {"registered": bool(cx_h), "notices": notice, "has_trust_level": bool(re.search(r"^\s*trust_level\s*=", toml, re.M)), "features_hooks_enabled": bool(re.search(r"^\s*\[features\][^\[]*?^\s*hooks\s*=\s*true\b", toml, re.M | re.S))}}
+        raw_text = cfg_file.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        warn(f"unable to read hook config {cfg_file}: {type(exc).__name__}: {exc}")
+        return None
+    try:
+        parsed = json.loads(raw_text)
+    except (ValueError, TypeError) as exc:
+        warn(f"corrupt JSON in hook config {cfg_file}: {exc}")
+        return None
+    if not isinstance(parsed, Mapping):
+        warn(f"invalid JSON root in hook config {cfg_file}: expected object")
+        return None
+    return parsed.get("hooks")
+
+
 def scan_hooks_for_rtk(cwd: str | Path | None = None, *, home: Path | None = None) -> bool:
     """Return True if Claude or Cursor user/workspace hook configs invoke `rtk`."""
-    roots, rels = [home or Path.home()] + ([Path(cwd)] if cwd else []), ((".claude", "settings.json"), (".claude", "settings.local.json"), (".cursor", "hooks.json"))
-    q: list[Any] = [_rjson(r.joinpath(*p)).get("hooks") for r in roots for p in rels]
-    while q:
-        cur = q.pop()
+    roots = [home or Path.home()] + ([Path(cwd)] if cwd else [])
+    rels = ((".claude", "settings.json"), (".claude", "settings.local.json"), (".cursor", "hooks.json"))
+    queue = [h for r in roots for p in rels if (h := _parse_hooks_section_for_rtk(r.joinpath(*p))) is not None]
+    while queue:
+        cur = queue.pop()
         if isinstance(cur, Mapping):
-            if isinstance((c := cur.get("command")), str) and re.search(r"(?:^|[\s;|&(/\\])rtk(?:\.exe)?(?=$|[\s;|&)])", c): return True
-            q.extend(v for k, v in cur.items() if k != "command")
-        elif isinstance(cur, list): q.extend(cur)
+            if isinstance((cmd := cur.get("command")), str) and _RTK_CMD_RE.search(cmd):
+                return True
+            queue.extend(val for key, val in cur.items() if key != "command")
+        elif isinstance(cur, list):
+            queue.extend(cur)
     return False

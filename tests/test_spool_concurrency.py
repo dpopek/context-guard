@@ -14,18 +14,33 @@ from typing import Any
 import pytest
 
 from hooks import config
+from hooks.harness_adapter import format_post_tool_spool_response
 from hooks.post_tool_use import handle_post_tool_use
 from spool import store as spool_store
-from spool.receipts import RECEIPTS_FILENAME, summarize_spool_lifecycle
+from spool.receipts import (
+    RECEIPTS_FILENAME,
+    RECEIPTS_KEEP_ROWS,
+    RECEIPTS_MAX_BYTES,
+    append_receipt,
+    build_receipt,
+    summarize_spool_lifecycle,
+)
 from spool.store import (
     SPOOL_MAX_TOMBSTONES,
-    build_post_tool_spool_response,
     gc_spools,
     grep_spool,
     list_spools,
     slice_spool,
+    spool_post_tool_output,
     spool_tool_output,
 )
+
+
+def _build_post_tool_spool_response(
+    harness: str, payload: dict[str, Any], **kwargs: Any
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    decision, meta = spool_post_tool_output(harness, payload, **kwargs)
+    return format_post_tool_spool_response(harness, decision), meta
 
 
 def _repo(tmp_path: Path, name: str = "repo") -> Path:
@@ -58,7 +73,7 @@ def test_group1_utf8_surrogate_cp1250_max_entry_bytes_and_multibyte_boundaries(
         spool_dir=spool_dir,
     ) is None
     for mode in ("active", "shadow"):
-        assert build_post_tool_spool_response(
+        assert _build_post_tool_spool_response(
             "claude",
             {"tool_name": "Bash", "tool_input": {"command": "cmd"}, "tool_response": cp1250_bytes, "cwd": str(repo)},
             mode=mode,
@@ -78,7 +93,7 @@ def test_group1_utf8_surrogate_cp1250_max_entry_bytes_and_multibyte_boundaries(
         spool_dir=spool_dir,
     ) is None
     for mode in ("active", "shadow"):
-        assert build_post_tool_spool_response(
+        assert _build_post_tool_spool_response(
             "claude",
             {"tool_name": "Bash", "tool_input": {"command": "cmd"}, "tool_response": surrogate_text, "cwd": str(repo)},
             mode=mode,
@@ -121,7 +136,7 @@ def test_group1_utf8_surrogate_cp1250_max_entry_bytes_and_multibyte_boundaries(
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg_path.write_text(json.dumps({"spool": {"isolation": "workspace", "max_spool_entry_bytes": limit}}), encoding="utf-8")
     config.clear_config_cache()
-    _, sh_ok = build_post_tool_spool_response(
+    _, sh_ok = _build_post_tool_spool_response(
         "claude",
         {"tool_name": "Bash", "tool_input": {"command": "cmd"}, "tool_response": base_bytes, "cwd": str(repo)},
         mode="shadow",
@@ -130,7 +145,7 @@ def test_group1_utf8_surrogate_cp1250_max_entry_bytes_and_multibyte_boundaries(
         spool_dir=spool_dir,
     )
     assert sh_ok is not None and sh_ok["total_bytes"] == limit
-    assert build_post_tool_spool_response(
+    assert _build_post_tool_spool_response(
         "claude",
         {"tool_name": "Bash", "tool_input": {"command": "cmd"}, "tool_response": over_bytes, "cwd": str(repo)},
         mode="shadow",
@@ -138,7 +153,7 @@ def test_group1_utf8_surrogate_cp1250_max_entry_bytes_and_multibyte_boundaries(
         call_id="c-sh-over",
         spool_dir=spool_dir,
     ) == ({}, None)
-    assert build_post_tool_spool_response(
+    assert _build_post_tool_spool_response(
         "claude",
         {"tool_name": "Bash", "tool_input": {"command": "cmd"}, "tool_response": over_bytes, "cwd": str(repo)},
         mode="active",
@@ -324,7 +339,7 @@ def test_group3_enospc_and_manifest_write_failure_force_passthrough(
             payload, session_id="s-g3", call_id="c-tmp", harness="claude", tool_name="Bash",
             workspace_root=repo, spool_dir=spool_dir,
         ) is None
-        assert build_post_tool_spool_response(
+        assert _build_post_tool_spool_response(
             "claude",
             {"tool_name": "Bash", "tool_input": {"command": "cmd"}, "tool_response": payload, "cwd": str(repo)},
             mode="active",
@@ -344,7 +359,7 @@ def test_group3_enospc_and_manifest_write_failure_force_passthrough(
 
     with monkeypatch.context() as mp:
         mp.setattr(spool_store, "atomic_write_bytes", _fail_manifest_write)
-        assert build_post_tool_spool_response(
+        assert _build_post_tool_spool_response(
             "claude",
             {"tool_name": "Bash", "tool_input": {"command": "cmd"}, "tool_response": payload, "cwd": str(repo)},
             mode="active",
@@ -526,3 +541,128 @@ def test_post_tool_use_turn_correlation_and_hook_duration_telemetry(
     life = summarize_spool_lifecycle(spool_dir / RECEIPTS_FILENAME, spool_id=sid_1)
     assert life["turn_correlation_status"] == "observed"
     assert life["recovery_model_turns"] == 1
+
+
+def test_append_receipt_single_pass_rotation_and_dedup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rcpt_path = tmp_path / "spool" / RECEIPTS_FILENAME
+    rcpt_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_count = RECEIPTS_KEEP_ROWS + 14
+    pad = "x" * 2048
+    seed_lines = [
+        json.dumps(
+            dict(
+                build_receipt(
+                    event_type="spool_created",
+                    harness="claude",
+                    session_id="s-rot",
+                    workspace_id="ws-rot",
+                    turn_key=f"turn-{i}",
+                    call_id=f"c-rot-{i}",
+                    spool_id=f"sp-rot-{i:04d}",
+                    line_span=(1, 10),
+                    byte_span=(0, 5000),
+                    delivery_evidence="hook_output",
+                    spool_id_referenced=True,
+                    event_id=f"ev-rot-{i}",
+                    reason=pad,
+                )
+            ),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        for i in range(seed_count)
+    ]
+    rcpt_path.write_text("\n".join(seed_lines) + "\n", encoding="utf-8")
+    assert rcpt_path.stat().st_size > RECEIPTS_MAX_BYTES
+
+    orig_loads = json.loads
+    parse_calls = 0
+
+    def counting_loads(*args: Any, **kwargs: Any) -> Any:
+        nonlocal parse_calls
+        parse_calls += 1
+        return orig_loads(*args, **kwargs)
+
+    monkeypatch.setattr(json, "loads", counting_loads)
+    dup_row = build_receipt(
+        event_type="spool_created",
+        harness="claude",
+        session_id="s-rot",
+        workspace_id="ws-rot",
+        turn_key="turn-0",
+        call_id="c-rot-0",
+        spool_id="sp-rot-0000",
+        line_span=(1, 10),
+        byte_span=(0, 5000),
+        delivery_evidence="hook_output",
+        spool_id_referenced=True,
+        event_id="ev-rot-0",
+    )
+    assert append_receipt(dup_row, receipts_path=rcpt_path) is True
+    assert parse_calls == seed_count
+    assert len(rcpt_path.read_text(encoding="utf-8").splitlines()) == seed_count
+
+    parse_calls = 0
+    fresh_row = build_receipt(
+        event_type="spool_created",
+        harness="claude",
+        session_id="s-rot",
+        workspace_id="ws-rot",
+        turn_key="turn-new",
+        call_id="c-rot-new",
+        spool_id="sp-rot-new",
+        line_span=(1, 10),
+        byte_span=(0, 5000),
+        delivery_evidence="hook_output",
+        spool_id_referenced=True,
+        event_id="ev-rot-new",
+    )
+    assert append_receipt(fresh_row, receipts_path=rcpt_path) is True
+    assert parse_calls == seed_count
+    after = [orig_loads(ln) for ln in rcpt_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(after) == RECEIPTS_KEEP_ROWS
+    assert after[-1]["event_id"] == "ev-rot-new"
+
+
+def test_slice_spool_warns_when_index_update_hits_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _repo(tmp_path, "warn")
+    spool_dir = tmp_path / "spool"
+    big = "".join(f"warn-line-{i:04d} payload padding to pass threshold\n" for i in range(300))
+    res = spool_tool_output(
+        big,
+        session_id="s-warn",
+        call_id="c-warn-1",
+        harness="claude",
+        tool_name="Bash",
+        workspace_root=repo,
+        spool_dir=spool_dir,
+        now_ts=1_000.0,
+    )
+    assert res is not None
+    contract, _summary = res
+    sid = contract.spool_id
+
+    warnings: list[str] = []
+    orig_atomic = spool_store.atomic_write_bytes
+
+    def fail_index_write(target: Path, data: bytes, *, prefix: str = ".tmp.") -> None:
+        if target.name == "spool_index.json":
+            raise OSError("index locked")
+        orig_atomic(target, data, prefix=prefix)
+
+    monkeypatch.setattr(spool_store, "atomic_write_bytes", fail_index_write)
+    monkeypatch.setattr(spool_store, "warn", warnings.append)
+
+    ok_slice = slice_spool(sid, start_line=1, limit=5, workspace_root=repo, spool_dir=spool_dir, now_ts=1_010.0)
+    assert ok_slice["ok"] is True
+    assert any(sid in w and "OSError" in w for w in warnings)
+
+    warnings.clear()
+    (spool_dir / f"{sid}.txt").write_bytes(b"corrupted blob content\n")
+    bad_slice = slice_spool(sid, start_line=1, limit=5, workspace_root=repo, spool_dir=spool_dir, now_ts=1_020.0)
+    assert bad_slice == {"ok": False, "error": "integrity_mismatch"}
+    assert any(sid in w and "OSError" in w for w in warnings)

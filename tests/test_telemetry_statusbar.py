@@ -91,13 +91,13 @@ def test_telemetry_accumulates_mcp_outline_and_range_trim_savings(tmp_path: Path
 
 
 import json
-from bin.cg_status import (
+from services.installer_service import install_all, uninstall_all
+from services.status_service import (
     format_compact_tokens,
     render_claude_hud,
     render_markdown_report,
     render_short_status,
 )
-from bin.install_harnesses import install_all, uninstall_all
 
 VERSION = json.loads((Path(__file__).resolve().parent.parent / "plugin.json").read_text(encoding="utf-8"))["version"]
 
@@ -298,7 +298,7 @@ def test_telemetry_classifies_twg_inline_as_outlines_and_credits_path_redirect(t
 
 
 def test_block_gauge_and_svg_donut_sidebar_rendering() -> None:
-    from bin.cg_status import format_block_gauge, render_claude_hud
+    from services.status_service import format_block_gauge, render_claude_hud
 
     assert format_block_gauge(0.0) == "▱▱▱▱▱"
     assert format_block_gauge(21.6) == "▰▱▱▱▱"
@@ -537,8 +537,7 @@ def _outcomes_ledger(rows: dict[str, dict], updated_at: str | None = "2026-10-30
 
 
 def test_render_outcomes_report_rows_percentages_and_footer() -> None:
-    from bin.cg_status import render_outcomes_report
-    from bin.outcomes_report import compute_associated_model_costs
+    from services.outcomes_report import compute_associated_model_costs, render_outcomes_report
 
     ledger = _outcomes_ledger(
         {
@@ -588,7 +587,7 @@ def test_render_outcomes_report_rows_percentages_and_footer() -> None:
 
 
 def test_render_outcomes_report_empty_ledger() -> None:
-    from bin.cg_status import render_outcomes_report
+    from services.outcomes_report import render_outcomes_report
 
     report = render_outcomes_report(_outcomes_ledger({}, updated_at=None))
     assert "No interventions recorded yet." in report
@@ -705,10 +704,15 @@ def test_status_line_failure_says_unavailable_and_reports_why(monkeypatch, capsy
         raise ValueError("stats unreadable")
 
     monkeypatch.setattr(cg_status, "load_telemetry_stats", _broken)
-    assert cg_status.main(["--short"]) == 0
+    assert cg_status.main(["--short"]) == 1
     captured = capsys.readouterr()
     assert captured.out == "CG: n/a\n"
     assert captured.err.startswith("context-guard: status line failed: ValueError: stats unreadable")
+
+    assert cg_status.main(["--claude-hud"]) == 0
+    captured_hud = capsys.readouterr()
+    assert captured_hud.out == "CG: n/a\n"
+    assert captured_hud.err.startswith("context-guard: status line failed: ValueError: stats unreadable")
 
 
 def test_cost_estimate_uses_current_input_rate_and_is_labelled_approximate() -> None:

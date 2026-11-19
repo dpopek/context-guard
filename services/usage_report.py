@@ -1,23 +1,18 @@
-#!/usr/bin/env python3
 """Session preamble breakdown, hygiene warnings and the Markdown/JSON views of the token usage ledger."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import date, timedelta
 import json
 import math
 import os
-import re
-from dataclasses import dataclass
-from datetime import date, timedelta
 from pathlib import Path
-import sys
+import re
 from typing import Any
 
-_PACKAGE_ROOT = Path(__file__).resolve().parent.parent
-if str(_PACKAGE_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PACKAGE_ROOT))
-
-from bin.preamble_attribution import (  # noqa: E402
+from hooks.outcomes import SCHEMA_VERSION as OUTCOMES_SCHEMA_VERSION
+from services.preamble_attribution import (
     CANDIDATE_MIN_TOKENS,
     CANDIDATE_WINDOW_DAYS,
     CLAUDE_CLI_HARNESS,
@@ -33,8 +28,7 @@ from bin.preamble_attribution import (  # noqa: E402
     split_codex_parts,
     summarize_parts,
 )
-from bin.tariffs import TARIFF_EFFECTIVE_DATE, attribute_turn_cost  # noqa: E402
-from hooks.outcomes import SCHEMA_VERSION as OUTCOMES_SCHEMA_VERSION  # noqa: E402
+from services.tariffs import TARIFF_EFFECTIVE_DATE, attribute_turn_cost
 
 PREAMBLE_HOME = Path.home()
 MEMORY_LOAD_LINES = 200

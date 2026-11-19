@@ -2,33 +2,43 @@
 """SessionEnd hook: notify active policy packs and clean transient pending_reads state."""
 from __future__ import annotations
 import argparse
+import copy
 import json
 import sys
 from pathlib import Path
 from typing import Any
 
 sys.path[:0] = [r] if (r := str(Path(__file__).resolve().parent.parent)) not in sys.path else []
+from core.platform_io import warn  # noqa: E402
 from hooks import config, policy_engine, state_store  # noqa: E402
 from hooks.outcomes import close_outcome_windows, ledger_path_for  # noqa: E402
-from hooks.telemetry import warn  # noqa: E402
 
 def handle_session_end(payload: dict[str, Any], state_dir: str | None = None) -> dict[str, Any]:
     """Clear transient `pending_reads` markers and emit `session_end` transition event."""
+    if not isinstance(payload, dict):
+        return {}
+    sess_id = str(payload.get("session_id") or payload.get("conversation_id") or payload.get("conversationId") or "default")
     try:
-        sess_id = str(payload.get("session_id") or payload.get("conversation_id") or payload.get("conversationId") or "default")
         close_outcome_windows(sess_id, force_all=True, ledger_path=ledger_path_for(state_dir))
+    except (OSError, ValueError, TypeError) as exc:
+        warn(f"session_end outcomes cleanup skipped: {type(exc).__name__}: {exc}")
+    state_snapshot: dict[str, Any] | None = None
+    try:
         sdir = state_store.resolve_state_dir(payload, state_dir)
         if state_store.state_file_in(sdir).exists():
-            cfg = config.load_runtime_config()
             with state_store.locked_state(sdir) as txn:
                 files = txn.state.get("files")
                 for entry in (files if isinstance(files, dict) else {}).values():
                     if isinstance(entry, dict) and entry.pop("pending_reads", None) is not None:
                         txn.dirty = True
-                policy_engine.notify_session_transition("session_end", txn.state, cfg)
-                txn.dirty = True
-    except OSError as exc:
+                state_snapshot = copy.deepcopy(txn.state)
+    except (OSError, ValueError, TypeError) as exc:
         warn(f"session_end skipped: {type(exc).__name__}: {exc}")
+    if state_snapshot is not None:
+        try:
+            policy_engine.notify_session_transition("session_end", state_snapshot, config.load_runtime_config())
+        except (OSError, ValueError, TypeError) as exc:
+            warn(f"session_end transition skipped: {type(exc).__name__}: {exc}")
     return {}
 
 def main(argv: list[str] | None = None) -> int:

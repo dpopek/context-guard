@@ -9,8 +9,9 @@ from typing import Any
 
 import pytest
 
+from evidence.conformance import replay_governor_decisions
 import policies
-from policies import api as policies_api
+from policies import api as policies_api, governor as policies_governor
 from policies.api import (
     ADAPTER_CONTRACT_VERSION,
     CAPABILITY_CONTRACT_SCHEMA_VERSION,
@@ -37,7 +38,6 @@ from policies.governor import (
     evaluate_governor,
     is_optimizer_tripped,
     record_governor_signal,
-    replay_governor_decisions,
     reset_circuit_breaker,
     resolve_governor_state_path,
 )
@@ -329,7 +329,7 @@ def test_circuit_breaker_trips_only_on_hard_failures_with_hysteresis(tmp_path: P
         assert st["ignored_signals"] == idx
         assert is_optimizer_tripped("output_spool", state_dir=sdir) is False
 
-    # Hard failure in spool/ mirrors to parent state/
+    # Hard failure reported via spool_dir writes to the unified parent state/governor_state.json
     hard_st = record_governor_signal("output_spool", "integrity_mismatch", state_dir=spool_dir, harness="claude", session_id="s1")
     assert hard_st["tripped"] is True
     assert hard_st["state"] == "open"
@@ -337,7 +337,7 @@ def test_circuit_breaker_trips_only_on_hard_failures_with_hysteresis(tmp_path: P
     assert hard_st["requires_verification_or_operator_reset"] is True
     assert is_optimizer_tripped("output_spool", state_dir=spool_dir) is True
     assert is_optimizer_tripped("output_spool", state_dir=sdir) is True
-    assert (spool_dir / DEFAULT_GOVERNOR_STATE_FILENAME).is_file()
+    assert not (spool_dir / DEFAULT_GOVERNOR_STATE_FILENAME).exists()
     assert (sdir / DEFAULT_GOVERNOR_STATE_FILENAME).is_file()
 
     # Soft signal while open preserves open state (hysteresis)
@@ -368,7 +368,7 @@ def test_circuit_breaker_trips_only_on_hard_failures_with_hysteresis(tmp_path: P
         assert is_optimizer_tripped("output_spool", state_dir=sdir) is True
         assert is_optimizer_tripped("output_spool", state_dir=spool_dir) is True
 
-    # Valid verification reset closes both parent and child spool mirrors
+    # Valid verification reset closes the unified canonical breaker state
     res_ver = reset_circuit_breaker("output_spool", state_dir=sdir, verification_passed=True, verification_evidence="spool_roundtrip_ok")
     assert res_ver["ok"] is True
     assert res_ver["reset_mode"] == "verification"
@@ -441,6 +441,7 @@ def test_security_enforcement_never_lowered_and_unsafe_links_rejected(tmp_path: 
 
 
 def test_replay_governor_decisions_passes_all_release_gates() -> None:
+    assert not hasattr(policies_governor, "replay_governor_decisions")
     res_a = replay_governor_decisions()
     res_b = replay_governor_decisions()
     assert res_a == res_b
@@ -471,3 +472,80 @@ def test_replay_governor_decisions_passes_all_release_gates() -> None:
         {"id": "cursor_spool_cannot_activate", "harness_id": "cursor", "runtime_cfg": {"optimizers": {"output_spool": "active"}}, "expected_modes": {"output_spool": "active"}},
     ])
     assert custom_fail["ok"] is False
+
+
+def test_evaluate_capability_contract_enforces_static_ceiling_upper_bound(tmp_path: Path) -> None:
+    fp = compute_hook_config_fingerprint("codex", {"optimizers": {"output_spool": "active"}})
+    unsupported_pairs = (
+        ("codex", "output_replacement"),
+        ("cursor", "output_replacement"),
+        ("cursor", "prompt_cache_telemetry"),
+        ("antigravity", "content_verified_reads"),
+        ("unknown_cli", "pre_tool_interception"),
+        ("unknown_cli", "dynamic_tool_mutation"),
+    )
+    for harness_id, capability_id in unsupported_pairs:
+        key = build_capability_attestation_key(harness_id, capability_id, hook_config_fingerprint=fp)
+        direct = evaluate_capability_contract(
+            key, claimed_level="runtime_verified", verification_evidence="custom_probe_ok",
+        )
+        assert direct["evidence_level"] == "unsupported"
+        assert direct["runtime_verified"] is False
+
+        unclaimed = evaluate_capability_contract(key, verification_evidence="custom_probe_ok")
+        assert unclaimed["evidence_level"] == "unsupported"
+        assert unclaimed["runtime_verified"] is False
+
+        stored_tamper: dict[str, Any] = {
+            "schema_version": CAPABILITY_CONTRACT_SCHEMA_VERSION,
+            "capability_id": capability_id,
+            "evidence_level": "runtime_verified",
+            "attestation_key": {
+                "harness_id": key.harness_id,
+                "harness_build_id": key.harness_build_id,
+                "adapter_version": key.adapter_version,
+                "hook_config_fingerprint": key.hook_config_fingerprint,
+                "capability_id": key.capability_id,
+            },
+            "verification_evidence": "custom_probe_ok",
+            "verified_at": "2026-01-01T00:00:00Z",
+            "runtime_verified": True,
+            "provider_only_rejected": False,
+            "invalidated_reason": None,
+        }
+        from_stored = evaluate_capability_contract(key, stored_attestation=stored_tamper)
+        assert from_stored["evidence_level"] == "unsupported"
+        assert from_stored["runtime_verified"] is False
+
+    persisted = attest_capability(
+        "codex", "output_replacement", verification_evidence="custom_probe_ok", state_dir=tmp_path,
+    )
+    assert persisted["evidence_level"] == "unsupported"
+    assert persisted["runtime_verified"] is False
+    gov = evaluate_governor("codex", runtime_cfg={"optimizers": {"output_spool": "active"}}, state_dir=tmp_path)
+    assert gov["capabilities"]["output_replacement"]["evidence_level"] == "unsupported"
+    assert gov["capabilities"]["output_replacement"]["runtime_verified"] is False
+    assert gov["decisions"]["output_spool"]["selected_mode"] == "shadow"
+
+
+def test_resolve_governor_state_path_unifies_spool_subdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "state"
+    spool_dir = state_dir / "spool"
+    expected = state_dir / DEFAULT_GOVERNOR_STATE_FILENAME
+
+    assert resolve_governor_state_path(state_dir) == expected
+    assert resolve_governor_state_path(spool_dir) == expected
+    assert resolve_governor_state_path(f"{spool_dir}{os.sep}") == expected
+    assert resolve_governor_state_path(state_dir / "spool_alt") == state_dir / "spool_alt" / DEFAULT_GOVERNOR_STATE_FILENAME
+
+    monkeypatch.setenv("CONTEXT_GUARD_STATE_DIR", str(spool_dir))
+    assert resolve_governor_state_path() == expected
+
+    tripped = record_governor_signal("output_spool", "integrity_mismatch", state_dir=spool_dir)
+    assert tripped["tripped"] is True
+    assert expected.is_file()
+    assert not (spool_dir / DEFAULT_GOVERNOR_STATE_FILENAME).exists()
+    assert is_optimizer_tripped("output_spool", state_dir=state_dir) is True
+    assert is_optimizer_tripped("output_spool", state_dir=spool_dir) is True

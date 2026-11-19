@@ -13,13 +13,16 @@ from typing import Any
 import pytest
 
 from bin.cg_spool import main as cli_main
-from policies.api import SpoolContractV1
+from core.contracts import SpoolDecision
+from hooks.harness_adapter import format_post_tool_spool_response
+from policies.api import HARD_INTEGRITY_FAILURE_REASONS, SpoolContractV1
+from policies.governor import record_governor_signal
+import spool as spool_pkg
 from spool.store import (
     SPOOL_MAX_BLOB_BYTES,
     SPOOL_MIN_BYTES,
     SPOOL_SUMMARY_MAX_BYTES,
     SPOOL_TTL_SECONDS,
-    build_post_tool_spool_response,
     classify_pre_tool_spool_followup,
     compute_command_signature,
     gc_spools,
@@ -29,6 +32,7 @@ from spool.store import (
     list_spools,
     resolve_spool_dir,
     slice_spool,
+    spool_post_tool_output,
     spool_tool_output,
 )
 
@@ -353,13 +357,20 @@ def test_spool_symlink_rejection_and_corrupt_index_quarantine(tmp_path: Path) ->
     assert list_spools(workspace_root=repo, spool_dir=spool_dir)["count"] == 1
 
 
+def _build_post_tool_spool_response(
+    harness: str, payload: dict[str, Any], **kwargs: Any
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    decision, meta = spool_post_tool_output(harness, payload, **kwargs)
+    return format_post_tool_spool_response(harness, decision), meta
+
+
 def test_build_post_tool_spool_response_claude_shapes_and_mixed_block_fail_open(tmp_path: Path) -> None:
     """Match Claude Bash/MCP output shapes exactly and fail open on mixed blocks or unresolved scope."""
     repo = _repo(tmp_path)
     spool_dir = tmp_path / "spool"
     big = make_lines_text(220, prefix="claude")
 
-    off_resp, off_meta = build_post_tool_spool_response(
+    off_resp, off_meta = _build_post_tool_spool_response(
         "claude",
         {"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": big, "cwd": str(repo)},
         mode="off",
@@ -369,7 +380,7 @@ def test_build_post_tool_spool_response_claude_shapes_and_mixed_block_fail_open(
     )
     assert off_resp == {} and off_meta is None
 
-    no_ws_resp, no_ws_meta = build_post_tool_spool_response(
+    no_ws_resp, no_ws_meta = _build_post_tool_spool_response(
         "claude",
         {"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": big},
         mode="active",
@@ -380,7 +391,7 @@ def test_build_post_tool_spool_response_claude_shapes_and_mixed_block_fail_open(
     assert no_ws_resp == {} and no_ws_meta is None
     assert not spool_dir.exists()
 
-    r_str, m_str = build_post_tool_spool_response(
+    r_str, m_str = _build_post_tool_spool_response(
         "claude",
         {"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": big, "cwd": str(repo)},
         mode="active",
@@ -395,7 +406,7 @@ def test_build_post_tool_spool_response_claude_shapes_and_mixed_block_fail_open(
     assert m_str["spool_id"] in r_str["hookSpecificOutput"]["updatedToolOutput"]
     assert m_str["workspace_id"].startswith("ws_")
 
-    r_out, _ = build_post_tool_spool_response(
+    r_out, _ = _build_post_tool_spool_response(
         "claude",
         {"tool_name": "Bash", "tool_input": {"command": "ls -la"}, "tool_response": {"output": big, "exit_code": 0}, "cwd": str(repo)},
         mode="active",
@@ -409,7 +420,7 @@ def test_build_post_tool_spool_response_claude_shapes_and_mixed_block_fail_open(
     assert updated_out["exit_code"] == 0
     assert updated_out["output"].startswith("[CONTEXT-GUARD OUTPUT SPOOL:")
 
-    r_stdout, _ = build_post_tool_spool_response(
+    r_stdout, _ = _build_post_tool_spool_response(
         "claude",
         {"tool_name": "Bash", "tool_input": {"command": "make"}, "tool_response": {"stdout": big, "stderr": "ok"}, "cwd": str(repo)},
         mode="active",
@@ -421,7 +432,7 @@ def test_build_post_tool_spool_response_claude_shapes_and_mixed_block_fail_open(
     assert r_stdout["hookSpecificOutput"]["updatedToolOutput"]["stderr"] == "ok"
     assert "[CONTEXT-GUARD OUTPUT SPOOL:" in r_stdout["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
 
-    r_blk, _ = build_post_tool_spool_response(
+    r_blk, _ = _build_post_tool_spool_response(
         "claude",
         {"tool_name": "mcp__demo__dump", "tool_input": {"q": 1}, "tool_response": [{"type": "text", "text": big}], "cwd": str(repo)},
         mode="active",
@@ -434,7 +445,7 @@ def test_build_post_tool_spool_response_claude_shapes_and_mixed_block_fail_open(
     assert isinstance(updated_blk, list) and len(updated_blk) == 1
     assert updated_blk[0]["type"] == "text"
 
-    r_mixed, m_mixed = build_post_tool_spool_response(
+    r_mixed, m_mixed = _build_post_tool_spool_response(
         "claude",
         {
             "tool_name": "mcp__demo__dump",
@@ -457,7 +468,7 @@ def test_build_post_tool_spool_response_cursor_mcp_redacted_and_shadow_parity(tm
     spool_dir = tmp_path / "spool"
     big = make_lines_text(220, prefix="cursor")
 
-    sh_resp, sh_meta = build_post_tool_spool_response(
+    sh_resp, sh_meta = _build_post_tool_spool_response(
         "cursor",
         {"tool_name": "Shell", "tool_input": {"command": "pytest"}, "tool_output": big, "cwd": str(repo)},
         mode="active",
@@ -468,7 +479,7 @@ def test_build_post_tool_spool_response_cursor_mcp_redacted_and_shadow_parity(tm
     assert sh_resp == {} and sh_meta is None
     assert not spool_dir.exists()
 
-    red_resp, red_meta = build_post_tool_spool_response(
+    red_resp, red_meta = _build_post_tool_spool_response(
         "cursor",
         {"tool_name": "MCP:gh:logs", "tool_input": {"id": 1}, "tool_output": {"redacted": True, "text": big}, "cwd": str(repo)},
         mode="active",
@@ -479,7 +490,7 @@ def test_build_post_tool_spool_response_cursor_mcp_redacted_and_shadow_parity(tm
     assert red_resp == {} and red_meta is None
 
     # Shadow fails open without workspace_root / cwd.
-    sh_no_ws, sh_no_ws_meta = build_post_tool_spool_response(
+    sh_no_ws, sh_no_ws_meta = _build_post_tool_spool_response(
         "cursor",
         {"tool_name": "MCP:gh:logs", "tool_input": {"id": 2}, "tool_output": {"text": big}},
         mode="shadow",
@@ -489,7 +500,7 @@ def test_build_post_tool_spool_response_cursor_mcp_redacted_and_shadow_parity(tm
     )
     assert sh_no_ws == {} and sh_no_ws_meta is None
 
-    shadow_resp, shadow_meta = build_post_tool_spool_response(
+    shadow_resp, shadow_meta = _build_post_tool_spool_response(
         "cursor",
         {"tool_name": "MCP:gh:logs", "tool_input": {"id": 2}, "tool_output": {"text": big}, "cwd": str(repo)},
         mode="shadow",
@@ -500,7 +511,7 @@ def test_build_post_tool_spool_response_cursor_mcp_redacted_and_shadow_parity(tm
     assert shadow_resp == {} and shadow_meta is not None
     assert not spool_dir.exists()
 
-    act_resp, act_meta = build_post_tool_spool_response(
+    act_resp, act_meta = _build_post_tool_spool_response(
         "cursor",
         {"tool_name": "MCP:gh:logs", "tool_input": {"id": 2}, "tool_output": {"text": big}, "cwd": str(repo)},
         mode="active",
@@ -535,7 +546,7 @@ def test_build_post_tool_spool_response_skips_errors_reads_mutations_and_self_ca
         {"tool_name": "call_mcp_tool", "tool_input": {"name": "cg_spool_list"}, "tool_response": big},
     ]
     for idx, payload in enumerate(cases):
-        resp, meta = build_post_tool_spool_response(
+        resp, meta = _build_post_tool_spool_response(
             "claude",
             payload,
             mode="active",
@@ -734,3 +745,53 @@ def test_spool_package_exports_and_recovery_receipt_telemetry_fields(tmp_path: P
         "error": "spool_corrupt",
         "corrupt_reason": "unexpectedly_missing",
     }
+
+
+def test_spool_post_tool_output_domain_contract(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "dom")
+    spool_dir = tmp_path / "spool"
+    big = make_lines_text(220, width=90)
+    assert spool_pkg.spool_post_tool_output is spool_post_tool_output
+
+    dec_cl, meta_cl = spool_post_tool_output(
+        "claude", {"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": {"output": big, "exit_code": 0}},
+        mode="active", session_id="s-dom", call_id="c-dom-1", workspace_root=repo, spool_dir=spool_dir, now_ts=1_000.0,
+    )
+    assert isinstance(dec_cl, SpoolDecision) and meta_cl is not None
+    assert dec_cl.harness == "claude" and dec_cl.shape == "output" and dec_cl.meta == meta_cl
+    assert isinstance(dec_cl.updated_output, dict) and dec_cl.updated_output["exit_code"] == 0
+    assert "[CONTEXT-GUARD OUTPUT SPOOL:" in dec_cl.updated_output["output"]
+    assert meta_cl["spool_id"] in dec_cl.updated_output["output"]
+    assert "hookSpecificOutput" not in dec_cl.updated_output and "hookSpecificOutput" not in meta_cl
+
+    dec_cu, meta_cu = spool_post_tool_output(
+        "cursor", {"tool_name": "MCP:big_search", "tool_input": {"q": "abc"}, "tool_output": {"text": big}},
+        mode="active", session_id="s-dom", call_id="c-dom-2", workspace_root=repo, spool_dir=spool_dir, now_ts=1_001.0,
+    )
+    assert isinstance(dec_cu, SpoolDecision) and meta_cu is not None
+    assert dec_cu.harness == "cursor" and dec_cu.shape == "text"
+    assert isinstance(dec_cu.updated_output, str) and meta_cu["spool_id"] in dec_cu.updated_output
+    assert "updated_mcp_tool_output" not in meta_cu
+
+    dec_sh, meta_sh = spool_post_tool_output(
+        "claude", {"tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_response": {"output": big}},
+        mode="shadow", session_id="s-dom", call_id="c-dom-sh", workspace_root=repo, spool_dir=spool_dir, now_ts=1_002.0,
+    )
+    assert dec_sh is None and meta_sh is not None and meta_sh["saved_bytes"] > 0
+
+    for pay, m in (
+        ({"tool_name": "Bash", "tool_response": {"output": big}}, "off"),
+        ({"tool_name": "Read", "tool_response": big}, "active"),
+        ({"tool_name": "Bash", "is_error": True, "tool_response": {"output": big}}, "active"),
+    ):
+        assert spool_post_tool_output(
+            "claude", pay, mode=m, session_id="s-dom", call_id="c-noop", workspace_root=repo, spool_dir=spool_dir,
+        ) == (None, None)
+
+    record_governor_signal(
+        "output_spool", HARD_INTEGRITY_FAILURE_REASONS[0], state_dir=spool_dir, harness="claude", session_id="s-dom",
+    )
+    assert spool_post_tool_output(
+        "claude", {"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": {"output": big}},
+        mode="active", session_id="s-dom", call_id="c-trip", workspace_root=repo, spool_dir=spool_dir,
+    ) == (None, None)

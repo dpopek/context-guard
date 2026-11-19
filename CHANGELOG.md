@@ -5,6 +5,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 
 ## [Unreleased]
 
+## [5.1.0] - 2026-11-19
+
+### Added
+- **Layer 0 foundation (`core/`):** Added `platform_io.py`, `contracts.py`, `scrub.py`, and `shell_lexer.py` with zero internal imports.
+- **Service layer (`services/`):** Extracted 18 off-hot-path modules (`installer`, `status`, `explain`, `export`, usage, replay).
+- **Hook core & drift probe (`hooks/`):** Split pure `telemetry_core.py` functional core and `drift_probe.py` out of `config.py`.
+- **8-layer DAG & AST gates (`tests/`):** Enforced package Tarjan SCC == 0, strict layer edges, zero `assert`s, and zero `X as X` facades.
+
+### Changed
+- **Thin CLI entrypoints (`bin/`):** Slimmed all 10 CLI scripts (`cg*.py`, `install_harnesses`, `outline`, `update_check`) <= 350 LOC.
+- **Unified contracts (`hooks/`, `spool/`):** Consolidated `HARNESS_CAPABILITIES`, `PendingRead`, `PlannerMeta`, and shared `warn`.
+- **Evidence & governor split (`evidence/`, `policies/`):** Moved `replay_governor_decisions` into `evidence/conformance.py`.
+- **Extension & docs (`vscode-extension/`, `README.md`):** Added `outputs_spooled`/`reliability_failures` cards and synced `v5.1.0` docs.
+
+### Fixed
+- **Transactional read planner (`hooks/`):** Added `StatePersistenceError`, inside-lock TOCTOU checks, and read-only snapshot fallback.
+- **Outcomes & shadow integrity (`hooks/`):** Fixed `step_idx=0` eviction, pipe keys, `trimmed_spans`, and bounded outline byte caps.
+- **Security & lock hygiene (`hooks/`, `spool/`, `evidence/`):** Moved probes off locks, enforced `_static_ceiling`, fixed GC race.
+- **Installer & CLI exit codes (`services/`, `bin/`):** Wrapped default installs in `RollbackJournal` and fixed non-zero CLI error exits.
+
 ## [5.0.0] - 2026-11-18
 
 ### Added

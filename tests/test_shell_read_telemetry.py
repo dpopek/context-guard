@@ -14,7 +14,7 @@ from hooks.shell_parser import (
     extract_shell_read_targets,
     is_bounded_shell_read,
 )
-from bin.cg_status import render_outcomes_report
+from services.outcomes_report import render_outcomes_report
 from tests.helpers import read_outcomes_ledger, read_session_state
 
 

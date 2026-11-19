@@ -6,7 +6,7 @@ import math
 import random
 from typing import Any, Mapping, Sequence
 
-from bin.tariffs import compute_turn_tariff_cost_usd
+from services.tariffs import compute_turn_tariff_cost_usd
 from policies.api import VALID_EVAL_TIERS, VALID_RUN_OUTCOME_CLASSES
 
 EXTERNAL_NOISE_REASONS: tuple[str, ...] = (

@@ -2,8 +2,10 @@
 
 This leaf module must never import anything from `hooks` (avoids cycles with `hooks.outcomes`).
 """
+
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
@@ -13,46 +15,14 @@ import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from types import SimpleNamespace
+from typing import IO, Any, Callable, Iterator
 
-fcntl: Any
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows
-    _win_msvcrt: Any = None
-    try:
-        import msvcrt as _win_msvcrt
-    except ImportError:
-        pass
+from core.platform_io import (
+    LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN, atomic_write_bytes, flock, resolve_plugin_root, warn,
+)
 
-    class _WindowsFcntlCompat:
-        LOCK_EX, LOCK_NB, LOCK_UN = 2, 4, 8
-
-        @staticmethod
-        def flock(fd: int | Any, operation: int) -> None:
-            if _win_msvcrt is None:
-                return
-            raw_fd = fd.fileno() if hasattr(fd, "fileno") else int(fd)
-            try:
-                os.lseek(raw_fd, 0, os.SEEK_SET)
-            except OSError:
-                pass
-            if operation & 8:
-                try:
-                    _win_msvcrt.locking(raw_fd, _win_msvcrt.LK_UNLCK, 1)
-                except OSError:
-                    pass
-                return
-            non_blocking = bool(operation & 4)
-            mode = _win_msvcrt.LK_NBLCK if non_blocking else _win_msvcrt.LK_LOCK
-            try:
-                _win_msvcrt.locking(raw_fd, mode, 1)
-            except OSError as exc:
-                if non_blocking:
-                    raise BlockingIOError(str(exc)) from exc
-                raise
-
-    fcntl = _WindowsFcntlCompat()
+fcntl = SimpleNamespace(LOCK_EX=LOCK_EX, LOCK_SH=LOCK_SH, LOCK_NB=LOCK_NB, LOCK_UN=LOCK_UN, flock=flock)
 
 STATE_FILENAME = ".context_guard_state.json"
 LOCK_FILENAME = ".context_guard_state.lock"
@@ -64,22 +34,10 @@ _OUTLINE_META_KEYS = (
     "pending_followup_kind", "outline_pull_step", "mirror_source",
 )
 
-def warn(message: object) -> None:
-    """Operator-facing diagnostic; never raises or leaves dirty C buffers on fd 2."""
-    try:
-        text = f"context-guard: {message}\n"
-    except Exception:
-        text = "context-guard: <unprintable diagnostic>\n"
-    try:
-        if (stream := sys.stderr) is None:
-            return
-        if (raw := sys.__stderr__) is not None and stream is raw:
-            os.write(raw.fileno(), text.encode("utf-8", errors="replace"))
-        else:
-            stream.write(text)
-            stream.flush()
-    except Exception:
-        pass
+
+class StatePersistenceError(OSError):
+    """Raised when a dirty session-state transaction fails to persist atomically."""
+
 
 def run_telemetry_safely(op: Callable[[], object], context: str = "telemetry") -> None:
     """Execute a post-decision telemetry/observation side effect without ever raising Exception."""
@@ -96,11 +54,13 @@ def run_telemetry_safely(op: Callable[[], object], context: str = "telemetry") -
         except Exception:
             pass
 
+
 def _neutralize_stream(attr: str) -> None:
     try:
         setattr(sys, attr, io.StringIO())
     except Exception:
         pass
+
 
 def sanitize_stderr_before_exit() -> None:
     """Ensure CPython Py_FinalizeEx will not exit 120 due to buffered writes on broken stderr."""
@@ -109,6 +69,7 @@ def sanitize_stderr_before_exit() -> None:
             sys.stderr.flush()
         except Exception:
             _neutralize_stream("stderr")
+
 
 def emit_json_and_sanitize_stdio(payload: dict[str, Any]) -> int:
     """Emit one JSON line to stdout and neutralize broken stdout/stderr buffers before exit."""
@@ -122,8 +83,10 @@ def emit_json_and_sanitize_stdio(payload: dict[str, Any]) -> int:
     sanitize_stderr_before_exit()
     return 0
 
+
 def _fresh_state() -> dict[str, Any]:
     return {"files": {}, "read_ledger_schema": READ_LEDGER_SCHEMA}
+
 
 def _read_state_raw(state_file: Path) -> tuple[dict[str, Any] | None, str | None]:
     if not state_file.is_file():
@@ -135,6 +98,7 @@ def _read_state_raw(state_file: Path) -> tuple[dict[str, Any] | None, str | None
         return None, "missing or non-dict 'files' map"
     except (OSError, ValueError, TypeError) as exc:
         return None, f"{type(exc).__name__}: {exc}"
+
 
 def _open_or_quarantine_state_unlocked(state_file: Path) -> dict[str, Any]:
     """Load session state under the lock; quarantine corrupt files and warn on failure."""
@@ -149,26 +113,17 @@ def _open_or_quarantine_state_unlocked(state_file: Path) -> dict[str, Any]:
         warn(f"corrupt session state ({detail}) reset in memory; quarantine failed: {q_exc}")
     return _fresh_state()
 
+
 def _save_state_atomic_unlocked(state_file: Path, state: dict[str, Any]) -> bool:
-    """Persist state via mkstemp + os.replace; False (with stderr note) on failure."""
+    """Persist state atomically via `atomic_write_bytes`; False (with stderr note) on failure."""
     try:
-        state_file.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(prefix=".cg_state.", suffix=".tmp", dir=str(state_file.parent))
-    except OSError as exc:
-        warn(f"state not saved ({state_file}): {exc}")
-        return False
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(state, fh, separators=(",", ":"))
-        os.replace(tmp_path, str(state_file))
+        payload = json.dumps(state, separators=(",", ":")).encode("utf-8")
+        atomic_write_bytes(state_file, payload, mode=0o600, prefix=".cg_state.")
         return True
     except OSError as exc:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
         warn(f"state not saved ({state_file}): {exc}")
         return False
+
 
 def is_valid_read_interval(item: Any) -> bool:
     """Return True iff `item` is a 4-tuple `[start, end, step, confirm_tier]` with valid tier."""
@@ -177,6 +132,7 @@ def is_valid_read_interval(item: Any) -> bool:
         and all(isinstance(x, int) and not isinstance(x, bool) for x in item[:4])
         and int(item[3]) in VALID_CONFIRM_TIERS
     )
+
 
 def _purge_stale_read_ledger_unlocked(state: dict[str, Any]) -> None:
     if isinstance((files_map := state.get("files")), dict):
@@ -188,13 +144,6 @@ def _purge_stale_read_ledger_unlocked(state: dict[str, Any]) -> None:
                 entry.pop("completed_read_ids", None)
     state["read_ledger_schema"] = READ_LEDGER_SCHEMA
 
-def resolve_plugin_root(default_root: Path | None = None) -> Path:
-    """Canonical Context-Guard root: CONTEXT_GUARD_HOME override, explicit default, or checkout."""
-    if (env_home := os.environ.get("CONTEXT_GUARD_HOME", "").strip()):
-        return Path(env_home).expanduser().resolve()
-    if default_root is not None:
-        return Path(default_root).expanduser().resolve()
-    return Path(__file__).resolve().parent.parent
 
 def resolve_state_dir(payload: dict[str, Any], state_dir: str | None) -> Path:
     """Session ledger directory: explicit override, harness artifact dir, or temp dir."""
@@ -203,10 +152,7 @@ def resolve_state_dir(payload: dict[str, Any], state_dir: str | None) -> Path:
     else:
         if isinstance((art := payload.get("artifactDirectoryPath")), str) and art.strip():
             return Path(art.strip())
-        conv_id = str(
-            payload.get("conversationId") or payload.get("session_id")
-            or payload.get("conversation_id") or "default"
-        )
+        conv_id = str(payload.get("conversationId") or payload.get("session_id") or payload.get("conversation_id") or "default")
         base = Path(tempfile.gettempdir()) / f"context-guard-{re.sub(r'[^a-zA-Z0-9_.-]', '_', conv_id)}"
     if isinstance((raw_agent := payload.get("agent_id")), str) and raw_agent.strip():
         agent_clean = raw_agent.strip()
@@ -214,6 +160,7 @@ def resolve_state_dir(payload: dict[str, Any], state_dir: str | None) -> Path:
         agent_digest = hashlib.sha256(agent_clean.encode("utf-8")).hexdigest()[:12]
         return base / "subagents" / f"{safe_agent}-{agent_digest}"
     return base
+
 
 def advance_session_step(state_dir_path: Path) -> int:
     """Increment and return `auto_step_seq` when `state_dir_path` already exists; 0 otherwise."""
@@ -229,29 +176,54 @@ def advance_session_step(state_dir_path: Path) -> int:
         warn(f"advance_session_step skipped: {exc}")
         return 0
 
+
 def state_file_in(state_dir_path: Path) -> Path:
     return state_dir_path / STATE_FILENAME
+
 
 @contextmanager
 def _dir_lock(state_dir_path: Path) -> Iterator[None]:
     with open(state_dir_path / LOCK_FILENAME, "a+", encoding="utf-8") as lock_fh:
-        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        flock(lock_fh.fileno(), LOCK_EX)
         try:
             yield
         finally:
-            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            flock(lock_fh.fileno(), LOCK_UN)
+
+
+def _unlocked_snapshot_fallback(state_file: Path, exc: OSError) -> dict[str, Any] | None:
+    warn(f"read_state_snapshot unlocked fallback ({state_file}): {exc}")
+    data, _ = _read_state_raw(state_file)
+    return data
+
 
 def read_state_snapshot(state_dir_path: Path) -> dict[str, Any]:
     """Read session ledger under lock without creating files or persisting schema writes."""
     state_file = state_file_in(state_dir_path)
     if not state_dir_path.is_dir() or not state_file.is_file():
         return _fresh_state()
-    with _dir_lock(state_dir_path):
-        data, _ = _read_state_raw(state_file)
-        state = data if data is not None else _fresh_state()
-        if state.get("read_ledger_schema") != READ_LEDGER_SCHEMA:
-            _purge_stale_read_ledger_unlocked(state)
-        return state
+    lock_file = state_dir_path / LOCK_FILENAME
+    try:
+        lock_fh: IO[Any]
+        try:
+            lock_fh, lock_op = open(lock_file, "rb"), LOCK_SH
+        except FileNotFoundError:
+            lock_fh, lock_op = open(lock_file, "a+", encoding="utf-8"), LOCK_EX
+        with lock_fh:
+            flock(lock_fh.fileno(), lock_op)
+            try:
+                data, _ = _read_state_raw(state_file)
+            finally:
+                flock(lock_fh.fileno(), LOCK_UN)
+    except OSError as exc:
+        if not isinstance(exc, PermissionError) and exc.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
+            raise
+        data = _unlocked_snapshot_fallback(state_file, exc)
+    state = data if data is not None else _fresh_state()
+    if state.get("read_ledger_schema") != READ_LEDGER_SCHEMA:
+        _purge_stale_read_ledger_unlocked(state)
+    return state
+
 
 class StateTxn:
     """One locked read-modify-write of the session ledger; see `locked_state`."""
@@ -263,6 +235,7 @@ class StateTxn:
         """Persist `state` now, still under the lock; True when written. Clears `dirty`."""
         self.dirty = False
         return _save_state_atomic_unlocked(self.state_file, self.state)
+
 
 @contextmanager
 def locked_state(state_dir_path: Path, *, create: bool = True) -> Iterator[StateTxn]:
@@ -282,14 +255,17 @@ def locked_state(state_dir_path: Path, *, create: bool = True) -> Iterator[State
             _purge_stale_read_ledger_unlocked(st)
             txn.dirty = True
         yield txn
-        if txn.dirty:
-            txn.save()
+        if txn.dirty and not txn.save():
+            raise StatePersistenceError(f"failed to persist state: {txn.state_file}")
+
 
 def _is_int(val: Any) -> bool:
     return isinstance(val, int) and not isinstance(val, bool)
 
+
 def filter_reads(
-    state: dict[str, Any], keep_read: Callable[[int], bool],
+    state: dict[str, Any],
+    keep_read: Callable[[int], bool],
     keep_outline: Callable[[int], bool] | None = None,
 ) -> bool:
     """Drop read ranges, pending reads, and outlines failing predicates; True when mutated."""
@@ -340,6 +316,7 @@ def filter_reads(
             mutated = True
     return mutated
 
+
 def merge_intervals(reads: list[list[int]]) -> list[list[int]]:
     """Merge overlapping/adjacent `[start, end, step_idx, confirm_tier]` sharing `confirm_tier`."""
     by_tier: dict[int, list[tuple[int, float, int]]] = {}
@@ -356,7 +333,8 @@ def merge_intervals(reads: list[list[int]]) -> list[list[int]]:
         merged: list[list[float | int]] = [[parsed[0][0], parsed[0][1], parsed[0][2]]]
         for nxt_s, nxt_e, nxt_step in parsed[1:]:
             if merged[-1][1] + 1 >= nxt_s:
-                merged[-1][1], merged[-1][2] = max(merged[-1][1], nxt_e), max(int(merged[-1][2]), nxt_step)
+                merged[-1][1] = max(merged[-1][1], nxt_e)
+                merged[-1][2] = max(int(merged[-1][2]), nxt_step)
             else:
                 merged.append([nxt_s, nxt_e, nxt_step])
         out.extend([int(m[0]), -1 if m[1] == float("inf") else int(m[1]), int(m[2]), tier] for m in merged)

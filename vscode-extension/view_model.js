@@ -20,7 +20,8 @@ const PROTECTION_LAYERS = [
   { key: "ranges_trimmed", shortLabel: "Trim", fullLabel: "Overlapping Ranges Trimmed", eventLabel: "Overlapping Range Trimmed", codicon: "$(filter)", emoji: "✂️" },
   { key: "cli_rewrites", shortLabel: "CLI", fullLabel: "Quiet CLI Flag Rewrites", eventLabel: "Quiet CLI Flag Rewrite", codicon: "$(terminal)", emoji: "🔇" },
   { key: "outline_pulls", shortLabel: "Outline CLI", fullLabel: "Voluntary Outlines (cg-outline)", eventLabel: "Voluntary Outline (cg-outline)", codicon: "$(list-tree)", emoji: "🧭" },
-  { key: "mcp_guards", shortLabel: "Guard", fullLabel: "Local-Repo & BigQuery MCP Guards", eventLabel: "Local-Repo & BQ MCP Guard", codicon: "$(lock)", emoji: "🔒" },
+  { key: "outputs_spooled", shortLabel: "Spool", fullLabel: "Spool Output Offloads", eventLabel: "Output Spooled", codicon: "$(archive)", emoji: "📦" },
+  { key: "mcp_guards", shortLabel: "Guard", fullLabel: "Policy Pack Security Guards", eventLabel: "Policy Pack Security Guard", codicon: "$(lock)", emoji: "🔒" },
   { key: "allowed_reads", shortLabel: "Allow", fullLabel: "Unmodified Allowed Reads", eventLabel: "Unmodified Allowed Read", codicon: "$(check)", emoji: "✅", compactHidden: true },
 ];
 
@@ -28,12 +29,14 @@ const EVENT_SHORT_LABELS = {
   wide_followup_blocks: "Wide", wide_followup_retries: "Wide",
   multi_file_blocks: "Batch", multi_file_retries: "Batch",
   rereads_blocked: "Re-Read", credit_reversals: "Reversal",
+  reliability_failures: "Reliability",
 };
 
 const EVENT_FULL_LABELS = {
   wide_followup_blocks: "Wide Follow-Up Read Blocked", wide_followup_retries: "Wide Follow-Up Read Blocked",
   multi_file_blocks: "Multi-File Batch Read Blocked", multi_file_retries: "Multi-File Batch Read Blocked",
   rereads_blocked: "Duplicate Re-Read Blocked", credit_reversals: "Credit Reversal After Bypass",
+  reliability_failures: "Reliability Failure",
 };
 
 for (const layer of PROTECTION_LAYERS) {
@@ -86,6 +89,7 @@ function normalizeStats(raw) {
   for (const layer of PROTECTION_LAYERS) {
     events[layer.key] = clampNonNegativeInt(rawEvents[layer.key]);
   }
+  events.reliability_failures = clampNonNegativeInt(rawEvents.reliability_failures);
   for (const [k, v] of Object.entries(rawEvents)) {
     if (!(k in events)) events[k] = clampNonNegativeInt(v);
   }

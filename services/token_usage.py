@@ -1,36 +1,32 @@
-#!/usr/bin/env python3
 """Real token usage read offline from harness transcripts (Claude Code, Codex, Antigravity, Cursor)."""
 
 from __future__ import annotations
 
-import json
-import sys
 from collections import Counter
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
+import json
 from pathlib import Path
 from typing import Any
 
-_PACKAGE_ROOT = Path(__file__).resolve().parent.parent
-if str(_PACKAGE_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PACKAGE_ROOT))
-
-fcntl: Any
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows
-    from hooks import file_io as fcntl
-
-from hooks.json_outliners import ANTIGRAVITY_FULL_TRANSCRIPT_GLOB  # noqa: E402
-from hooks.model_identity import (  # noqa: E402
+from core.platform_io import (
+    LOCK_EX,
+    LOCK_UN,
+    flock,
+    now_iso,
+    read_json_object_or_quarantine,
+    resolve_plugin_root,
+    warn,
+    write_json_atomic,
+)
+from hooks.json_outliners import ANTIGRAVITY_FULL_TRANSCRIPT_GLOB
+from hooks.model_identity import (
     UNKNOWN_MODEL,
     detect_codex_model,
     normalize_model_label,
     pinned_model,
 )
-from hooks.state_store import resolve_plugin_root, warn  # noqa: E402
-from hooks.telemetry import now_iso, read_json_object_or_quarantine, write_json_atomic  # noqa: E402
-from bin.preamble_attribution import (  # noqa: E402
+from services.preamble_attribution import (
     CODEX_CLI_HARNESS,
     MalformedAttachment,
     accumulate_codex_preamble,
@@ -41,17 +37,17 @@ from bin.preamble_attribution import (  # noqa: E402
     merge_parts,
     usage_keys,
 )
-from bin.transcript_parsers import (  # noqa: E402
-    UsageEvent as UsageEvent,
-    antigravity_model_from_record as antigravity_model_from_record,
-    codex_model_from_record as codex_model_from_record,
-    codex_total_counts as codex_total_counts,
-    estimate_cursor_tokens as estimate_cursor_tokens,
-    nonneg_int as nonneg_int,
-    parse_antigravity_record as parse_antigravity_record,
-    parse_claude_record as parse_claude_record,
-    parse_codex_record as parse_codex_record,
-    parse_utc_day as parse_utc_day,
+from services.transcript_parsers import (
+    UsageEvent,
+    antigravity_model_from_record,
+    codex_model_from_record,
+    codex_total_counts,
+    estimate_cursor_tokens,
+    nonneg_int,
+    parse_antigravity_record,
+    parse_claude_record,
+    parse_codex_record,
+    parse_utc_day,
 )
 
 _ROOT = resolve_plugin_root()
@@ -707,7 +703,7 @@ def refresh_usage(
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         lock_fh = open(lock_path, "a+", encoding="utf-8")
-        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        flock(lock_fh.fileno(), LOCK_EX)
         locked = True
     except OSError as exc:
         if lock_fh is not None:
@@ -729,7 +725,7 @@ def refresh_usage(
     finally:
         if lock_fh is not None:
             try:
-                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+                flock(lock_fh.fileno(), LOCK_UN)
             except OSError:
                 pass
             lock_fh.close()

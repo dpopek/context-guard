@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Outline-pull discoverability: the `cg-outline` PATH shim and a marked rule block in instruction files.
 
 Both are owned by markers: the installer never edits text outside its block and never replaces
@@ -10,9 +9,10 @@ import os
 import shlex
 import shutil
 import sys
-import tempfile
 from pathlib import Path
 from typing import Callable, Sequence
+
+from core.platform_io import atomic_write_bytes
 
 BLOCK_START = "<!-- context-guard:outline-pull:start -->"
 BLOCK_END = "<!-- context-guard:outline-pull:end -->"
@@ -53,21 +53,8 @@ def _write(path: Path, content: str, mode: int | None = None) -> None:
     backup = path.with_name(path.name + ".bak")
     if mode is None and path.exists() and not backup.exists():
         shutil.copy2(path, backup)
-    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
-            fh.write(content)
-        if mode is not None:
-            os.chmod(tmp, mode)
-        elif path.exists():
-            shutil.copymode(path, tmp)
-        os.replace(tmp, str(path))
-    except OSError:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    eff_mode = mode if mode is not None else ((path.stat().st_mode & 0o777) if path.exists() else 0o644)
+    atomic_write_bytes(path, content.encode("utf-8"), mode=eff_mode, prefix=f".{path.name}.")
 
 
 def _read(path: Path) -> str:
@@ -107,7 +94,7 @@ def upsert_block(path: Path, dry_run: bool = False) -> str:
     elif span[1] < 0:
         return "skipped (unterminated block)"
     else:
-        new_text = text[:span[0]] + _BLOCK + text[span[1]:]
+        new_text = text[: span[0]] + _BLOCK + text[span[1] :]
     if new_text == text:
         return "unchanged"
     if not dry_run:
@@ -124,11 +111,11 @@ def remove_block(path: Path, dry_run: bool = False) -> bool:
     span = _block_span(text)
     if span is None or span[1] < 0:
         return False
-    head = text[:span[0]]
+    head = text[: span[0]]
     if head.endswith("\n\n"):
         head = head[:-1]
     if not dry_run:
-        _write(path, head + text[span[1]:])
+        _write(path, head + text[span[1] :])
     return True
 
 
@@ -160,8 +147,13 @@ def on_path(bin_dir: Path) -> bool:
 
 
 def install_shim(
-    bin_dir: Path, plugin_root: Path, dry_run: bool = False,
-    *, shim_name: str = SHIM_NAME, marker: str = SHIM_MARKER, script_name: str = "outline.py",
+    bin_dir: Path,
+    plugin_root: Path,
+    dry_run: bool = False,
+    *,
+    shim_name: str = SHIM_NAME,
+    marker: str = SHIM_MARKER,
+    script_name: str = "outline.py",
 ) -> str:
     """Write an executable POSIX shim: `created`, `updated`, `unchanged`, or `skipped (...)`."""
     if IS_WINDOWS:
@@ -209,7 +201,11 @@ def _upsert_status(path: Path, dry_run: bool) -> str:
 def _install_one_shim(
     bin_dir: Path, plugin_root: Path, dry_run: bool, *, shim_name: str, marker: str, script_name: str
 ) -> tuple[str, bool]:
-    status = _guarded(lambda: install_shim(bin_dir, plugin_root, dry_run=dry_run, shim_name=shim_name, marker=marker, script_name=script_name))
+    status = _guarded(
+        lambda: install_shim(
+            bin_dir, plugin_root, dry_run=dry_run, shim_name=shim_name, marker=marker, script_name=script_name
+        )
+    )
     installed = not status.startswith(("skipped", "error"))
     usable = installed and on_path(bin_dir)
     return (f"{status} (not_on_path)" if installed and not usable else status), usable
@@ -230,9 +226,13 @@ def install_outline_pull(
     extra_statuses = {key: _NOT_REQUESTED for key, _, _, _ in _EXTRA_SHIMS}
     if shim_bin_dir is not None:
         bin_dir, root = shim_bin_dir, Path(plugin_root)
-        shim_status, usable = _install_one_shim(bin_dir, root, dry_run, shim_name=SHIM_NAME, marker=SHIM_MARKER, script_name="outline.py")
+        shim_status, usable = _install_one_shim(
+            bin_dir, root, dry_run, shim_name=SHIM_NAME, marker=SHIM_MARKER, script_name="outline.py"
+        )
         for key, name, marker, script in _EXTRA_SHIMS:
-            extra_statuses[key], _ = _install_one_shim(bin_dir, root, dry_run, shim_name=name, marker=marker, script_name=script)
+            extra_statuses[key], _ = _install_one_shim(
+                bin_dir, root, dry_run, shim_name=name, marker=marker, script_name=script
+            )
     if not instruction_files:
         block_status = _NOT_REQUESTED
     elif not usable:

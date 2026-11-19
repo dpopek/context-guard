@@ -9,14 +9,14 @@ import shlex
 from pathlib import Path
 from typing import Any
 
-from hooks.json_outliners import (
+from core.contracts import (
     MAX_FORMAT_JSON_BYTES,
+    MAX_OUTLINE_FILE_BYTES,
     PendingUnwrapWrite,
     PreparedOutline,
     finalize_outline_text,
     materialize_unwrap_write,
 )
-from hooks.outline import MAX_OUTLINE_FILE_BYTES
 
 TWG_STDOUT_OUTLINE_MIN_BYTES = 6 * 1024  # 6 KB minimum before outlining TWG stdout*.json
 TWG_STDOUT_FILENAMES = frozenset({"stdout.json", "stdout.compact.json"})

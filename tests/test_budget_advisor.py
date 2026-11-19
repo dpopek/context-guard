@@ -13,7 +13,8 @@ from typing import Any
 
 import pytest
 
-from bin import budget_advisor, cg_budget, mcp_inventory, token_usage, usage_report
+from bin import cg_budget
+from services import budget_advisor, mcp_inventory, token_usage, usage_report
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -374,8 +375,8 @@ def test_cli_passive_default_audit_touches_zero_files_and_spawns_zero_processes(
     assert "Context-Guard Preamble & MCP Budget Advisor" in capsys.readouterr().out
     assert _snapshot_tree(tmp_path) == before
 
-    # Zero os.getcwd() inside library bin/budget_advisor.py
-    tree = ast.parse((REPO_ROOT / "bin" / "budget_advisor.py").read_text(encoding="utf-8"))
+    # Zero os.getcwd() inside library services/budget_advisor.py
+    tree = ast.parse((REPO_ROOT / "services" / "budget_advisor.py").read_text(encoding="utf-8"))
     cwd_calls = [
         n for n in ast.walk(tree)
         if isinstance(n, ast.Attribute) and n.attr == "getcwd" and isinstance(n.value, ast.Name) and n.value.id == "os"

@@ -6,9 +6,9 @@ Live token savings telemetry, status bar indicator, SVG donut ring side panel, a
 
 ## Overview
 
-**Context-Guard (v5.0.0)** is a zero-prompt Policy API v1 reliability platform, verified Read Ledger v2 (`range_trim`), reversible output spooler, preamble/MCP budget advisor, Evidence Engine, Adaptive Governor, intervention explainer, off-hot-path OTel exporter, and 4-harness conformance plugin for **Google Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex CLI/App** using pure Python 3.9+ stdlib hooks.
+**Context-Guard (v5.1.0)** is a zero-prompt Policy API v1 reliability platform, Read Ledger v2 (`range_trim`), reversible output spooler, preamble/MCP budget advisor, Evidence Engine, Adaptive Governor, explainer, OTel exporter, and 4-harness conformance plugin for **Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex** (`Python 3.9+` stdlib).
 
-This companion IDE extension reads `telemetry/stats.json`, `token_usage.json`, `outcomes.json` (Outcomes Schema v4), and `update.json` from your installed Context-Guard checkout (auto-refreshing missing or stale `token_usage.json` via `cg_status.py --usage`) to surface token savings and v4.5 insights in your editor.
+This extension reads `telemetry/stats.json`, `token_usage.json`, `outcomes.json` (Outcomes v4), and `update.json` from your installed checkout (auto-refreshing stale `token_usage.json` via `cg_status.py --usage`) to display savings and reliability insights.
 
 ---
 
@@ -23,7 +23,7 @@ This companion IDE extension reads `telemetry/stats.json`, `token_usage.json`, `
 - **Activity Bar View (`Token Savings`)** and **Explorer Section (`Context-Guard Savings`)**:
   - Interactive SVG donut gauge showing token reduction percentage and saved token total.
   - KPI cards for **Baseline Read**, **Actual Sent**, **Cache Hit %**, **Preamble (Last)** with **Recent (10)** median, **Doctor**, and **30d Verdict**.
-  - **By Harness** progress bars and **By Protection Layer** breakdown across v4.5 layers, plus **Estimated Cost Impact (non-counterfactual)**.
+  - **By Harness** bars and **By Protection Layer** breakdown (including `outputs_spooled` and `reliability_failures`), plus **Estimated Cost Impact (non-counterfactual)**.
 
 ### 3. Interactive Token Savings Report (`contextGuard.showReport`)
 - Open from status bar or Command Palette for Outcomes Schema v4, **Estimated Cost Impact (non-counterfactual)**, `Cache Hit %`, `Doctor` (`NATIVE_FAIL_CLOSED_DRIFT`), and `sunset_verdict`.

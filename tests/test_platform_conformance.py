@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from bin.token_usage import USAGE_SCHEMA_VERSION
+from services.token_usage import USAGE_SCHEMA_VERSION
 from evidence.conformance import (
     build_capability_limitation_matrix,
     build_deprecation_policy,

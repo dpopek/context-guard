@@ -10,10 +10,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from bin import cg_status, install_harnesses
-from bin.cg_status import load_update, render_claude_hud, render_update_line, render_update_suffix
+from services import status_service
+from services.status_service import load_update, render_claude_hud, render_update_line, render_update_suffix
 
 # Captured at import, before tests/conftest.py swaps it for a no-op in every test.
-REAL_SPAWN_UPDATE_CHECK = cg_status.spawn_update_check
+REAL_SPAWN_UPDATE_CHECK = status_service.spawn_update_check
 
 UPDATE_AVAILABLE = {
     "checked_at": "2026-11-01T10:00:00Z",
@@ -93,8 +94,8 @@ def test_load_update_returns_none_for_missing_or_unreadable_files(tmp_path: Path
 
 def test_hud_starts_the_check_only_when_the_result_is_stale(tmp_path: Path, monkeypatch, capsys) -> None:
     spawns: list = []
-    monkeypatch.setattr(cg_status, "read_nonblocking_stdin_json", lambda: {})
-    monkeypatch.setattr(cg_status, "spawn_update_check", lambda: spawns.append(1))
+    monkeypatch.setattr(status_service, "read_nonblocking_stdin_json", lambda: {})
+    monkeypatch.setattr(status_service, "spawn_update_check", lambda: spawns.append(1))
     update_path = tmp_path / "update.json"
     argv = ["--claude-hud", "--stats-path", str(tmp_path / "stats.json"), "--update-path", str(update_path)]
 
@@ -110,8 +111,8 @@ def test_hud_starts_the_check_only_when_the_result_is_stale(tmp_path: Path, monk
 
 def test_hud_backs_off_while_a_recent_attempt_left_a_fresh_lock(tmp_path: Path, monkeypatch, capsys) -> None:
     spawns: list = []
-    monkeypatch.setattr(cg_status, "read_nonblocking_stdin_json", lambda: {})
-    monkeypatch.setattr(cg_status, "spawn_update_check", lambda: spawns.append(1))
+    monkeypatch.setattr(status_service, "read_nonblocking_stdin_json", lambda: {})
+    monkeypatch.setattr(status_service, "spawn_update_check", lambda: spawns.append(1))
     update_path = tmp_path / "update.json"
     stale = {**UPDATE_AVAILABLE, "checked_at": "2020-01-01T00:00:00Z"}
     update_path.write_text(json.dumps(stale), encoding="utf-8")
@@ -148,8 +149,8 @@ def test_real_spawn_starts_update_check_detached(monkeypatch) -> None:
 
 
 def test_markdown_and_json_include_the_update(tmp_path: Path, monkeypatch, capsys) -> None:
-    monkeypatch.setattr(cg_status, "usage_lines", lambda stats, path, outcomes=None: [])
-    monkeypatch.setattr(cg_status, "usage_json", lambda stats, path, outcomes=None: {})
+    monkeypatch.setattr(status_service, "usage_lines", lambda stats, path, outcomes=None: [])
+    monkeypatch.setattr(status_service, "usage_json", lambda stats, path, outcomes=None: {})
     update_path = tmp_path / "update.json"
     update_path.write_text(json.dumps(UPDATE_AVAILABLE), encoding="utf-8")
     common = ["--stats-path", str(tmp_path / "stats.json"), "--update-path", str(update_path)]

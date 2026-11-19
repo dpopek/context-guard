@@ -4,16 +4,11 @@ from __future__ import annotations
 
 import json
 import re
-import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-_PACKAGE_ROOT = Path(__file__).resolve().parent.parent
-if str(_PACKAGE_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PACKAGE_ROOT))
-
-from spool.mcp_server import is_cursor_spool_mcp_configured  # noqa: E402
+from spool.mcp_server import is_cursor_spool_mcp_configured
 
 DEFAULT_CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
 DEFAULT_CURSOR_HOOKS = Path.home() / ".cursor" / "hooks.json"

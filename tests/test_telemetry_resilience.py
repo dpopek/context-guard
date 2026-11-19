@@ -14,7 +14,8 @@ from typing import Any
 
 import pytest
 
-from bin import token_usage, update_check
+from bin import update_check
+from services import token_usage
 from hooks import config as guard_config
 from hooks import policy_engine, post_tool_use, pre_compact, pre_invocation, pre_tool_use, state_store
 from hooks.harness_adapter import NormalizedToolCall

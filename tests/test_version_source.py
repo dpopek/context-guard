@@ -43,12 +43,14 @@ def test_extension_manifest_matches_plugin_manifest() -> None:
 def test_no_version_literal_outside_the_manifests() -> None:
     version = _manifest_version(ROOT / "plugin.json")
     sources = [
-        *ROOT.glob("hooks/*.py"),
-        *ROOT.glob("bin/*.py"),
+        *ROOT.glob("core/*.py"),
         *ROOT.glob("policies/*.py"),
-        *ROOT.glob("integrations/*.py"),
         *ROOT.glob("spool/*.py"),
+        *ROOT.glob("integrations/*.py"),
+        *ROOT.glob("hooks/*.py"),
+        *ROOT.glob("services/*.py"),
         *ROOT.glob("evidence/*.py"),
+        *ROOT.glob("bin/*.py"),
         *ROOT.glob("tests/*.py"),
         *ROOT.glob("vscode-extension/*.js"),
     ]
@@ -73,12 +75,14 @@ def test_readme_version_modules_flags_and_config_stay_in_sync() -> None:
     production_modules = sorted(
         path.name
         for pattern in (
-            "hooks/*.py",
-            "bin/*.py",
+            "core/*.py",
             "policies/*.py",
-            "integrations/*.py",
             "spool/*.py",
+            "integrations/*.py",
+            "hooks/*.py",
+            "services/*.py",
             "evidence/*.py",
+            "bin/*.py",
             "vscode-extension/*.js",
         )
         for path in ROOT.glob(pattern)

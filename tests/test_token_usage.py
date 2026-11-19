@@ -9,8 +9,8 @@ from typing import Any
 
 import pytest
 
-from bin import token_usage, transcript_parsers
-from bin.token_usage import (
+from services import token_usage, transcript_parsers
+from services.token_usage import (
     ingest_transcripts,
     prune_component_use,
     prune_vanished,
@@ -664,7 +664,7 @@ def test_token_usage_lock_failure_is_read_only_and_cg_status_json_error_is_valid
     def _boom_flock(*_args: Any, **_kwargs: Any) -> None:
         raise OSError("simulated flock failure")
 
-    monkeypatch.setattr(token_usage.fcntl, "flock", _boom_flock)
+    monkeypatch.setattr(token_usage, "flock", _boom_flock)
     loaded = token_usage.refresh_usage(state_path=usage_path, roots={}, saved_tokens_now=500)
     assert usage_path.read_text(encoding="utf-8") == before_bytes
     assert isinstance(loaded, dict)
@@ -675,7 +675,7 @@ def test_token_usage_lock_failure_is_read_only_and_cg_status_json_error_is_valid
     monkeypatch.setattr(cg_status, "load_telemetry_stats", _boom_stats)
     capsys.readouterr()
     rc = cg_status.main(["--json"])
-    assert rc == 0
+    assert rc == 1
     out_json = json.loads(capsys.readouterr().out.strip())
     assert out_json.get("error") == "RuntimeError"
 

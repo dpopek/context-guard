@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from bin.cg_status import render_markdown_report
+from services.status_service import render_markdown_report
 from hooks.shell_output import BUCKETS, measure
 from hooks.telemetry import load_telemetry_stats, record_shell_output, record_telemetry_event
 

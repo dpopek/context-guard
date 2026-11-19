@@ -33,13 +33,13 @@ from spool.receipts import (
     summarize_spool_lifecycle,
 )
 from spool.store import (
-    build_post_tool_spool_response,
     gc_spools,
     grep_spool,
     inspect_spool_health,
     list_spools,
     resolve_spool_dir,
     slice_spool,
+    spool_post_tool_output,
     spool_tool_output,
 )
 
@@ -52,7 +52,6 @@ __all__ = [
     "VALID_SPOOL_ISOLATIONS",
     "append_receipt",
     "atomic_write_bytes",
-    "build_post_tool_spool_response",
     "build_receipt",
     "check_unsafe_link",
     "classify_pre_tool_spool_followup",
@@ -76,6 +75,7 @@ __all__ = [
     "same_workspace_dir",
     "serve_stdio",
     "slice_spool",
+    "spool_post_tool_output",
     "spool_tool_output",
     "summarize_receipts",
     "summarize_spool_lifecycle",

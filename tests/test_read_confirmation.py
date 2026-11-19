@@ -119,7 +119,7 @@ def test_plan_file_read_verdict_is_pure_and_pass2_block_writes_no_unwrap_or_pend
         pre_tool_use,
         "verify_security_policies_post_transform",
         lambda call, cfg, **kw: {"decision": "deny", "reason": "blocked target"}
-        if "secret_target.py" in str(call.target_path or "")
+        if "secret_target.py" in str(call.canonical_args.get("Path") or "")
         else None,
     )
     res = pre_tool_use.evaluate_hook(

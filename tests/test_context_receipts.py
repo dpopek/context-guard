@@ -193,7 +193,7 @@ def test_receipts_rotate_at_limit_and_public_json_scrubs_receipt_paths_and_works
         sym_path.symlink_to(target)
         assert append_receipt(extra, receipts_path=sym_path) is False
 
-    from bin.replay_benchmark import build_public_json_bundle, check_release_hygiene
+    from services.replay_benchmark import build_public_json_bundle, check_release_hygiene
 
     bundle = build_public_json_bundle(
         {"saved_bytes": 100, "receipts_path": str(rcpt_path), "workspace_id": "ws_0123456789abcdef"},

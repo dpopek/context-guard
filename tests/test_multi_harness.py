@@ -259,13 +259,9 @@ def test_pre_compact_clears_session_file_cache(tmp_path: Path) -> None:
     assert allowed == {}
 
 
-from bin.install_harnesses import (
-    CODEX_POST_MATCHER,
-    CURSOR_POST_MATCHER,
-    compute_codex_trusted_hash,
-    install_all,
-    uninstall_all,
-)
+from services.codex_toml import compute_codex_trusted_hash
+from services.harness_status import CODEX_POST_MATCHER, CURSOR_POST_MATCHER
+from services.installer_service import install_all, uninstall_all
 
 
 def test_codex_trusted_hash_matches_upstream_formula() -> None:
@@ -323,7 +319,7 @@ def test_installer_idempotency_and_uninstall(tmp_path: Path) -> None:
 
 
 def test_installer_registers_shell_output_hooks(tmp_path: Path) -> None:
-    from bin.install_harnesses import format_hook_script_path, resolve_python_command
+    from services.installer_service import format_hook_script_path, resolve_python_command
 
     claude_cfg = tmp_path / "claude.json"
     cursor_cfg = tmp_path / "cursor_hooks.json"
@@ -385,8 +381,7 @@ def test_installer_registers_shell_output_hooks(tmp_path: Path) -> None:
 
 def test_evaluate_hook_env_detection_and_pack_matchers(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     import re
-    from bin.harness_status import merge_harness_matcher
-    from bin.install_harnesses import CLAUDE_MATCHER, CODEX_MATCHER, CURSOR_MATCHER
+    from services.harness_status import CLAUDE_MATCHER, CODEX_MATCHER, CURSOR_MATCHER, merge_harness_matcher
 
     assert re.search(CLAUDE_MATCHER, "Bash") and re.search(CURSOR_MATCHER, "Shell")
     assert re.search(CODEX_MATCHER, "mcp__acme_db__execute_sql_readonly")
@@ -434,7 +429,8 @@ def test_normal_source_file_reads_are_always_allowed_across_harnesses(tmp_path: 
 
 def test_matchers_include_codex_exec_and_cursor_snake_case_and_clean_stale_extension_dir(tmp_path: Path) -> None:
     import re
-    from bin.install_harnesses import CODEX_MATCHER, CURSOR_MATCHER, EXTENSION_ID, install_all
+    from services.harness_status import CODEX_MATCHER, CURSOR_MATCHER
+    from services.installer_service import EXTENSION_ID, install_all
 
     assert re.search(CODEX_MATCHER, "exec")
     assert re.search(CODEX_MATCHER, "exec_command")
@@ -657,11 +653,11 @@ def test_non_antigravity_format_preserves_capital_path_key() -> None:
 
 
 def test_installer_output_spool_hooks_mcp_verify_and_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from bin.harness_status import (
+    from services.harness_status import (
         CLAUDE_POST_SPOOL_MATCHER, CLAUDE_POST_SYNC_MATCHER, CURSOR_POST_SPOOL_MATCHER,
         verify_harness_hooks, without_cg_handlers,
     )
-    from bin.install_harnesses import check_status as install_check_status
+    from services.installer_service import check_status as install_check_status
 
     plugin_root = Path(__file__).resolve().parent.parent
     cfg_path = tmp_path / "cfg" / "config.json"
@@ -669,7 +665,7 @@ def test_installer_output_spool_hooks_mcp_verify_and_status(tmp_path: Path, monk
     cfg_path.write_text(json.dumps({"optimizers": {"output_spool": "active"}, "integrations": {"cursor_spool_mcp": "active"}}), encoding="utf-8")
     monkeypatch.setenv("CONTEXT_GUARD_CONFIG_PATH", str(cfg_path))
     guard_config.clear_config_cache()
-    monkeypatch.setattr("bin.instruction_block.IS_WINDOWS", False)
+    monkeypatch.setattr("services.instruction_block.IS_WINDOWS", False)
 
     claude_cfg = tmp_path / "claude" / "settings.json"
     cursor_dir = tmp_path / "cursor"
@@ -734,7 +730,7 @@ def test_installer_rollback_restores_cg_spool_and_cursor_mcp(
     isolated_user_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     plugin_root = Path(__file__).resolve().parent.parent
-    monkeypatch.setattr("bin.instruction_block.IS_WINDOWS", False)
+    monkeypatch.setattr("services.instruction_block.IS_WINDOWS", False)
     cfg_path = isolated_user_env / ".config" / "context-guard" / "config.json"
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg_path.write_text(json.dumps({"optimizers": {"output_spool": "active"}, "integrations": {"cursor_spool_mcp": "active"}}), encoding="utf-8")

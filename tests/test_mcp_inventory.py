@@ -13,9 +13,9 @@ from typing import Any
 
 import pytest
 
-from bin import mcp_inventory, token_usage
-from bin.codex_toml import parse_codex_mcp_servers
-from bin.preamble_attribution import CODEX_TOOL_BYTES_PER_TOKEN
+from services import mcp_inventory, token_usage
+from services.codex_toml import parse_codex_mcp_servers
+from services.preamble_attribution import CODEX_TOOL_BYTES_PER_TOKEN
 from spool.mcp_server import SPOOL_MCP_TOOL_SCHEMAS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -96,8 +96,8 @@ def test_passive_inventory_has_zero_subprocess_network_or_disk_side_effects(
     assert inv["probe_warning"] is None
     assert all(s["probe_status"] == "not_probed" for s in inv["servers"])
 
-    # Enforce zero os.getcwd() inside bin/mcp_inventory.py
-    inv_src = (REPO_ROOT / "bin" / "mcp_inventory.py").read_text(encoding="utf-8")
+    # Enforce zero os.getcwd() inside services/mcp_inventory.py
+    inv_src = (REPO_ROOT / "services" / "mcp_inventory.py").read_text(encoding="utf-8")
     tree = ast.parse(inv_src)
     cwd_calls = [
         n for n in ast.walk(tree)

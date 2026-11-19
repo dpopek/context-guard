@@ -1,13 +1,13 @@
-# Context-Guard — Development Roadmap `v4.5.2`–`v5.0.0` and Architectural Freeze Record
+# Context-Guard — Development Roadmap `v4.5.2`–`v5.1.0` and Architectural Freeze Record
 
-**Status:** `ARCHITECTURAL FREEZE` — approved direction; implementation details subject to contract tests  
-**Date:** November 16, 2026  
-**Analysis baseline:** `v4.5.1`, commit `54045e2f793893a895c8693f61c1ac63f0c7ed01` (`7/7` green Multi-OS CI jobs per reported verification)  
+**Status:** `ARCHITECTURAL FREEZE` — `v5.0.0` contracts frozen; `v5.1.0` architectural remediation & 8-layer DAG enforced  
+**Date:** November 19, 2026  
+**Analysis baseline:** `v4.5.1`, commit `54045e2f793893a895c8693f61c1ac63f0c7ed01` (`7/7` green Multi-OS CI jobs per reported verification); `v5.1.0` builds on `v5.0.0` (`7278094`)  
 **Supported harnesses:** Claude Code, Cursor, OpenAI Codex, Google Antigravity  
-**Document purpose:** authoring specifications, TDD plans, issues, and acceptance criteria for upcoming releases
+**Document purpose:** authoring specifications, TDD plans, issues, and acceptance criteria for releases
 
 > [!NOTE]
-> **Repository state in `v5.0.0`:** Completing the `v4.5.2`–`v5.0.0` Architectural Freeze roadmap (`v4.5.2`/`v4.5.3` spool integrity & `ContextReceiptV1`, `v4.6.0` passive `cg budget`, `v4.7.0` Evidence Engine `cg eval`, `v4.8.0` Adaptive Governor `cg eval --governor-check`, and `v4.9.0` `cg explain` / off-hot-path `cg export --otel` / `cg eval --hardening-check` with `hooks/*.py` untouched at `6,762` LOC), `v5.0.0` delivers the **Stable Context Reliability Platform** (`policies/api.py`, `policies/__init__.py`, `evidence/conformance.py`, `bin/cg.py`, `bin/cg_eval.py`): frozen `POLICY_API_VERSION = 1` without an unnecessary Policy API v2 or external SDK (`policy_api_v2_mandated == False`, `external_sdk_shipped == False`), the 17-entry `CORE_SCHEMA_VERSIONS` registry and formal `DeprecationPolicyV1`, a cohesive `cg` CLI across `doctor`, `budget`, `explain`, `eval`, and `help` with `--json`/`--markdown` parity and exit codes `0`/`1`/`2`, the published 4-harness `PlatformMatrixContractV1` capability & limitation matrix (Part III below and `cg eval --platform-matrix`), and the 10-gate `cg eval --conformance` adapter, baseline policy-pack, migration, and rollback suite verified in Multi-OS CI.
+> **Repository state in `v5.1.0`:** Building on the frozen `v5.0.0` **Stable Context Reliability Platform** (`POLICY_API_VERSION = 1`, `CORE_SCHEMA_VERSIONS`, `DeprecationPolicyV1`, `PlatformMatrixContractV1`, and 10-gate `cg eval --conformance`), `v5.1.0` enforces a strict **8-layer acyclic DAG** (`core` -> `policies` -> `spool`/`integrations` -> `hooks` -> `services` -> `evidence` -> `bin`, with `Tarjan Package SCC == 0`, `Tarjan File SCC == 0`, zero production `assert`s, and zero `X as X` facades), adds the Layer 0 `core/` foundation and Layer 4 `services/` package (keeping all 10 `bin/*.py` CLI entrypoints `<= 350` LOC and `hooks/*.py < 6,800` LOC), extracts the pure `hooks/telemetry_core.py` and `hooks/drift_probe.py` modules, moves `replay_governor_decisions` to `evidence/conformance.py`, and hardens transactional read-planner TOCTOU checks, `StatePersistenceError` semantics, read-only state fallbacks, Outcomes v4 `step_idx=0` eviction, spool GC races, and `RollbackJournal` installs. See **Part IV** below.
 
 ---
 
@@ -484,3 +484,31 @@ Context-Guard separates deterministic mechanism verification from live stochasti
 | **Small Live Pilot** (`cg eval --pilot`, `small_live_pilot`: `6 tasks x 2 configs x 3 repeats = 36 runs`) | Provides a fast, workspace-isolated live smoke gate to catch gross pass-rate drops, broken recovery loops, or runaway turn amplification before full evaluation. | Sample size (`36` runs) is underpowered for narrow confidence intervals and is a regression gate, **not** statistical proof of net cost reduction. |
 | **Release Evaluation** (`cg eval --release`, `release_evaluation`: `12-15 tasks x 3 configs x 2 repeats = 72-90 runs/harness`) | Measures **`Cost per Passed Run`** (`total_cost_usd_all_attempts / passed_runs`, `undefined` at `0` passes) across Baseline, Context-Guard, and Context-Guard + RTK with Wilson pass-rate intervals, bootstrap CIs, and pinned `CapabilityAttestationKey` provenance. | Results hold strictly for the attested `(harness_id, harness_build_id, adapter_version, hook_config_fingerprint, model_id)` tuple and task distribution; upgrading the harness CLI or changing models invalidates prior capability/cost claims. |
 | **Observational Outcomes Attribution** (`cg_status.py --outcomes`, `outcomes.json` v4) | Tracks live per-harness/model intervention counts, targeted vs. full spool recovery, `suspected` vs. `confirmed` regret, 30-day `sunset_verdict`, and `Est. associated model cost`. | **`Estimated Cost Impact` is observational `1/k` step-weighted transcript attribution, never causal counterfactual A/B proof.** Failed attempts (`failed_attempt`) and endogenous prompt-cache `TTL cache misses` are **never** excluded from `Cost per Passed Run`, and missing telemetry (e.g., Cursor CLI `excluded_missing_telemetry`) is never reported as `0`. |
+
+---
+
+## Part IV — `v5.1.0` Architectural Hardening & 8-Layer Acyclic DAG
+
+While preserving frozen `POLICY_API_VERSION = 1` and all 17 `CORE_SCHEMA_VERSIONS` entries from `v5.0.0`, `v5.1.0` eliminates cross-layer cycles, duplicate utilities, lock-held subprocess calls, and silent write/integrity edge cases across the codebase.
+
+### 1. Enforced 8-Layer Acyclic Dependency Graph (`Tarjan Package SCC == 0`)
+
+```text
+Layer 0: core/          -> {}                                                           (platform_io, contracts, scrub, shell_lexer)
+Layer 1: policies/      -> {core}                                                       (Policy API v1, loader, governor)
+Layer 2: spool/         -> {core, policies}                                             (domain spool store, receipts, classifier, MCP)
+Layer 2: integrations/  -> {core}                                                       (opt-in CLI/JSON adapters; zero hooks.*)
+Layer 3: hooks/         -> {core, policies, spool, integrations}                        (hook pipeline, functional telemetry_core, drift_probe)
+Layer 4: services/      -> {core, policies, spool, integrations, hooks}                 (18 off-hot-path application & reporting services)
+Layer 5: evidence/      -> {core, policies, spool, integrations, hooks, services}       (ledger, metrics, runner, conformance)
+Layer 6: bin/           -> {core, policies, spool, integrations, hooks, services, evidence} (10 thin CLI entrypoints <= 350 LOC each)
+```
+
+Mechanical AST checks in `tests/test_module_boundaries.py` enforce `Tarjan Package SCC == 0` (including lazy function/class imports), `Tarjan File SCC == 0`, strict layer direction, `0` production `assert` statements, `0` `X as X` identity re-export aliases, `bin/*.py <= 350` LOC, and `hooks/*.py < 6,800` LOC.
+
+### 2. Core Reliability & Concurrency Hardening Delivered in `v5.1.0`
+
+* **Transactional Read Planner & State Persistence (`hooks/state_store.py`, `hooks/read_planner.py`, `hooks/pre_tool_use.py`):** Raises `StatePersistenceError` when `locked_state` fails to flush dirty mutations, falls back cleanly on read-only `state_dir` snapshots (`LOCK_SH`/unlocked `warn`), verifies `sha256` and `reads` inside `locked_state` to abort stale trims on concurrent mutations, strips dangling redirects if unwrap fails, merges Pass-1 `pack_ow` decisions, and keeps `PreToolUse` fail-open for planner I/O vs. fail-closed for security packs.
+* **Functional Telemetry Core & Outcomes Integrity (`hooks/telemetry_core.py`, `hooks/telemetry.py`, `hooks/outcomes.py`, `hooks/post_tool_use.py`):** Extracts pure `telemetry_core`, prevents `step_idx <= 0` eviction blackholes and `|` key collisions in `open_windows`, supports dual-ended `trimmed_spans`, preserves global `shadow_spools` on per-session compaction, skips `tier=0` LRU pollution, unifies read caps in `core.contracts.HARNESS_CAPABILITIES`, and routes `PostToolUse` `state_dir=None` outcomes to `DEFAULT_OUTCOMES_PATH`.
+* **Lock Hygiene, Spool GC & Security Ceilings (`hooks/drift_probe.py`, `spool/store.py`, `policies/governor.py`, `evidence/`):** Moves `subprocess` drift probes and session transition hooks outside `locked_state`, closes spool GC vs. read verification races via locked file descriptors, enforces `_static_capability_ceiling` in both `governor` and `evidence/ledger.py`, moves `replay_governor_decisions` into `evidence/conformance.py`, and clears `hooks.config` cache around isolated env-mutating runs.
+* **Service Extraction, Rollback & CLI Exit Parity (`services/`, `bin/`, `vscode-extension/`):** Moves 13 non-CLI modules and 4 extracted service modules (`installer_service`, `explain_service`, `export_service`, `status_service`) into `services/`, wraps default `install_all` in `RollbackJournal`, aggregates Schema v4 `outcomes.by_key` in `services/replay_benchmark.py`, returns exit code `1` on installer/`cg_status.py` errors (keeping `--claude-hud` fail-open `0`), and adds `outputs_spooled` and `reliability_failures` cards to `vscode-extension/view_model.js`.

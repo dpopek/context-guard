@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from bin.preamble_attribution import CODEX_CLI_HARNESS, CODEX_DESKTOP_HARNESS
-from bin.token_usage import empty_usage_state
-from bin.usage_report import (
+from services.preamble_attribution import CODEX_CLI_HARNESS, CODEX_DESKTOP_HARNESS
+from services.token_usage import empty_usage_state
+from services.usage_report import (
     PreambleBreakdown,
     collect_instruction_files,
     hygiene_warnings,
@@ -261,7 +261,7 @@ def test_attribution_json() -> None:
 
 
 def test_attribution_failure_shows_the_class_name(monkeypatch) -> None:
-    import bin.usage_report as usage_report
+    import services.usage_report as usage_report
 
     def broken(entries):
         raise RuntimeError("boom")
@@ -514,7 +514,7 @@ def test_sunset_verdict_empty_stats_without_started_at_and_denial_proration() ->
 
 
 def test_tariffs_compute_and_attribute_turn_cost_per_million_and_unpriced() -> None:
-    from bin.tariffs import TARIFF_EFFECTIVE_DATE, attribute_turn_cost, compute_turn_tariff_cost_usd
+    from services.tariffs import TARIFF_EFFECTIVE_DATE, attribute_turn_cost, compute_turn_tariff_cost_usd
 
     assert TARIFF_EFFECTIVE_DATE == "2026-11-01"
     cost = compute_turn_tariff_cost_usd(

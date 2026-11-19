@@ -532,7 +532,7 @@ console.log(JSON.stringify({
 }));
 """
     res = _run_node(script, str(EXT_DIR))
-    from bin.usage_report import denial_overhead, savings_share, sunset_verdict
+    from services.usage_report import denial_overhead, savings_share, sunset_verdict
 
     base_u = {
         "totals": {"claude|opus": {"input": 100000, "cache_read": 1000000, "cache_write": 0, "events": 100}},

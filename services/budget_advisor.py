@@ -1,22 +1,15 @@
-#!/usr/bin/env python3
 """Cross-harness preamble measurement, session summary, and conservative budget recommendations."""
 
 from __future__ import annotations
 
-import json
-import math
-import sys
 from datetime import date, timedelta
+import math
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-_PACKAGE_ROOT = Path(__file__).resolve().parent.parent
-if str(_PACKAGE_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PACKAGE_ROOT))
-
-from bin import mcp_inventory, preamble_attribution, token_usage, usage_report  # noqa: E402
-from bin.transcript_parsers import nonneg_int  # noqa: E402
-from hooks import state_store  # noqa: E402
+from core.platform_io import read_plugin_version
+from services import mcp_inventory, preamble_attribution, token_usage, usage_report
+from services.transcript_parsers import nonneg_int
 
 LARGE_INSTRUCTION_FILE_BYTES = 16_384
 
@@ -36,21 +29,11 @@ _MEMORY_CAVEAT = (
 
 
 def _normalize_harnesses(harnesses: Sequence[str] | None) -> list[str]:
-    return list(mcp_inventory.SUPPORTED_HARNESSES) if harnesses is None else [h for h in mcp_inventory.SUPPORTED_HARNESSES if h in harnesses]
-
-
-def _plugin_version() -> str:
-    for root in (state_store.resolve_plugin_root(), _PACKAGE_ROOT):
-        manifest = root / "plugin.json"
-        if not manifest.is_file():
-            continue
-        try:
-            data = json.loads(manifest.read_text(encoding="utf-8"))
-            if isinstance(data, Mapping) and isinstance(data.get("version"), str) and data["version"].strip():
-                return data["version"].strip()
-        except (OSError, ValueError, TypeError):
-            pass
-    return "0.0.0"
+    return (
+        list(mcp_inventory.SUPPORTED_HARNESSES)
+        if harnesses is None
+        else [h for h in mcp_inventory.SUPPORTED_HARNESSES if h in harnesses]
+    )
 
 
 def _read_bytes_and_text(path: Path) -> tuple[int, str] | None:
@@ -83,30 +66,23 @@ def _add_static_file(
     all_lines = text.splitlines()
     est_tokens = len("\n".join(all_lines[:token_line_limit]).encode("utf-8")) // 4 if token_line_limit is not None else nbytes // 4
     out.append({
-        "harness": harness, "component": component,
-        "path": mcp_inventory.format_display_path(path, home, workspace_root),
-        "bytes": nbytes, "bytes_evidence": "measured",
-        "estimated_tokens": est_tokens, "token_evidence": "estimated", "lines": len(all_lines),
+        "harness": harness, "component": component, "path": mcp_inventory.format_display_path(path, home, workspace_root),
+        "bytes": nbytes, "bytes_evidence": "measured", "estimated_tokens": est_tokens, "token_evidence": "estimated", "lines": len(all_lines),
     })
     return len(all_lines)
 
 
-def _add_skills_listing(
-    out: list[dict[str, Any]], skill_paths: Sequence[Path], harness: str, display_label: str
-) -> None:
+def _add_skills_listing(out: list[dict[str, Any]], skill_paths: Sequence[Path], harness: str, display_label: str) -> None:
     listings = [
         fm for path in skill_paths
-        if (loaded := _read_bytes_and_text(path)) is not None
-        and (fm := preamble_attribution.extract_skill_frontmatter_summary(loaded[1]))
+        if (loaded := _read_bytes_and_text(path)) is not None and (fm := preamble_attribution.extract_skill_frontmatter_summary(loaded[1]))
     ]
     if not listings:
         return
     listing_bytes = len("\n".join(listings).encode("utf-8"))
     out.append({
-        "harness": harness, "component": "skills_listing",
-        "path": f"{display_label} ({len(skill_paths)} skills)",
-        "bytes": listing_bytes, "bytes_evidence": "measured",
-        "estimated_tokens": listing_bytes // 4, "token_evidence": "estimated", "lines": None,
+        "harness": harness, "component": "skills_listing", "path": f"{display_label} ({len(skill_paths)} skills)",
+        "bytes": listing_bytes, "bytes_evidence": "measured", "estimated_tokens": listing_bytes // 4, "token_evidence": "estimated", "lines": None,
     })
 
 
@@ -116,10 +92,7 @@ def _collect_claude_files(home: Path, workspace_root: Path | None, out: list[dic
         _add_static_file(out, seen, path, "claude", "user_instructions", home, workspace_root)
     memory_lines: int | None = None
     if workspace_root is not None:
-        proj_roots = [
-            directory / name for directory in (workspace_root, *workspace_root.parents)
-            for name in ("CLAUDE.md", "CLAUDE.local.md", ".claude/CLAUDE.md")
-        ]
+        proj_roots = [directory / name for directory in (workspace_root, *workspace_root.parents) for name in ("CLAUDE.md", "CLAUDE.local.md", ".claude/CLAUDE.md")]
         for path in usage_report.collect_instruction_files(proj_roots, home):
             _add_static_file(out, seen, path, "claude", "workspace_instructions", home, workspace_root)
         lines_read = _add_static_file(
@@ -210,11 +183,9 @@ def _build_session_summaries(
     usage_state: Mapping[str, Any] | None, eff_harnesses: Sequence[str]
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, int]]]:
     state: Mapping[str, Any] = usage_state if isinstance(usage_state, Mapping) else {}
-    raw_pre = state.get("preamble")
+    raw_pre, raw_tot = state.get("preamble"), state.get("totals")
     preamble: Mapping[str, Any] = raw_pre if isinstance(raw_pre, Mapping) else {}
-    raw_tot = state.get("totals")
     totals: Mapping[str, Any] = raw_tot if isinstance(raw_tot, Mapping) else {}
-
     raw_int: dict[str, dict[str, int]] = {}
     ordered_rows: list[tuple[str, str]] = []
 
@@ -252,9 +223,8 @@ def _build_session_summaries(
         if stats["sessions"] > 0:
             cache_pct, cache_ev = (None, "unavailable") if row_name == "cursor" else _harness_cache_share(totals, row_name.split(" ", 1)[0])
             summaries[row_name] = {
-                "harness": row_name, "sessions": stats["sessions"],
-                "median": stats["median"], "recent_median": stats["recent_median"],
-                "p90": stats["p90"], "last": stats["last"],
+                "harness": row_name, "sessions": stats["sessions"], "median": stats["median"],
+                "recent_median": stats["recent_median"], "p90": stats["p90"], "last": stats["last"],
                 "evidence": active_ev, "cache_read_share_pct": cache_pct, "cache_evidence": cache_ev,
             }
         else:
@@ -267,21 +237,12 @@ def _build_session_summaries(
 
 
 def collect_preamble_budget(
-    home: Path,
-    workspace_root: Path | None = None,
-    usage_state: Mapping[str, Any] | None = None,
-    *,
-    harnesses: Sequence[str] | None = None,
+    home: Path, workspace_root: Path | None = None, usage_state: Mapping[str, Any] | None = None, *, harnesses: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Measure static instruction/rules/memory/skill files and summarize observed session preambles."""
-    eff_home = Path(home)
-    eff_ws = Path(workspace_root) if workspace_root is not None else None
-    eff_harnesses = _normalize_harnesses(harnesses)
-
+    eff_home, eff_ws, eff_harnesses = Path(home), (Path(workspace_root) if workspace_root is not None else None), _normalize_harnesses(harnesses)
     static_files: list[dict[str, Any]] = []
-    memory_lines: int | None = None
-    if "claude" in eff_harnesses:
-        memory_lines = _collect_claude_files(eff_home, eff_ws, static_files)
+    memory_lines: int | None = _collect_claude_files(eff_home, eff_ws, static_files) if "claude" in eff_harnesses else None
     if "antigravity" in eff_harnesses:
         _collect_antigravity_files(eff_home, eff_ws, static_files)
     if "codex" in eff_harnesses:
@@ -299,7 +260,6 @@ def collect_preamble_budget(
         }
 
     session_summaries, raw_int_summaries = _build_session_summaries(usage_state, eff_harnesses)
-
     dup_skills: list[dict[str, Any]] = []
     for name, paths in usage_report.find_duplicate_skills(eff_home):
         disp_paths = [mcp_inventory.format_display_path(p, eff_home, eff_ws) for p in paths]
@@ -314,10 +274,7 @@ def collect_preamble_budget(
         warnings.append(f"Duplicate skill `{dup['name']}` found {dup['count']} times ({', '.join(dup['paths'])}).")
     for rec in static_files:
         if rec["component"] in ("user_instructions", "workspace_instructions", "rules") and rec["bytes"] > LARGE_INSTRUCTION_FILE_BYTES:
-            warnings.append(
-                f"Large instruction file `{rec['path']}` ({rec['bytes']:,} B / ~{rec['estimated_tokens']:,} tokens) "
-                f"exceeds {LARGE_INSTRUCTION_FILE_BYTES:,} B."
-            )
+            warnings.append(f"Large instruction file `{rec['path']}` ({rec['bytes']:,} B / ~{rec['estimated_tokens']:,} tokens) exceeds {LARGE_INSTRUCTION_FILE_BYTES:,} B.")
 
     result: dict[str, Any] = {
         "harnesses_scanned": eff_harnesses, "static_files": static_files, "by_harness": by_harness,
@@ -366,9 +323,8 @@ def _collect_unused_recommendations(
 ) -> set[tuple[str, str]]:
     """Emit `unused_mcp_or_plugin_30d` only when 30-day component_use telemetry is actually present."""
     unused_pairs: set[tuple[str, str]] = set()
-    if not (_has_session_history(usage_state) and _has_component_use(usage_state)):
+    if not isinstance(usage_state, Mapping) or not (_has_session_history(usage_state) and _has_component_use(usage_state)):
         return unused_pairs
-    assert isinstance(usage_state, Mapping)
     since = str(usage_state.get("component_use_since") or "")
     window_start = (eff_today - timedelta(days=preamble_attribution.CANDIDATE_WINDOW_DAYS - 1)).isoformat()
     if not since or _parse_iso_day(since) is None or since > window_start:
@@ -402,8 +358,7 @@ def _collect_unused_recommendations(
         unused_pairs.add(("claude", nkey))
         sev = "high" if raw_toks >= 2_000 else ("medium" if raw_toks >= preamble_attribution.CANDIDATE_MIN_TOKENS else "low")
         items.append(_make_item(
-            f"unused_mcp_or_plugin_30d:claude:{nkey}", "unused_mcp_or_plugin_30d", sev, "claude",
-            str(srv.get("name") or nkey),
+            f"unused_mcp_or_plugin_30d:claude:{nkey}", "unused_mcp_or_plugin_30d", sev, "claude", str(srv.get("name") or nkey),
             f"Review disabling unused Claude MCP server `{srv.get('name')}` (~{raw_toks:,} schema tokens, 0 calls in last 30 days).",
             raw_toks, "estimated", _PREFIX_CACHE_CAVEAT,
         ))
@@ -420,16 +375,14 @@ def _collect_overlap_recommendations(mcp: Mapping[str, Any], items: list[dict[st
             continue
         kind, harness = str(ov.get("kind") or ""), str(ov.get("harness") or "")
         if kind == "duplicate_server_definition":
-            nkey = str(ov.get("normalized_key") or "")
-            sources = [str(s) for s in (ov.get("sources") or ())]
+            nkey, sources = str(ov.get("normalized_key") or ""), [str(s) for s in (ov.get("sources") or ())]
             known = [
                 int(t) for s in servers if s.get("harness") == harness and s.get("normalized_key") == nkey
                 and isinstance((t := s.get("estimated_tokens") if s.get("estimated_tokens") is not None else s.get("transcript_preamble_tokens")), int)
                 and not isinstance(t, bool)
             ]
             delta: int | None = (sum(known) - max(known)) if len(known) >= 2 else (known[0] if len(known) == 1 else None)
-            ev = "estimated" if delta is not None else "unavailable"
-            sev = "high" if (delta is not None and delta >= 2_000) else "medium"
+            ev, sev = ("estimated" if delta is not None else "unavailable"), ("high" if (delta is not None and delta >= 2_000) else "medium")
             items.append(_make_item(
                 f"duplicate_mcp_server:{harness}:{nkey}", "duplicate_mcp_server", sev, harness, nkey,
                 f"Consolidate duplicate `{nkey}` definitions in {harness} ({', '.join(sources)}) into a single scope.",
@@ -447,8 +400,7 @@ def _collect_overlap_recommendations(mcp: Mapping[str, Any], items: list[dict[st
 
     for (harness, sname), (cats, tools) in sorted(native_by_srv.items()):
         items.append(_make_item(
-            f"mcp_tool_overlap:native:{harness}:{sname}", "mcp_tool_overlap", "medium" if len(cats) >= 2 else "low",
-            harness, sname,
+            f"mcp_tool_overlap:native:{harness}:{sname}", "mcp_tool_overlap", "medium" if len(cats) >= 2 else "low", harness, sname,
             f"Server `{sname}` overlaps native {harness} tools ({', '.join(sorted(cats))}: {', '.join(sorted(tools))}); consider disabling redundant tools or the server.",
             None, "unavailable", _PREFIX_CACHE_CAVEAT,
         ))
@@ -543,9 +495,8 @@ def _build_session_profiles(mcp: Mapping[str, Any], unused_pairs: set[tuple[str,
         {
             "name": "minimal-core",
             "description": "Keep bundled Context-Guard spool and actively used MCP servers; review disabling unused or unverified servers between sessions.",
-            "keep_servers": keep_min, "disable_candidates": disable_min,
-            "estimated_tokens_delta": min_delta, "evidence": min_ev,
-            "auto_applied": False, "guaranteed_savings": False, "cache_caveat": _PREFIX_CACHE_CAVEAT,
+            "keep_servers": keep_min, "disable_candidates": disable_min, "estimated_tokens_delta": min_delta,
+            "evidence": min_ev, "auto_applied": False, "guaranteed_savings": False, "cache_caveat": _PREFIX_CACHE_CAVEAT,
         },
         {
             "name": "full-integrations",
@@ -558,11 +509,7 @@ def _build_session_profiles(mcp: Mapping[str, Any], unused_pairs: set[tuple[str,
 
 
 def build_budget_recommendations(
-    preamble: Mapping[str, Any],
-    mcp: Mapping[str, Any],
-    usage_state: Mapping[str, Any] | None = None,
-    *,
-    today: date | None = None,
+    preamble: Mapping[str, Any], mcp: Mapping[str, Any], usage_state: Mapping[str, Any] | None = None, *, today: date | None = None,
 ) -> dict[str, Any]:
     """Generate conservative, non-mutating recommendations and cautious session profiles."""
     eff_today = today if today is not None else (_parse_iso_day((usage_state or {}).get("updated_at")) or date.today())
@@ -577,35 +524,20 @@ def build_budget_recommendations(
         -(int(it["estimated_tokens_delta"]) if isinstance(it.get("estimated_tokens_delta"), int) else -1),
         str(it["kind"]), str(it["harness"]), str(it["target"]), str(it["id"]),
     ))
-    return {
-        "auto_applied": False, "guaranteed_savings": False,
-        "items": items, "session_profiles": _build_session_profiles(mcp, unused_pairs),
-    }
+    return {"auto_applied": False, "guaranteed_savings": False, "items": items, "session_profiles": _build_session_profiles(mcp, unused_pairs)}
 
 
 def run_budget_audit(
-    *,
-    home: Path | None = None,
-    workspace_root: Path | None = None,
-    usage_path: Path | None = None,
-    harnesses: Sequence[str] | None = None,
-    include_preamble: bool = True,
-    include_mcp: bool = True,
-    include_recommendations: bool = True,
-    probe: bool = False,
-    probe_servers: Sequence[str] | None = None,
+    *, home: Path | None = None, workspace_root: Path | None = None, usage_path: Path | None = None,
+    harnesses: Sequence[str] | None = None, include_preamble: bool = True, include_mcp: bool = True,
+    include_recommendations: bool = True, probe: bool = False, probe_servers: Sequence[str] | None = None,
     probe_timeout_s: float = mcp_inventory.DEFAULT_PROBE_TIMEOUT_S,
 ) -> dict[str, Any]:
     """Run a read-only cross-harness preamble, MCP inventory, and advisory budget audit."""
-    if probe and (
-        not math.isfinite(probe_timeout_s)
-        or not (mcp_inventory.MIN_PROBE_TIMEOUT_S <= probe_timeout_s <= mcp_inventory.MAX_PROBE_TIMEOUT_S)
-    ):
+    if probe and (not math.isfinite(probe_timeout_s) or not (mcp_inventory.MIN_PROBE_TIMEOUT_S <= probe_timeout_s <= mcp_inventory.MAX_PROBE_TIMEOUT_S)):
         raise ValueError(f"probe_timeout_s must be in [{mcp_inventory.MIN_PROBE_TIMEOUT_S}, {mcp_inventory.MAX_PROBE_TIMEOUT_S}]")
-    eff_home = Path(home) if home is not None else Path.home()
-    eff_ws = Path(workspace_root) if workspace_root is not None else None
-    eff_harnesses = _normalize_harnesses(harnesses)
-    roots = token_usage.transcript_roots_for_home(eff_home)
+    eff_home, eff_ws = Path(home) if home is not None else Path.home(), Path(workspace_root) if workspace_root is not None else None
+    eff_harnesses, roots = _normalize_harnesses(harnesses), token_usage.transcript_roots_for_home(eff_home)
 
     if usage_path is not None:
         u_state = token_usage.read_usage_snapshot(usage_path, roots=roots)
@@ -617,18 +549,14 @@ def run_budget_audit(
     eff_probe = bool(probe and (include_mcp or include_recommendations))
     preamble_data = collect_preamble_budget(eff_home, eff_ws, u_state, harnesses=eff_harnesses) if (include_preamble or include_recommendations) else None
     mcp_data = (
-        mcp_inventory.collect_mcp_inventory(
-            eff_home, eff_ws, u_state, harnesses=eff_harnesses,
-            probe=eff_probe, probe_servers=probe_servers, probe_timeout_s=probe_timeout_s,
-        )
-        if (include_mcp or include_recommendations) else None
+        mcp_inventory.collect_mcp_inventory(eff_home, eff_ws, u_state, harnesses=eff_harnesses, probe=eff_probe, probe_servers=probe_servers, probe_timeout_s=probe_timeout_s)
+        if (include_mcp or include_recommendations)
+        else None
     )
 
-    requested_sections = [
-        sec for sec, enabled in (("preamble", include_preamble), ("mcp", include_mcp), ("recommendations", include_recommendations)) if enabled
-    ]
+    requested_sections = [sec for sec, enabled in (("preamble", include_preamble), ("mcp", include_mcp), ("recommendations", include_recommendations)) if enabled]
     report: dict[str, Any] = {
-        "schema_version": 1, "plugin_version": _plugin_version(),
+        "schema_version": 1, "plugin_version": read_plugin_version(default="0.0.0"),
         "mode": "probe" if eff_probe else "passive", "read_only": True, "auto_mutated_configs": False,
         "probe_warning": mcp_inventory.PROBE_SIDE_EFFECT_WARNING if eff_probe else None,
         "harnesses_scanned": eff_harnesses, "requested_sections": requested_sections,

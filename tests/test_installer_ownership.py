@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from bin.install_harnesses import install_all, uninstall_all
+from services.installer_service import install_all, uninstall_all
 
 FOREIGN = "python3 /opt/other-tool/hooks/pre_tool_use.py --mode strict"
 SIBLING = "/usr/local/bin/audit-log.sh"
@@ -63,7 +63,7 @@ def test_workspace_session_start_and_stop_hooks_installed_idempotently_keeping_s
 ) -> None:
     import hashlib
     import os
-    from bin.install_harnesses import compute_codex_trusted_hash
+    from services.codex_toml import compute_codex_trusted_hash
     from hooks import config as guard_config
 
     ws = tmp_path / "workspace"
@@ -222,7 +222,7 @@ def test_workspace_session_start_and_stop_hooks_installed_idempotently_keeping_s
 def test_codex_toml_lexical_scanner_preserves_comments_strings_arrays_and_indented_tables(
     tmp_path: Path,
 ) -> None:
-    from bin.codex_toml import sync_codex_config_toml
+    from services.codex_toml import sync_codex_config_toml
 
     codex_hooks = tmp_path / "hooks.json"
     codex_config = tmp_path / "config.toml"
@@ -316,7 +316,7 @@ def test_codex_toml_lexical_scanner_preserves_comments_strings_arrays_and_indent
 
 
 def test_codex_toml_preserves_existing_user_compact_limit(tmp_path: Path) -> None:
-    from bin.codex_toml import sync_codex_config_toml
+    from services.codex_toml import sync_codex_config_toml
 
     codex_hooks = tmp_path / "hooks.json"
     codex_config = tmp_path / "config.toml"
@@ -407,9 +407,9 @@ def test_build_vscode_file_uri_location_hook_quoting_and_lazy_plugin_root(
     tmp_path: Path, monkeypatch
 ) -> None:
     from pathlib import PureWindowsPath
-    from bin import install_harnesses
+    from services import installer_service
 
-    win_loc = install_harnesses.build_vscode_file_uri_location(
+    win_loc = installer_service.build_vscode_file_uri_location(
         PureWindowsPath(r"C:\Users\Alice Smith\.cursor\extensions\advox.context-guard-statusbar-3.99.0")
     )
     assert win_loc == {
@@ -422,33 +422,33 @@ def test_build_vscode_file_uri_location_hook_quoting_and_lazy_plugin_root(
 
     space_dir = tmp_path / "dir with spaces" / "ext"
     space_dir.mkdir(parents=True)
-    posix_loc = install_harnesses.build_vscode_file_uri_location(space_dir)
+    posix_loc = installer_service.build_vscode_file_uri_location(space_dir)
     assert posix_loc["external"].startswith("file:///")
     assert "%20" in posix_loc["external"]
     assert posix_loc["path"].startswith("/")
     assert posix_loc["fsPath"] == str(space_dir.resolve())
 
     assert (
-        install_harnesses.format_hook_script_path(Path("/opt/my(proj)&1/hooks/pre_tool_use.py"))
+        installer_service.format_hook_script_path(Path("/opt/my(proj)&1/hooks/pre_tool_use.py"))
         == '"/opt/my(proj)&1/hooks/pre_tool_use.py"'
     )
     assert (
-        install_harnesses.format_hook_script_path(Path('/opt/my"proj/hooks/pre_tool_use.py'))
+        installer_service.format_hook_script_path(Path('/opt/my"proj/hooks/pre_tool_use.py'))
         == '"/opt/my\\"proj/hooks/pre_tool_use.py"'
     )
     assert (
-        install_harnesses.format_hook_script_path(Path("C:/Users/Alice/hooks/pre_tool_use.py"))
+        installer_service.format_hook_script_path(Path("C:/Users/Alice/hooks/pre_tool_use.py"))
         == "C:/Users/Alice/hooks/pre_tool_use.py"
     )
 
-    assert hasattr(install_harnesses, "DEFAULT_PLUGIN_ROOT")
+    assert hasattr(installer_service, "DEFAULT_PLUGIN_ROOT")
     lazy_root = tmp_path / "lazy-cg-root"
     (lazy_root / "hooks").mkdir(parents=True)
     (lazy_root / "bin").mkdir(parents=True)
     claude_cfg = tmp_path / "claude.json"
     claude_cfg.write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("CONTEXT_GUARD_HOME", str(lazy_root))
-    install_harnesses.install_all(
+    installer_service.install_all(
         claude_settings_path=claude_cfg,
         cursor_hooks_path=tmp_path / "missing_cursor.json",
         codex_hooks_path=tmp_path / "missing_codex.json",

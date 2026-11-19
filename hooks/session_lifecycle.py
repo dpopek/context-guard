@@ -1,4 +1,5 @@
 """Unified session lifecycle transitions for conversation rewind and context compaction."""
+
 from __future__ import annotations
 
 import os
@@ -10,10 +11,15 @@ PENDING_READ_TTL_SECONDS = 3600.0
 MAX_PENDING_READS_PER_FILE = 32
 COMPLETED_READ_IDS_MAX = 128
 
+_LEGACY_FALLBACK_KEYS: tuple[str, ...] = ("gitlab_fallback_allowed", "bq_raw_fallback_allowed")
+_TRANSIENT_POLICY_KEYS: tuple[str, ...] = (*_LEGACY_FALLBACK_KEYS, "policy_state")
+
+
 def _trim_fifo(mapping: dict[str, Any], limit: int) -> dict[str, Any]:
     while len(mapping) > limit:
         mapping.pop(next(iter(mapping)))
     return mapping
+
 
 def gc_pending_reads(raw_pending: Any, now_ts: float) -> dict[str, Any]:
     """Return bounded non-stale `pending_reads` mapping (TTL <= 1h, FIFO <= 32)."""
@@ -28,11 +34,13 @@ def gc_pending_reads(raw_pending: Any, now_ts: float) -> dict[str, Any]:
     }
     return _trim_fifo(kept, MAX_PENDING_READS_PER_FILE)
 
+
 def store_pending_read(entry: dict[str, Any], call_id: str, record: dict[str, Any], now_ts: float) -> None:
     """GC stale pending reads on `entry` and append `call_id -> record` bounded FIFO."""
     pending_map = gc_pending_reads(entry.get("pending_reads"), now_ts)
     pending_map[call_id] = record
     entry["pending_reads"] = _trim_fifo(pending_map, MAX_PENDING_READS_PER_FILE)
+
 
 def record_completed_read_id(entry: dict[str, Any], call_id: str, tier: int, credited: bool) -> None:
     """Record terminal `call_id` outcome in bounded (`<= 128` FIFO) `completed_read_ids` map."""
@@ -42,6 +50,7 @@ def record_completed_read_id(entry: dict[str, Any], call_id: str, tier: int, cre
     completed: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
     completed[call_id] = {"tier": tier, "credited": credited}
     entry["completed_read_ids"] = _trim_fifo(completed, COMPLETED_READ_IDS_MAX)
+
 
 def invalidate_mutated_paths(state: dict[str, Any], targets: Iterable[str]) -> bool:
     """Clear cached read intervals, pending reads, completed read IDs, and outline metadata on paths."""
@@ -61,11 +70,13 @@ def invalidate_mutated_paths(state: dict[str, Any], targets: Iterable[str]) -> b
             mutated = True
     return mutated
 
+
 def _int_or_zero(value: Any) -> int:
     try:
         return 0 if isinstance(value, bool) else int(value or 0)
     except (TypeError, ValueError):
         return 0
+
 
 def _pop_keys(mapping: dict[str, Any], keys: tuple[str, ...]) -> bool:
     mutated = False
@@ -73,6 +84,7 @@ def _pop_keys(mapping: dict[str, Any], keys: tuple[str, ...]) -> bool:
         if mapping.pop(key, None) is not None:
             mutated = True
     return mutated
+
 
 def prune_state_on_rewind(state: dict[str, Any], current_step: int, inclusive: bool = True) -> bool:
     """Prune cached file reads, outlines, and cursors rolled back by a rewind."""
@@ -97,7 +109,7 @@ def prune_state_on_rewind(state: dict[str, Any], current_step: int, inclusive: b
             state[step_key] = current_step
             mutated = True
     if current_step == 0:
-        if _pop_keys(state, ("gitlab_fallback_allowed", "bq_raw_fallback_allowed")):
+        if _pop_keys(state, _LEGACY_FALLBACK_KEYS):
             mutated = True
         if isinstance((files_map := state.get("files")), dict):
             for entry in files_map.values():
@@ -105,9 +117,10 @@ def prune_state_on_rewind(state: dict[str, Any], current_step: int, inclusive: b
                     mutated = True
     return _pop_keys(state, ("policy_state",)) or mutated
 
+
 def apply_compaction_boundary(state: dict[str, Any], checkpoint_step: int | None = None) -> None:
     """Reset or prune session ledger state across full PreCompact (`None`) or incremental checkpoint."""
-    _pop_keys(state, ("gitlab_fallback_allowed", "bq_raw_fallback_allowed", "policy_state"))
+    _pop_keys(state, _TRANSIENT_POLICY_KEYS)
     if checkpoint_step is None:
         state["files"] = {}
         state["last_compact_warn_step"] = 0

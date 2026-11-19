@@ -3,44 +3,45 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
-import hashlib, json, os, re, stat, time, urllib.parse, uuid
+import hashlib
+import json
+import os
 from pathlib import Path
+import re
+import stat
+import time
 from typing import Any, Iterator, Mapping, Sequence
-from hooks import state_store
+import urllib.parse
+import uuid
+
+from core.platform_io import (
+    LOCK_EX,
+    LOCK_UN,
+    atomic_write_bytes,
+    check_unsafe_link,
+    flock,
+    resolve_plugin_root,
+)
 from policies.api import ContextReceiptV1, RECEIPT_SCHEMA_VERSION, VALID_TURN_CORRELATIONS
 
 VALID_SPOOL_ISOLATIONS: tuple[str, ...] = ("workspace", "session", "global")
 DEFAULT_MAX_SPOOL_ENTRY_BYTES = 4 * 1024 * 1024
-RECEIPTS_FILENAME, RECEIPTS_LOCK_FILENAME, RECEIPTS_MAX_BYTES, RECEIPTS_KEEP_ROWS = "receipts.jsonl", "receipts.lock", 512 * 1024, 256
+RECEIPTS_FILENAME = "receipts.jsonl"
+RECEIPTS_LOCK_FILENAME = "receipts.lock"
+RECEIPTS_MAX_BYTES = 512 * 1024
+RECEIPTS_KEEP_ROWS = 256
 _O_FLAGS = getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
 _ROOT_MARKERS = (".git", ".hg", ".jj", ".context-guard-root")
 _UNRESOLVED_TMPL_RE = re.compile(r"\$\{[^}]+\}")
 _SPOOL_HEADER_RE = re.compile(r"\[CONTEXT-GUARD OUTPUT SPOOL:\s*(sp_[0-9a-f]{12})")
 
-def check_unsafe_link(path: Path) -> bool:
-    """Return True if `path` is a symlink, Windows reparse point, or cannot be safely statted."""
-    try:
-        st = os.lstat(str(path))
-        return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
-    except OSError as exc:
-        return not isinstance(exc, FileNotFoundError)
-
-def atomic_write_bytes(target: Path, data: bytes) -> None:
-    """Atomically write `data` to `target` with mode `0o600` using O_NOFOLLOW temp + os.replace."""
-    tmp = target.parent / f".{target.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
-    try:
-        with os.fdopen(os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_FLAGS, 0o600), "wb") as fh:
-            fh.write(data)
-        if os.name != "nt":
-            os.chmod(str(tmp), 0o600)
-        os.replace(str(tmp), str(target))
-    except OSError:
-        tmp.unlink(missing_ok=True)
-        raise
 
 def _home_norm() -> str:
-    try: return os.path.normcase(str(Path(h).resolve())) if os.path.isabs(h := str(Path.home())) else ""
-    except (RuntimeError, OSError): return ""
+    try:
+        home_str = str(Path.home())
+        return os.path.normcase(str(Path(home_str).resolve())) if os.path.isabs(home_str) else ""
+    except (RuntimeError, OSError):
+        return ""
 
 def read_spool_config(config_path: Path | None = None) -> tuple[str, int, str | None]:
     """Read `spool` config purely, returning `(isolation, max_spool_entry_bytes, error_or_None)`."""
@@ -49,7 +50,10 @@ def read_spool_config(config_path: Path | None = None) -> tuple[str, int, str | 
     elif (ov := str(os.environ.get("CONTEXT_GUARD_CONFIG_PATH") or "").strip()):
         eff = Path(ov).expanduser()
     else:
-        cands = [Path.home() / ".config"] + [Path(raw.strip()).expanduser() for var in (("XDG_CONFIG_HOME", "APPDATA", "LOCALAPPDATA") if os.name == "nt" else ("XDG_CONFIG_HOME",)) if (raw := os.environ.get(var) or "").strip()]
+        env_vars: tuple[str, ...] = ("XDG_CONFIG_HOME", "APPDATA", "LOCALAPPDATA") if os.name == "nt" else ("XDG_CONFIG_HOME",)
+        cands = [Path.home() / ".config"] + [
+            Path(raw.strip()).expanduser() for var in env_vars if (raw := os.environ.get(var) or "").strip()
+        ]
         eff = next((p / "context-guard" / "config.json" for p in cands if (p / "context-guard" / "config.json").exists()), cands[0] / "context-guard" / "config.json")
     if check_unsafe_link(eff) or not eff.is_file():
         return "workspace", DEFAULT_MAX_SPOOL_ENTRY_BYTES, None
@@ -189,7 +193,7 @@ def receipts_path_for(spool_dir: Path | None = None) -> Path:
         return spool_dir / RECEIPTS_FILENAME
     if (ov := str(os.environ.get("CONTEXT_GUARD_SPOOL_DIR") or "").strip()):
         return Path(ov).expanduser() / RECEIPTS_FILENAME
-    return state_store.resolve_plugin_root() / "telemetry" / "spool" / RECEIPTS_FILENAME
+    return resolve_plugin_root() / "telemetry" / "spool" / RECEIPTS_FILENAME
 
 def derive_spool_event_id(event_type: str, session_id: str, call_id: str, spool_id: str) -> str:
     """Derive deterministic `ev_<16hex>` ID when session_id and call_id are non-empty, else random."""
@@ -296,11 +300,11 @@ def _receipts_lock(parent_dir: Path) -> Iterator[None]:
     with os.fdopen(os.open(str(lp), os.O_RDWR | os.O_CREAT | _O_FLAGS, 0o600), "a+", encoding="utf-8") as fh:
         if os.name != "nt":
             os.chmod(str(lp), 0o600)
-        state_store.fcntl.flock(fh.fileno(), state_store.fcntl.LOCK_EX)
+        flock(fh.fileno(), LOCK_EX)
         try:
             yield
         finally:
-            state_store.fcntl.flock(fh.fileno(), state_store.fcntl.LOCK_UN)
+            flock(fh.fileno(), LOCK_UN)
 
 def _normalize_receipt_row(r: Mapping[str, Any]) -> ContextReceiptV1 | None:
     sv = r.get("schema_version")
@@ -377,27 +381,39 @@ def normalize_receipt_row(row: Mapping[str, Any]) -> ContextReceiptV1 | None:
     return _normalize_receipt_row(row)
 
 
+def _parse_receipt_bytes(raw_bytes: bytes) -> list[ContextReceiptV1]:
+    try:
+        raw_text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return []
+    rows: list[ContextReceiptV1] = []
+    for line in raw_text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(parsed, dict) and (row := _normalize_receipt_row(parsed)) is not None:
+            rows.append(row)
+    return rows
+
+
 def _read_receipt_rows(eff_path: Path) -> list[ContextReceiptV1]:
     if check_unsafe_link(eff_path.parent) or check_unsafe_link(eff_path) or not eff_path.is_file():
         return []
     try:
         with os.fdopen(os.open(str(eff_path), os.O_RDONLY | _O_FLAGS), "rb") as fh:
-            raw_text = fh.read().decode("utf-8") if stat.S_ISREG(os.fstat(fh.fileno()).st_mode) else ""
-    except (OSError, UnicodeDecodeError):
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                return []
+            raw_bytes = fh.read()
+    except OSError:
         return []
-    rows: list[ContextReceiptV1] = []
-    for line in raw_text.splitlines():
-        try:
-            r = json.loads(line) if line.strip() else None
-            if isinstance(r, dict) and (row := _normalize_receipt_row(r)) is not None:
-                rows.append(row)
-        except (ValueError, TypeError):
-            continue
-    return rows
+    return _parse_receipt_bytes(raw_bytes)
 
 
 def append_receipt(receipt: Mapping[str, Any], receipts_path: Path | None = None) -> bool:
-    """Append one `ContextReceiptV1` row under `receipts.lock` with atomic 512 KiB rotation."""
+    """Append one `ContextReceiptV1` row under `receipts.lock` with single-pass 512 KiB rotation."""
     eff = receipts_path or receipts_path_for()
     if check_unsafe_link(eff.parent) or check_unsafe_link(eff):
         return False
@@ -405,30 +421,55 @@ def append_receipt(receipt: Mapping[str, Any], receipts_path: Path | None = None
         eff.parent.mkdir(parents=True, exist_ok=True)
         if os.name != "nt":
             os.chmod(str(eff.parent), 0o700)
-        line_bytes = (json.dumps(dict(receipt), separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
-        raw_eid = receipt.get("event_id")
+        receipt_dict = dict(receipt)
+        line_bytes = (json.dumps(receipt_dict, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
+        raw_eid = receipt_dict.get("event_id")
         eid = raw_eid if isinstance(raw_eid, str) and raw_eid.strip() else ""
         with _receipts_lock(eff.parent):
             if check_unsafe_link(eff):
                 return False
-            if eid and any(row["event_id"] == eid for row in _read_receipt_rows(eff)):
+            existing_rows: list[ContextReceiptV1] = []
+            have_parsed = False
+            try:
+                rfd = os.open(str(eff), os.O_RDONLY | _O_FLAGS)
+            except FileNotFoundError:
+                rfd = -1
+            if rfd >= 0:
+                with os.fdopen(rfd, "rb") as rfh:
+                    st = os.fstat(rfh.fileno())
+                    if not stat.S_ISREG(st.st_mode):
+                        return False
+                    will_rotate = (st.st_size + len(line_bytes)) > RECEIPTS_MAX_BYTES
+                    if eid or will_rotate:
+                        existing_rows = _parse_receipt_bytes(rfh.read())
+                        have_parsed = True
+            else:
+                will_rotate = len(line_bytes) > RECEIPTS_MAX_BYTES
+
+            if eid and have_parsed and any(row["event_id"] == eid for row in existing_rows):
                 return True
-            with os.fdopen(os.open(str(eff), os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_FLAGS, 0o600), "ab") as fh:
+
+            if will_rotate:
+                new_row = _normalize_receipt_row(receipt_dict)
+                if new_row is not None:
+                    existing_rows.append(new_row)
+                rotated = "".join(
+                    json.dumps(dict(r), separators=(",", ":"), sort_keys=True) + "\n"
+                    for r in existing_rows[-RECEIPTS_KEEP_ROWS:]
+                ).encode("utf-8")
+                atomic_write_bytes(eff, rotated)
+                return True
+
+            with os.fdopen(
+                os.open(str(eff), os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_FLAGS, 0o600),
+                "ab",
+            ) as fh:
                 if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
                     return False
                 if os.name != "nt":
                     os.chmod(str(eff), 0o600)
                 fh.write(line_bytes)
                 fh.flush()
-                cur_size = os.fstat(fh.fileno()).st_size
-            if cur_size > RECEIPTS_MAX_BYTES:
-                atomic_write_bytes(
-                    eff,
-                    "".join(
-                        json.dumps(dict(r), separators=(",", ":"), sort_keys=True) + "\n"
-                        for r in _read_receipt_rows(eff)[-RECEIPTS_KEEP_ROWS:]
-                    ).encode("utf-8"),
-                )
         return True
     except (OSError, ValueError, TypeError):
         return False
@@ -440,7 +481,15 @@ def load_receipt_rows(receipts_path: Path | None = None) -> list[ContextReceiptV
 
 def find_created_receipt(spool_id: str, *, session_id: str | None = None, call_id: str | None = None, receipts_path: Path | None = None) -> ContextReceiptV1 | None:
     """Return the latest matching `spool_created` receipt without mutating state."""
-    return next((r for r in reversed(_read_receipt_rows(receipts_path or receipts_path_for())) if r["event_type"] == "spool_created" and r["spool_id"] == spool_id and (session_id is None or r["session_id"] == session_id) and (call_id is None or r["call_id"] == call_id)), None)
+    for row in reversed(_read_receipt_rows(receipts_path or receipts_path_for())):
+        if (
+            row["event_type"] == "spool_created"
+            and row["spool_id"] == spool_id
+            and (session_id is None or row["session_id"] == session_id)
+            and (call_id is None or row["call_id"] == call_id)
+        ):
+            return row
+    return None
 
 def summarize_receipts(receipts_path: Path | None = None, *, window_seconds: float | None = None, now_ts: float | None = None) -> dict[str, Any]:
     """Summarize `receipts.jsonl` counts and timestamps purely read-only."""
@@ -598,6 +647,18 @@ def summarize_spool_lifecycle(
     )
     return {**agg, "by_spool": by_spool}
 
+def _extract_batch_response_text(resp: Any) -> str:
+    if isinstance(resp, str):
+        return resp
+    if isinstance(resp, Mapping):
+        return "\n".join(
+            str(resp[k]) for k in ("output", "stdout", "text", "content") if isinstance(resp.get(k), str)
+        )
+    if isinstance(resp, list):
+        return "\n".join(b["text"] for b in resp if isinstance(b, Mapping) and isinstance(b.get("text"), str))
+    return ""
+
+
 def persist_spool_delivery_verification(
     payload: Mapping[str, Any], *, harness: str, session_id: str,
     workspace_root: str | Path | None = None, workspace_roots: Sequence[str] | None = None,
@@ -622,16 +683,43 @@ def persist_spool_delivery_verification(
     for item in tool_calls:
         if not isinstance(item, Mapping) or item.get("is_error"):
             continue
-        resp = item.get("tool_response")
-        text = resp if isinstance(resp, str) else ("\n".join(str(resp[k]) for k in ("output", "stdout", "text", "content") if isinstance(resp.get(k), str)) if isinstance(resp, Mapping) else ("\n".join(b["text"] for b in resp if isinstance(b, Mapping) and isinstance(b.get("text"), str)) if isinstance(resp, list) else ""))
+        text = _extract_batch_response_text(item.get("tool_response"))
         cid = str(item.get("tool_use_id") or item.get("call_id") or item.get("tool_call_id") or item.get("callId") or "")
         for m in _SPOOL_HEADER_RE.finditer(text):
             sid = m.group(1)
-            created = next((c for c in reversed(created_by_sid.get(sid) or ()) if (not cid or not c["call_id"] or c["call_id"] == cid)), None)
+            created = next(
+                (c for c in reversed(created_by_sid.get(sid) or ()) if (not cid or not c["call_id"] or c["call_id"] == cid)),
+                None,
+            )
             if created is None or (iso_mode == "session" and created["session_id"] != session_id):
                 continue
-            if (has_ws and (iso_mode == "workspace" or created["workspace_id"]) and created["workspace_id"] != caller_ws_id) or (not has_ws and (not session_id or created["session_id"] != session_id or (created["call_id"] and cid != created["call_id"]))):
+            ws_mismatch = has_ws and (iso_mode == "workspace" or created["workspace_id"]) and created["workspace_id"] != caller_ws_id
+            no_ws_mismatch = not has_ws and (
+                not session_id
+                or created["session_id"] != session_id
+                or (created["call_id"] and cid != created["call_id"])
+            )
+            if ws_mismatch or no_ws_mismatch:
                 continue
-            if (key := (created["receipt_id"], sid)) not in verified and append_receipt(build_receipt(event_type="spool_delivery_verified", harness=harness, session_id=session_id or created["session_id"], workspace_id=created["workspace_id"] or caller_ws_id, turn_key=turn_key or created["turn_key"], call_id=cid or created["call_id"], spool_id=sid, line_span=created["line_span"], byte_span=created["byte_span"], upstream_truncation=bool(item.get("truncated") or item.get("is_truncated")), delivery_evidence="delivery_verified", spool_id_referenced=False, parent_event_id=created["receipt_id"]), receipts_path=eff_path):
-                verified.add(key); emitted += 1
+            key = (created["receipt_id"], sid)
+            if key in verified:
+                continue
+            rcpt = build_receipt(
+                event_type="spool_delivery_verified",
+                harness=harness,
+                session_id=session_id or created["session_id"],
+                workspace_id=created["workspace_id"] or caller_ws_id,
+                turn_key=turn_key or created["turn_key"],
+                call_id=cid or created["call_id"],
+                spool_id=sid,
+                line_span=created["line_span"],
+                byte_span=created["byte_span"],
+                upstream_truncation=bool(item.get("truncated") or item.get("is_truncated")),
+                delivery_evidence="delivery_verified",
+                spool_id_referenced=False,
+                parent_event_id=created["receipt_id"],
+            )
+            if append_receipt(rcpt, receipts_path=eff_path):
+                verified.add(key)
+                emitted += 1
     return emitted

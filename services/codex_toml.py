@@ -19,7 +19,10 @@ def compute_codex_trusted_hash(
     event_name: str, matcher: str | None, command: str, timeout: int = 600, is_async: bool = False
 ) -> str:
     """Return `sha256:<hex>` matching `codex-rs/config/src/fingerprint.rs` canonical JSON identity."""
-    obj: dict[str, Any] = {"event_name": event_name, "hooks": [{"async": bool(is_async), "command": command, "timeout": int(timeout), "type": "command"}]}
+    obj: dict[str, Any] = {
+        "event_name": event_name,
+        "hooks": [{"async": bool(is_async), "command": command, "timeout": int(timeout), "type": "command"}],
+    }
     if matcher is not None:
         obj["matcher"] = matcher
     return "sha256:" + hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
@@ -66,7 +69,9 @@ def _scan_toml_lines(lines: list[str]) -> list[tuple[bool, bool, bool, bool, boo
         seen_table = seen_table or is_header
         is_compact = starts_top and not seen_table and bool(_COMPACT_KEY_RE.match(line))
         is_managed = multiline is None and line.rstrip("\r\n").endswith("# context-guard:managed")
-        meta.append((is_header, multiline is None and stripped.startswith("#"), multiline is None and stripped == "", is_compact, is_managed))
+        meta.append(
+            (is_header, multiline is None and stripped.startswith("#"), multiline is None and stripped == "", is_compact, is_managed)
+        )
         multiline, bracket_depth = _advance_toml_state(line, multiline, bracket_depth)
     return meta
 
@@ -104,15 +109,24 @@ def _build_hooks_state_blocks(hooks_data: dict[str, Any], esc_hooks: str) -> lis
                 cmd = str(h_obj.get("command") or "") if isinstance(h_obj, dict) else ""
                 if cmd:
                     thash = compute_codex_trusted_hash(
-                        snake_evt, matcher, cmd, timeout=int(h_obj.get("timeout") or 600), is_async=bool(h_obj.get("async") or False)
+                        snake_evt,
+                        matcher,
+                        cmd,
+                        timeout=int(h_obj.get("timeout") or 600),
+                        is_async=bool(h_obj.get("async") or False),
                     )
                     blocks.append(f'[hooks.state."{esc_hooks}:{snake_evt}:{g_idx}:{h_idx}"]\ntrusted_hash = "{thash}"\n')
     return blocks
 
 
 def sync_codex_config_toml(
-    codex_hooks_path: Path, codex_config_path: Path, hooks_data: dict[str, Any],
-    ensure_compact_limit: bool, dry_run: bool = False, *, atomic_writer: Callable[[Path, str], None] | None = None,
+    codex_hooks_path: Path,
+    codex_config_path: Path,
+    hooks_data: dict[str, Any],
+    ensure_compact_limit: bool,
+    dry_run: bool = False,
+    *,
+    atomic_writer: Callable[[Path, str], None] | None = None,
 ) -> str:
     """Non-destructively sync Context-Guard `[hooks.state]` blocks and compact token limit in Codex `config.toml`."""
     if not codex_config_path.exists():
@@ -152,13 +166,22 @@ def sync_codex_config_toml(
         (atomic_writer or _default_atomic_write)(codex_config_path, final_toml)
     return "updated"
 
+
 _TOML_BAD, _TOML_BARE_RE, _TOML_VAL_RE = object(), re.compile(r"[A-Za-z0-9_-]+"), re.compile(r"[^ \t\n#,\]}]+")
 _TOML_WS = (re.compile(r"(?:[ \t]+|#[^\n]*)*"), re.compile(r"(?:[ \t\n]+|#[^\n]*)*"))
 _TOML_ESC_RE = re.compile(r"\\([ \t]*\n[ \t\n]*|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|.)", re.DOTALL)
 _TOML_ESC = {"b": "\b", "t": "\t", "n": "\n", "f": "\f", "r": "\r", '"': '"', "\\": "\\"}
-_TOML_STRS = (('"""', re.compile(r'"""\n?((?:\\.|[^\\])*?)"""("{0,2})', re.DOTALL), False, True), ("'''", re.compile(r"'''\n?(.*?)'''('{0,2})", re.DOTALL), True, True), ('"', re.compile(r'"((?:\\[^\n]|[^"\\\n])*)"'), False, False), ("'", re.compile(r"'([^'\n]*)'"), True, False))
+_TOML_STRS = (
+    ('"""', re.compile(r'"""\n?((?:\\.|[^\\])*?)"""("{0,2})', re.DOTALL), False, True),
+    ("'''", re.compile(r"'''\n?(.*?)'''('{0,2})", re.DOTALL), True, True),
+    ('"', re.compile(r'"((?:\\[^\n]|[^"\\\n])*)"'), False, False),
+    ("'", re.compile(r"'([^'\n]*)'"), True, False),
+)
+
+
 def _toml_ws(src: str, pos: int, nl: bool = False) -> int:
     return m.end() if (m := _TOML_WS[1 if nl else 0].match(src, pos)) else pos
+
 
 def _unescape_basic(raw: str, ml: bool) -> str | None:
     def _sub(m: re.Match[str]) -> str:
@@ -170,10 +193,12 @@ def _unescape_basic(raw: str, ml: bool) -> str | None:
         if len(t) > 1 and t[0] in ("u", "U") and 0 <= (cp := int(t[1:], 16)) <= 0x10FFFF and not (0xD800 <= cp <= 0xDFFF):
             return chr(cp)
         raise ValueError(t)
+
     try:
         return _TOML_ESC_RE.sub(_sub, raw)
     except ValueError:
         return None
+
 
 def _read_toml_str(src: str, pos: int) -> tuple[str | None, int]:
     for prefix, rx, is_lit, ml in _TOML_STRS:
@@ -183,6 +208,7 @@ def _read_toml_str(src: str, pos: int) -> tuple[str | None, int]:
                 return (raw if is_lit else _unescape_basic(raw, ml)), m.end()
             return None, (len(src) if ml or (nl := src.find("\n", pos)) == -1 else nl)
     return None, pos
+
 
 def _read_key_path(src: str, pos: int) -> tuple[list[str] | None, int]:
     segs: list[str] = []
@@ -200,6 +226,7 @@ def _read_key_path(src: str, pos: int) -> tuple[list[str] | None, int]:
             return segs, nxt
         pos = _toml_ws(src, nxt + 1)
     return segs or None, pos
+
 
 def _read_toml_val(src: str, pos: int) -> tuple[Any, int]:
     if pos >= (n := len(src)):
@@ -234,6 +261,7 @@ def _read_toml_val(src: str, pos: int) -> tuple[Any, int]:
     tok, end = (m.group(0), m.end()) if m else ("", pos)
     return (True, end) if tok == "true" else ((False, end) if tok == "false" else (_TOML_BAD, end))
 
+
 def parse_codex_mcp_servers(toml_text: str) -> list[dict[str, Any]]:
     """Lexically parse `[mcp_servers.<name>]` and `[mcp_servers.<name>.env]` TOML tables without tomllib."""
     src = toml_text.replace("\r\n", "\n").replace("\r", "\n")
@@ -246,7 +274,10 @@ def parse_codex_mcp_servers(toml_text: str) -> list[dict[str, Any]]:
                 kp, nxt = _read_key_path(src, _toml_ws(src, pos + 1))
                 if kp and (nxt := _toml_ws(src, nxt)) < n and src[nxt] == "]" and ((tail := _toml_ws(src, nxt + 1)) >= n or src[tail] == "\n"):
                     if kp[0] == "mcp_servers" and (len(kp) == 2 or (len(kp) == 3 and kp[2] == "env")):
-                        servers.setdefault(kp[1], {"name": kp[1], "command": None, "args": [], "url": None, "cwd": None, "enabled": True, "env": {}})
+                        servers.setdefault(
+                            kp[1],
+                            {"name": kp[1], "command": None, "args": [], "url": None, "cwd": None, "enabled": True, "env": {}},
+                        )
                         section = ("server" if len(kp) == 2 else "env", kp[1])
         else:
             kp, nxt = _read_key_path(src, pos)
@@ -255,10 +286,16 @@ def parse_codex_mcp_servers(toml_text: str) -> list[dict[str, Any]]:
                 tail = _toml_ws(src, vend)
                 if (ok := tail >= n or src[tail] == "\n") and section is not None and val is not _TOML_BAD:
                     ent = servers[section[1]]
-                    if (section[0] == "env" and len(kp) == 1 and isinstance(val, str)) or (section[0] == "server" and len(kp) == 2 and kp[0] == "env" and isinstance(val, str)):
+                    if (section[0] == "env" and len(kp) == 1 and isinstance(val, str)) or (
+                        section[0] == "server" and len(kp) == 2 and kp[0] == "env" and isinstance(val, str)
+                    ):
                         ent["env"][kp[-1]] = val
                     elif section[0] == "server" and len(kp) == 1:
-                        if (kp[0] in ("command", "url", "cwd") and isinstance(val, str)) or (kp[0] == "args" and isinstance(val, list)) or (kp[0] == "enabled" and isinstance(val, bool)):
+                        if (
+                            (kp[0] in ("command", "url", "cwd") and isinstance(val, str))
+                            or (kp[0] == "args" and isinstance(val, list))
+                            or (kp[0] == "enabled" and isinstance(val, bool))
+                        ):
                             ent[kp[0]] = val
                         elif kp[0] == "env" and isinstance(val, dict):
                             ent["env"].update(val)

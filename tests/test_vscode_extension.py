@@ -7,7 +7,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from bin import install_harnesses
+from services import codex_toml, harness_status, installer_service
 
 ROOT = Path(__file__).resolve().parent.parent
 EXT_DIR = ROOT / "vscode-extension"
@@ -16,8 +16,14 @@ EXT_DIR = ROOT / "vscode-extension"
 def test_view_model_normalization_semver_escaping_and_csp(tmp_path: Path) -> None:
     view_model_path = EXT_DIR / "view_model.js"
     assert view_model_path.is_file(), "vscode-extension/view_model.js must exist"
+    vm_src = view_model_path.read_text(encoding="utf-8")
+    assert "BigQuery" not in vm_src
+    assert "Local-Repo" not in vm_src
+    assert "Policy Pack Security Guards" in vm_src
+    assert "Policy Pack Security Guard" in vm_src
 
     script = r"""
+const fs = require("fs");
 const path = require("path");
 const Module = require("module");
 const origLoad = Module._load;
@@ -39,11 +45,16 @@ Module._load = function(request, parent, isMain) {
   return origLoad.apply(this, arguments);
 };
 
+const vscode = require("vscode");
 const vm = require(path.resolve(process.argv[1], "view_model.js"));
+const renderers = require(path.resolve(process.argv[1], "renderers.js"));
+const updater = require(path.resolve(process.argv[1], "updater.js"));
 const ext = require(path.resolve(process.argv[1], "extension.js"));
+const extVer = JSON.parse(fs.readFileSync(path.resolve(process.argv[1], "package.json"), "utf8")).version;
 
 const layerKeys = vm.PROTECTION_LAYERS.map((l) => l.key);
 const retryKeys = vm.PROTECTION_LAYERS.filter((l) => l.retryKey).map((l) => l.retryKey);
+const mcpLayer = vm.PROTECTION_LAYERS.find((l) => l.key === "mcp_guards");
 const norm = vm.normalizeStats({
   saved_tokens: 800,
   baseline_tokens: 1000,
@@ -52,17 +63,10 @@ const norm = vm.normalizeStats({
   installed_at: "2026-11-08T10:00:00Z",
   updated_at: "2026-11-08T11:00:00Z",
   events: {
-    outlines: 10,
-    wide_followup_blocks: 4,
-    wide_followup_retries: 1,
-    multi_file_blocks: 3,
-    multi_file_retries: 2,
-    rereads_blocked: 5,
-    ranges_trimmed: 6,
-    cli_rewrites: 7,
-    mcp_guards: 8,
-    allowed_reads: 20,
-    credit_reversals: 2,
+    outlines: 10, wide_followup_blocks: 4, wide_followup_retries: 1,
+    multi_file_blocks: 3, multi_file_retries: 2, rereads_blocked: 5,
+    ranges_trimmed: 6, cli_rewrites: 7, outputs_spooled: 9,
+    mcp_guards: 8, allowed_reads: 20, credit_reversals: 2, reliability_failures: 3,
   },
   by_harness: {
     antigravity: { hits: -3, baseline_tokens: 1000, saved_tokens: -50 },
@@ -74,6 +78,8 @@ const norm = vm.normalizeStats({
     saved_tokens: 300,
   },
 });
+const emptyNorm = vm.normalizeStats({});
+const badRelNorm = vm.normalizeStats({ events: { outputs_spooled: -4, reliability_failures: "bad" } });
 
 const rawStats = {
   saved_tokens: 800,
@@ -94,21 +100,23 @@ const rawStats = {
   },
 };
 
-const sidebarHtml = ext.renderSidebarHtml(rawStats);
-const webviewHtml = ext.renderWebviewHtml(rawStats);
-const tooltipHtml = ext.buildTooltipMarkdown(rawStats).value;
+const sidebarHtml = renderers.renderSidebarHtml(extVer, rawStats);
+const webviewHtml = renderers.renderWebviewHtml(extVer, rawStats);
+const tooltipHtml = renderers.buildTooltipMarkdown(vscode.MarkdownString, extVer, rawStats).value;
 const v4Stats = {
   saved_tokens: 400,
   baseline_tokens: 1000,
   reduction_pct: 40.0,
-  events: { outlines: 5, ranges_trimmed: 12, cli_rewrites: 8, outline_pulls: 15, mcp_guards: 2, allowed_reads: 40 },
+  events: { outlines: 5, ranges_trimmed: 12, cli_rewrites: 8, outline_pulls: 15, outputs_spooled: 9, mcp_guards: 2, allowed_reads: 40 },
 };
-const v4Sidebar = ext.renderSidebarHtml(v4Stats);
-const v4Webview = ext.renderWebviewHtml(v4Stats);
-const v4Tooltip = ext.buildTooltipMarkdown(v4Stats).value;
-const pulseWide = ext.formatStatusBarPulseText(rawStats, 300, "wide_followup_blocks");
-const pulseBatch = ext.formatStatusBarPulseText(rawStats, 300, "multi_file_blocks");
-const pulseRev = ext.formatStatusBarPulseText(rawStats, 300, "credit_reversals");
+const v4Sidebar = renderers.renderSidebarHtml(extVer, v4Stats);
+const v4Webview = renderers.renderWebviewHtml(extVer, v4Stats);
+const v4Tooltip = renderers.buildTooltipMarkdown(vscode.MarkdownString, extVer, v4Stats).value;
+const pulseWide = vm.formatStatusBarPulseText(rawStats, 300, "wide_followup_blocks");
+const pulseBatch = vm.formatStatusBarPulseText(rawStats, 300, "multi_file_blocks");
+const pulseRev = vm.formatStatusBarPulseText(rawStats, 300, "credit_reversals");
+const pulseSpool = vm.formatStatusBarPulseText(rawStats, 300, "outputs_spooled");
+const pulseRel = vm.formatStatusBarPulseText(rawStats, 0, "reliability_failures");
 
 const badUpdate1 = { state: "update_available", local: "3.5.0", latest: "3.99.0:refs/heads/main" };
 const badUpdate2 = { state: "update_available", local: "3.5.0` [pwn](command:contextGuard.update) `", latest: "3.99.0" };
@@ -118,6 +126,9 @@ const goodUpdate = { state: "update_available", local: "3.5.0", latest: "3.99.0"
 console.log(JSON.stringify({
   layerKeys,
   retryKeys,
+  mcpLabels: mcpLayer ? [mcpLayer.fullLabel, mcpLayer.eventLabel] : [],
+  normEvents: { sp: norm.events.outputs_spooled, rel: norm.events.reliability_failures },
+  zeroEvents: { eSp: emptyNorm.events.outputs_spooled, eRel: emptyNorm.events.reliability_failures, bSp: badRelNorm.events.outputs_spooled, bRel: badRelNorm.events.reliability_failures },
   actualTokens: norm.actualTokens,
   reductionPct: norm.reductionPct,
   agHarness: norm.harnesses.antigravity,
@@ -133,20 +144,30 @@ console.log(JSON.stringify({
   webviewHasWide: webviewHtml.includes("wide_followup_blocks") && webviewHtml.includes("multi_file_blocks") && webviewHtml.includes("credit_reversals"),
   tooltipHasOutlinePulls: tooltipHtml.includes("Voluntary Outlines (cg-outline)"),
   tooltipHasLegacyLastHit: tooltipHtml.includes("Wide Follow-Up Read Blocked"),
+  hasReliabilityRows: sidebarHtml.includes("Reliability Failures") && webviewHtml.includes("reliability_failures") && tooltipHtml.includes("Reliability Failures"),
   v4HasOutlinePulls: v4Sidebar.includes("Voluntary Outlines (cg-outline)") && v4Webview.includes("Voluntary Outlines (cg-outline)") && v4Tooltip.includes("Voluntary Outlines (cg-outline)"),
+  v4HasSpool: v4Sidebar.includes("Spool Output Offloads") && v4Webview.includes("Spool Output Offloads") && v4Tooltip.includes("Spool Output Offloads"),
+  v4NoReliabilityWhenZero: !/Reliability Failure/.test(v4Sidebar + v4Webview + v4Tooltip),
   v4HidesLegacy: !/Wide Follow-Up|Multi-File Batch|Duplicate Re-Reads|Credits Taken Back/.test(v4Sidebar + v4Webview + v4Tooltip),
-  pulseWide,
-  pulseBatch,
-  pulseRev,
+  pulseWide, pulseBatch, pulseRev, pulseSpool, pulseRel,
+  spoolLabels: [vm.EVENT_SHORT_LABELS.outputs_spooled, vm.EVENT_FULL_LABELS.outputs_spooled],
+  relLabels: [vm.EVENT_SHORT_LABELS.reliability_failures, vm.EVENT_FULL_LABELS.reliability_failures],
+  extRuntimeExports: ["activate", "deactivate", "updateStatusBar"].every((k) => typeof ext[k] === "function"),
+  extTrimmedUndefined: [
+    "formatCompactTokens", "formatBlockGauge", "escapeHtml", "escapeMarkdownCodeSpan",
+    "isValidSemver", "normalizeStats", "HARNESS_ORDER", "PROTECTION_LAYERS",
+    "WEBVIEW_CSP_META", "probeDoctor", "summarizeV4Insights", "resolvePluginRoot",
+    "pythonCandidates", "buildTooltipMarkdown", "renderWebviewHtml",
+  ].every((k) => ext[k] === undefined),
   semverGood: vm.isValidSemver("3.99.0") && vm.isValidSemver("9.99.0-rc.1"),
   semverBad: !vm.isValidSemver("3.99.0:refs/heads/main") && !vm.isValidSemver("../evil") && !vm.isValidSemver("v3.99.0"),
-  badSteps: ext.updateSteps("update_available", "/tmp/cg", "3.99.0:refs/heads/main"),
-  badBadge1: ext.updateBadge(badUpdate1),
-  badBadge2: ext.updateBadge(badUpdate2),
-  badNotice1: ext.updateNotice(badUpdate1),
-  badNoticeInstall: ext.updateNotice(badInstall),
-  goodStepsLen: ext.updateSteps("update_available", "/tmp/cg", "3.99.0").length,
-  goodBadge: ext.updateBadge(goodUpdate),
+  badSteps: updater.updateSteps("update_available", "/tmp/cg", "3.99.0:refs/heads/main"),
+  badBadge1: updater.updateBadge(badUpdate1),
+  badBadge2: updater.updateBadge(badUpdate2),
+  badNotice1: updater.updateNotice(badUpdate1),
+  badNoticeInstall: updater.updateNotice(badInstall),
+  goodStepsLen: updater.updateSteps("update_available", "/tmp/cg", "3.99.0").length,
+  goodBadge: updater.updateBadge(goodUpdate),
   escapedCodeSpan: vm.escapeMarkdownCodeSpan("a`b\nc\rd<e>"),
 }));
 """
@@ -158,32 +179,28 @@ console.log(JSON.stringify({
     )
     data = json.loads(proc.stdout.strip())
     assert data["layerKeys"] == [
-        "outlines",
-        "ranges_trimmed",
-        "cli_rewrites",
-        "outline_pulls",
-        "mcp_guards",
-        "allowed_reads",
+        "outlines", "ranges_trimmed", "cli_rewrites", "outline_pulls",
+        "outputs_spooled", "mcp_guards", "allowed_reads",
     ]
+    assert data["mcpLabels"] == ["Policy Pack Security Guards", "Policy Pack Security Guard"]
+    assert data["normEvents"] == {"sp": 9, "rel": 3}
+    assert data["zeroEvents"] == {"eSp": 0, "eRel": 0, "bSp": 0, "bRel": 0}
     assert data["tooltipHasOutlinePulls"] is True
     assert data["tooltipHasLegacyLastHit"] is True
+    assert data["hasReliabilityRows"] is True
     assert data["v4HasOutlinePulls"] is True
+    assert data["v4HasSpool"] is True
+    assert data["v4NoReliabilityWhenZero"] is True
     assert data["v4HidesLegacy"] is True
+    assert data["extRuntimeExports"] is True
+    assert data["extTrimmedUndefined"] is True
+    assert data["spoolLabels"] == ["Spool", "Output Spooled"]
+    assert data["relLabels"] == ["Reliability", "Reliability Failure"]
     assert data["retryKeys"] == []
     assert data["actualTokens"] == 0
     assert data["reductionPct"] == 100.0
-    assert data["agHarness"] == {
-        "hits": 0,
-        "baselineTokens": 1000,
-        "savedTokens": 0,
-        "reductionPct": 0.0,
-    }
-    assert data["claudeHarness"] == {
-        "hits": 5,
-        "baselineTokens": 500,
-        "savedTokens": 900,
-        "reductionPct": 100.0,
-    }
+    assert data["agHarness"] == {"hits": 0, "baselineTokens": 1000, "savedTokens": 0, "reductionPct": 0.0}
+    assert data["claudeHarness"] == {"hits": 5, "baselineTokens": 500, "savedTokens": 900, "reductionPct": 100.0}
     assert data["sidebarHasCsp"] is True
     assert data["webviewHasCsp"] is True
     assert data["sidebarHasZeroActual"] is True
@@ -196,6 +213,8 @@ console.log(JSON.stringify({
     assert "(Wide)" in data["pulseWide"]
     assert "(Batch)" in data["pulseBatch"]
     assert "(Reversal)" in data["pulseRev"]
+    assert "(Spool)" in data["pulseSpool"]
+    assert "(Reliability)" in data["pulseRel"]
     assert data["semverGood"] is True
     assert data["semverBad"] is True
     assert data["badSteps"] == []
@@ -219,7 +238,7 @@ console.log(JSON.stringify({
     )
     ext_install_dir = tmp_path / "extensions"
     ext_install_dir.mkdir(parents=True)
-    res = install_harnesses.install_ide_extension(synthetic_plugin, ext_install_dir, dry_run=False)
+    res = installer_service.install_ide_extension(synthetic_plugin, ext_install_dir, dry_run=False)
     assert res == "updated"
     installed_dirs = list(ext_install_dir.glob("advox.context-guard-statusbar-*"))
     assert len(installed_dirs) == 1
@@ -336,6 +355,7 @@ Module._load = function(request, parent, isMain) {
 };
 
 const ext = require(path.resolve(extDir, "extension.js"));
+const updater = require(path.resolve(extDir, "updater.js"));
 
 (async () => {
   const globalStore = {};
@@ -405,7 +425,7 @@ const ext = require(path.resolve(extDir, "extension.js"));
 
   console.log(JSON.stringify({
     spawnedDuringFreshLock,
-    recentLockCheck: ext.isUpdateAttemptRecent(lockPath, Date.now()),
+    recentLockCheck: updater.isUpdateAttemptRecent(lockPath, Date.now()),
     textDuringPulseBeforeUpdate,
     textDuringPulseAfterUpdate,
     latchedAfterDismiss,
@@ -460,13 +480,13 @@ def test_install_ide_extension_writes_plugin_root_json_and_extension_js_resolves
     extensions_dir.mkdir()
     (extensions_dir / "extensions.json").write_text("[]\n", encoding="utf-8")
 
-    dry_status = install_harnesses.install_ide_extension(
+    dry_status = installer_service.install_ide_extension(
         custom_plugin_root, extensions_dir, dry_run=True
     )
     assert dry_status == "updated"
     assert list(extensions_dir.glob("advox.context-guard-statusbar-*")) == []
 
-    real_status = install_harnesses.install_ide_extension(
+    real_status = installer_service.install_ide_extension(
         custom_plugin_root, extensions_dir, dry_run=False
     )
     assert real_status == "updated"
@@ -487,17 +507,22 @@ def test_install_ide_extension_writes_plugin_root_json_and_extension_js_resolves
         "const orig = Module._load;"
         "Module._load = (req, parent, isMain) => req === 'vscode' ? {} : orig(req, parent, isMain);"
         f"const ext = require({json.dumps(str(installed_ext_dir / 'extension.js'))});"
+        f"const upd = require({json.dumps(str(installed_ext_dir / 'updater.js'))});"
         "console.log(JSON.stringify({"
-        "  exported: typeof ext.resolvePluginRoot,"
-        f"  fromBreadcrumb: ext.resolvePluginRoot({{}}, {json.dumps(str(installed_ext_dir))}, {json.dumps(str(fake_home))}),"
-        f"  fromEnvOverride: ext.resolvePluginRoot({{CONTEXT_GUARD_HOME: '~/override-cg'}}, {json.dumps(str(installed_ext_dir))}, {json.dumps(str(fake_home))}),"
-        f"  fromDevCheckout: ext.resolvePluginRoot({{}}, {json.dumps(str(EXT_DIR))}, {json.dumps(str(fake_home))}),"
-        f"  fromCorruptFallback: ext.resolvePluginRoot({{}}, {json.dumps(str(corrupt_ext_dir))}, {json.dumps(str(fake_home))})"
+        "  exported: typeof upd.resolvePluginRoot,"
+        "  trimmedOnExt: typeof ext.resolvePluginRoot,"
+        "  activateType: typeof ext.activate,"
+        f"  fromBreadcrumb: upd.resolvePluginRoot({{}}, {json.dumps(str(installed_ext_dir))}, {json.dumps(str(fake_home))}),"
+        f"  fromEnvOverride: upd.resolvePluginRoot({{CONTEXT_GUARD_HOME: '~/override-cg'}}, {json.dumps(str(installed_ext_dir))}, {json.dumps(str(fake_home))}),"
+        f"  fromDevCheckout: upd.resolvePluginRoot({{}}, {json.dumps(str(EXT_DIR))}, {json.dumps(str(fake_home))}),"
+        f"  fromCorruptFallback: upd.resolvePluginRoot({{}}, {json.dumps(str(corrupt_ext_dir))}, {json.dumps(str(fake_home))})"
         "}));"
     )
     proc = subprocess.run(["node", "-e", node_script], capture_output=True, text=True, check=True)
     resolved = json.loads(proc.stdout.strip())
     assert resolved["exported"] == "function"
+    assert resolved["trimmedOnExt"] == "undefined"
+    assert resolved["activateType"] == "function"
     assert resolved["fromBreadcrumb"] == str(custom_plugin_root.resolve())
     assert resolved["fromEnvOverride"] == str((fake_home / "override-cg").resolve())
     assert resolved["fromDevCheckout"] == str(ROOT.resolve())
@@ -516,20 +541,13 @@ def test_sync_codex_config_toml_section_at_line_zero_and_brackets_in_values(tmp_
     )
     hooks_data = {
         "hooks": {
-            "PreToolUse": [
-                {
-                    "matcher": "^(Bash)$",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": "/usr/bin/python3 /custom/hooks/pre_tool_use.py",
-                        }
-                    ],
-                }
-            ]
+            "PreToolUse": [{
+                "matcher": "^(Bash)$",
+                "hooks": [{"type": "command", "command": "/usr/bin/python3 /custom/hooks/pre_tool_use.py"}],
+            }]
         }
     }
-    res = install_harnesses.sync_codex_config_toml(
+    res = installer_service.sync_codex_config_toml(
         codex_hooks_path=codex_hooks,
         codex_config_path=codex_config,
         hooks_data=hooks_data,
@@ -546,7 +564,7 @@ def test_sync_codex_config_toml_section_at_line_zero_and_brackets_in_values(tmp_
 def test_custom_context_guard_home_dir_status_idempotency_and_corrupt_json_isolation(
     tmp_path: Path,
 ) -> None:
-    from bin import harness_status
+    from services import harness_status
 
     custom_root = tmp_path / "my-custom-cg-folder"
     (custom_root / "hooks").mkdir(parents=True)
@@ -562,29 +580,18 @@ def test_custom_context_guard_home_dir_status_idempotency_and_corrupt_json_isola
     codex_cfg.write_text("{}\n", encoding="utf-8")
     codex_toml.write_text("", encoding="utf-8")
 
-    install_harnesses.install_all(
-        plugin_root=custom_root,
-        claude_settings_path=claude_cfg,
-        cursor_hooks_path=cursor_cfg,
-        codex_hooks_path=codex_cfg,
-        codex_config_path=codex_toml,
-        cursor_extensions_dir=None,
-        antigravity_extensions_dir=None,
-        antigravity_ide_extensions_dir=None,
-    )
+    def _run_install() -> dict[str, str]:
+        return installer_service.install_all(
+            plugin_root=custom_root, claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
+            codex_hooks_path=codex_cfg, codex_config_path=codex_toml, cursor_extensions_dir=None,
+            antigravity_extensions_dir=None, antigravity_ide_extensions_dir=None,
+        )
+
+    _run_install()
     status = harness_status.check_status(claude_cfg, cursor_cfg, codex_cfg)
     assert status == {"claude": True, "cursor": True, "codex": True}
 
-    install_harnesses.install_all(
-        plugin_root=custom_root,
-        claude_settings_path=claude_cfg,
-        cursor_hooks_path=cursor_cfg,
-        codex_hooks_path=codex_cfg,
-        codex_config_path=codex_toml,
-        cursor_extensions_dir=None,
-        antigravity_extensions_dir=None,
-        antigravity_ide_extensions_dir=None,
-    )
+    _run_install()
     claude_data = json.loads(claude_cfg.read_text(encoding="utf-8"))
     cursor_data = json.loads(cursor_cfg.read_text(encoding="utf-8"))
     assert len(claude_data["hooks"]["PreToolUse"]) == 1
@@ -592,41 +599,32 @@ def test_custom_context_guard_home_dir_status_idempotency_and_corrupt_json_isola
 
     claude_cfg.write_text("{corrupt json", encoding="utf-8")
     cursor_cfg.write_text("{}\n", encoding="utf-8")
-    res = install_harnesses.install_all(
-        plugin_root=custom_root,
-        claude_settings_path=claude_cfg,
-        cursor_hooks_path=cursor_cfg,
-        codex_hooks_path=codex_cfg,
-        codex_config_path=codex_toml,
-        cursor_extensions_dir=None,
-        antigravity_extensions_dir=None,
-        antigravity_ide_extensions_dir=None,
-    )
+    res = _run_install()
     assert res["claude"].startswith("error")
     assert res["cursor"] == "updated"
 
 
 def test_windows_python_resolution_and_codex_toml_backslash_escaping(tmp_path: Path) -> None:
     assert (
-        install_harnesses.resolve_python_command(
+        installer_service.resolve_python_command(
             os_name="nt", which_fn=lambda cmd: "C:\\Python312\\python.exe" if cmd == "python" else None
         )
         == "python"
     )
     assert (
-        install_harnesses.resolve_python_command(
+        installer_service.resolve_python_command(
             os_name="nt", which_fn=lambda cmd: "C:\\Windows\\py.exe" if cmd == "py" else None
         )
         == "py -3"
     )
     assert (
-        install_harnesses.resolve_python_command(
+        installer_service.resolve_python_command(
             os_name="posix", which_fn=lambda cmd: "/usr/bin/python" if cmd == "python" else None
         )
         == "python"
     )
     assert (
-        install_harnesses.format_hook_script_path(Path("C:/Users/Jan Kowalski/hooks/pre_tool_use.py"))
+        installer_service.format_hook_script_path(Path("C:/Users/Jan Kowalski/hooks/pre_tool_use.py"))
         == '"C:/Users/Jan Kowalski/hooks/pre_tool_use.py"'
     )
 
@@ -646,7 +644,7 @@ def test_windows_python_resolution_and_codex_toml_backslash_escaping(tmp_path: P
             ]
         }
     }
-    status = install_harnesses.sync_codex_config_toml(
+    status = installer_service.sync_codex_config_toml(
         codex_hooks_path=Path(win_hooks_str),
         codex_config_path=codex_config,
         hooks_data=hooks_data,
@@ -661,6 +659,7 @@ def test_windows_python_resolution_and_codex_toml_backslash_escaping(tmp_path: P
 
 def test_vscode_extension_python_candidates_and_windows_fallback(tmp_path: Path) -> None:
     ext_js = ROOT / "vscode-extension" / "extension.js"
+    updater_js = ROOT / "vscode-extension" / "updater.js"
     node_script = tmp_path / "test_win_ext.js"
     node_script.write_text(
         f"""
@@ -686,11 +685,13 @@ Module._load = function(request, parent, isMain) {{
   return origLoad(request, parent, isMain);
 }};
 const ext = require({json.dumps(str(ext_js))});
-assert.strictEqual(typeof ext.pythonCandidates, "function");
-const winCands = ext.pythonCandidates("win32", {{}});
+const upd = require({json.dumps(str(updater_js))});
+assert.strictEqual(typeof ext.pythonCandidates, "undefined");
+assert.strictEqual(typeof upd.pythonCandidates, "function");
+const winCands = upd.pythonCandidates("win32", {{}});
 assert.deepStrictEqual(winCands[0], ["python", []]);
 assert.deepStrictEqual(winCands[1], ["py", ["-3"]]);
-const customCands = ext.pythonCandidates("linux", {{ CONTEXT_GUARD_PYTHON: "/opt/py/bin/python3" }});
+const customCands = upd.pythonCandidates("linux", {{ CONTEXT_GUARD_PYTHON: "/opt/py/bin/python3" }});
 assert.deepStrictEqual(customCands[0], ["/opt/py/bin/python3", []]);
 console.log("WIN_EXT_OK");
 """,

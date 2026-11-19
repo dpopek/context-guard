@@ -389,6 +389,8 @@ def test_compaction_and_session_end_close_spool_windows_and_clean_shadow_spools(
     assert read_outcomes_ledger(sd1)["open_windows"] == {}
     cmp_row = _spool_row(sd1, "output_spool")
     assert cmp_row["recovery"]["none"] == 1 and cmp_row["regret"]["none"] == 1
+    assert telemetry.load_shadow_ledger(sh_path)["shadow_spools"]["count"] == 1
+    assert telemetry.invalidate_shadow_ledger(full_compact=True, shadow_path=sh_path)
     assert telemetry.load_shadow_ledger(sh_path)["shadow_spools"] == {
         "count": 0, "estimated_saved_bytes": 0, "last_ts": None, "by_harness": {}
     }
@@ -460,7 +462,7 @@ def test_spool_hook_lock_ordering_never_nests_inside_locked_state(
             "record_cli_verbose_regret", "record_range_trim_regret",
             "record_spool_command_repeat", "record_spool_followup", "classify_pre_tool_spool_followup",
         )),
-        (spool_store, ("build_post_tool_spool_response", "classify_pre_tool_spool_followup")),
+        (spool_store, ("spool_post_tool_output", "classify_pre_tool_spool_followup")),
     ):
         for fn_name in names:
             _wrap_pub(target_mod, fn_name)

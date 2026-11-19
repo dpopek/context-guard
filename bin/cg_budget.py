@@ -14,7 +14,7 @@ _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 if str(_PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(_PACKAGE_ROOT))
 
-from bin import budget_advisor, mcp_inventory  # noqa: E402
+from services import budget_advisor, mcp_inventory  # noqa: E402
 
 
 def _fmt_num(value: Any, *, prefix: str = "", suffix: str = "") -> str:

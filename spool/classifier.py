@@ -7,19 +7,23 @@ import hashlib
 import json
 import os
 import re
+from pathlib import Path
 import shlex
 import stat
-from pathlib import Path
-from typing import Any, Mapping, Sequence
+import time
+from typing import Any, Callable, Mapping, Sequence
 
+from core.platform_io import check_unsafe_link
 from spool.receipts import (
+    DEFAULT_MAX_SPOOL_ENTRY_BYTES,
     VALID_SPOOL_ISOLATIONS,
-    check_unsafe_link,
     compute_scope_key,
+    compute_scoped_spool_id,
     read_spool_config,
     receipts_path_for,
     resolve_workspace_identity,
     same_workspace_dir,
+    summarize_receipts,
 )
 
 SPOOL_ID_RE = re.compile(r"^sp_[0-9a-f]{12}$")
@@ -50,16 +54,35 @@ def _strip_cd_and_split(cmd: str, *, raw_words: bool = False) -> list[str]:
 
 
 def read_blob_bytes(path: Path) -> tuple[bytes | None, str | None]:
-    """Safely read a regular non-symlink file with O_NOFOLLOW."""
-    if check_unsafe_link(path):
-        return None, "unsafe_path"
-    try:
-        with os.fdopen(os.open(str(path), os.O_RDONLY | _O_FLAGS), "rb") as fh:
-            return (fh.read(), None) if stat.S_ISREG(os.fstat(fh.fileno()).st_mode) else (None, "unsafe_path")
-    except OSError as exc:
-        if isinstance(exc, FileNotFoundError):
+    """Safely read a regular non-symlink file with O_NOFOLLOW and lstat/fstat identity verification."""
+    for _ in range(3):
+        if check_unsafe_link(path):
+            return None, "unsafe_path"
+        try:
+            l_st = os.lstat(str(path))
+        except FileNotFoundError:
             return None, "spool_not_found"
-        return None, "unsafe_path" if exc.errno in (errno.ELOOP, getattr(errno, "EMLINK", -1)) else str(exc)
+        except OSError as exc:
+            return None, str(exc)
+        if not stat.S_ISREG(l_st.st_mode):
+            return None, "unsafe_path"
+        try:
+            with os.fdopen(os.open(str(path), os.O_RDONLY | _O_FLAGS), "rb") as fh:
+                f_st = os.fstat(fh.fileno())
+                if not stat.S_ISREG(f_st.st_mode):
+                    return None, "unsafe_path"
+                if (l_st.st_ino != 0 or f_st.st_ino != 0) and (
+                    (f_st.st_dev, f_st.st_ino) != (l_st.st_dev, l_st.st_ino)
+                ):
+                    continue
+                return fh.read(), None
+        except FileNotFoundError:
+            return None, "spool_not_found"
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, getattr(errno, "EMLINK", -1)):
+                return None, "unsafe_path"
+            return None, str(exc)
+    return None, "unsafe_path"
 
 
 def resolve_spool_scope(
@@ -180,12 +203,10 @@ def parse_spool_index(data: Any) -> dict[str, Any] | None:
 
 
 def _ro_index_state(eff_dir: Path) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], bool]:
-    try:
-        rb, _ = (None, "u") if check_unsafe_link(eff_dir) else read_blob_bytes(eff_dir / "spool_index.json")
-        parsed = parse_spool_index(json.loads(rb.decode("utf-8"))) if rb is not None else None
-        return (parsed["entries"], parsed["tombstones"], True) if parsed else ({}, {}, False)
-    except (OSError, UnicodeDecodeError, ValueError, TypeError):
+    if check_unsafe_link(eff_dir):
         return {}, {}, False
+    parsed, _ = read_spool_index_readonly(eff_dir / "spool_index.json")
+    return (parsed["entries"], parsed["tombstones"], True) if parsed else ({}, {}, False)
 
 
 def _eval_followup(
@@ -280,22 +301,419 @@ def classify_pre_tool_spool_followup(
             return None
         eff_dir = spool_dir or receipts_path_for().parent
         if tool_name in ("call_mcp_tool", "cg_spool_slice", "cg_spool_grep") or tool_name.startswith(("mcp__", "MCP:", "mcp_")):
-            leaf = (str(tool_input.get("name") or tool_input.get("tool_name") or tool_name) if tool_name == "call_mcp_tool" else tool_name).rsplit("__", 1)[-1].rsplit(":", 1)[-1]
+            raw_leaf = str(tool_input.get("name") or tool_input.get("tool_name") or tool_name) if tool_name == "call_mcp_tool" else tool_name
+            leaf = raw_leaf.rsplit("__", 1)[-1].rsplit(":", 1)[-1]
             args = (tool_input.get("arguments") or tool_input.get("args") or tool_input) if tool_name == "call_mcp_tool" else tool_input
             if isinstance(args, Mapping) and SPOOL_ID_RE.fullmatch((sid := str(args.get("spool_id") or "").strip())) and leaf in ("cg_spool_grep", "cg_spool_slice"):
-                return _eval_followup(sid, "grep" if leaf == "cg_spool_grep" else "slice", eff_dir, mode, ws_id, canon_root, eff_sess, max(1, _opt_int(args.get("start_line")) or 1), _opt_int(args.get("end_line")), _opt_int(args.get("limit")), 120)
-        elif tool_name in ("Read", "read_file", "view_file") and (msid := _match_blob_path(str(tool_input.get("file_path") or tool_input.get("path") or tool_input.get("Path") or tool_input.get("AbsolutePath") or ""), eff_dir)):
-            return _eval_followup(msid, "direct_read", eff_dir, mode, ws_id, canon_root, eff_sess, max(1, _opt_int(tool_input.get("StartLine") if "StartLine" in tool_input else tool_input.get("offset")) or 1), _opt_int(tool_input.get("EndLine")), _opt_int(tool_input.get("limit")))
+                return _eval_followup(
+                    sid, "grep" if leaf == "cg_spool_grep" else "slice", eff_dir, mode, ws_id,
+                    canon_root, eff_sess, max(1, _opt_int(args.get("start_line")) or 1),
+                    _opt_int(args.get("end_line")), _opt_int(args.get("limit")), 120,
+                )
+        elif tool_name in ("Read", "read_file", "view_file"):
+            raw_fp = str(tool_input.get("file_path") or tool_input.get("path") or tool_input.get("Path") or tool_input.get("AbsolutePath") or "")
+            if (msid := _match_blob_path(raw_fp, eff_dir)):
+                s_val = _opt_int(tool_input.get("StartLine") if "StartLine" in tool_input else tool_input.get("offset"))
+                return _eval_followup(
+                    msid, "direct_read", eff_dir, mode, ws_id, canon_root, eff_sess,
+                    max(1, s_val or 1), _opt_int(tool_input.get("EndLine")), _opt_int(tool_input.get("limit")),
+                )
         elif tool_name in _SHELL_TOOLS:
             rc = tool_input.get("command") or tool_input.get("cmd") or tool_input.get("CommandLine")
-            tokens = _strip_cd_and_split(rc if isinstance(rc, str) else (" ".join(str(x) for x in rc) if isinstance(rc, list) else ""))
-            if (cg := next((i for i, t in enumerate(tokens) if re.sub(r"\.(?:exe|cmd|bat)$", "", t.replace("\\", "/").rsplit("/", 1)[-1].lower()) in ("cg-spool", "cg_spool.py")), -1)) >= 0 and cg + 1 < len(tokens) and tokens[cg + 1] in ("grep", "slice") and (csid := next((t for t in tokens[cg + 2 :] if SPOOL_ID_RE.fullmatch(t)), "")):
-                return _eval_followup(csid, "grep" if tokens[cg + 1] == "grep" else "slice", eff_dir, mode, ws_id, canon_root, eff_sess, max(1, _cli_int(tokens[cg + 2 :], "--start") or 1), _cli_int(tokens[cg + 2 :], "--end"), _cli_int(tokens[cg + 2 :], "--limit"), 120)
-            if tokens and (cmd_bin := tokens[0].replace("\\", "/").rsplit("/", 1)[-1].lower()) in _READER_BINS and (rsid := next((m for t in tokens[1:] if (m := _match_blob_path(t, eff_dir)) is not None), None)):
-                s_l, req = 1, (max(1, val) if (val := _cli_int(tokens[1:], "--lines") or _cli_int(tokens[1:], "-n") or next((int(mm.group(1)) for t in tokens[1:] if (mm := re.fullmatch(r"-n?(\d+)", t))), None)) is not None else 10) if cmd_bin in ("head", "tail") else None
-                if cmd_bin == "sed" and (ms := next((mm for t in tokens[1:] if (mm := re.fullmatch(r"(\d+),(\d+)p", t))), None)):
-                    s_l, req = max(1, int(ms.group(1))), max(1, int(ms.group(2)) - max(1, int(ms.group(1))) + 1)
-                return _eval_followup(rsid, "direct_read", eff_dir, mode, ws_id, canon_root, eff_sess, s_l, lim=req)
+            cmd_text = rc if isinstance(rc, str) else (" ".join(str(x) for x in rc) if isinstance(rc, list) else "")
+            tokens = _strip_cd_and_split(cmd_text)
+            cg = next(
+                (i for i, t in enumerate(tokens) if re.sub(r"\.(?:exe|cmd|bat)$", "", t.replace("\\", "/").rsplit("/", 1)[-1].lower()) in ("cg-spool", "cg_spool.py")),
+                -1,
+            )
+            if cg >= 0 and cg + 1 < len(tokens) and tokens[cg + 1] in ("grep", "slice"):
+                tail_toks = tokens[cg + 2 :]
+                if (csid := next((t for t in tail_toks if SPOOL_ID_RE.fullmatch(t)), "")):
+                    return _eval_followup(
+                        csid, "grep" if tokens[cg + 1] == "grep" else "slice", eff_dir, mode, ws_id, canon_root,
+                        eff_sess, max(1, _cli_int(tail_toks, "--start") or 1), _cli_int(tail_toks, "--end"), _cli_int(tail_toks, "--limit"), 120,
+                    )
+            if tokens and (cmd_bin := tokens[0].replace("\\", "/").rsplit("/", 1)[-1].lower()) in _READER_BINS:
+                if (rsid := next((m for t in tokens[1:] if (m := _match_blob_path(t, eff_dir)) is not None), None)) is not None:
+                    s_l, req = 1, None  # type: tuple[int, int | None]
+                    if cmd_bin in ("head", "tail"):
+                        val = _cli_int(tokens[1:], "--lines") or _cli_int(tokens[1:], "-n") or next(
+                            (int(mm.group(1)) for t in tokens[1:] if (mm := re.fullmatch(r"-n?(\d+)", t))), None
+                        )
+                        req = max(1, val) if val is not None else 10
+                    elif cmd_bin == "sed" and (ms := next((mm for t in tokens[1:] if (mm := re.fullmatch(r"(\d+),(\d+)p", t))), None)):
+                        s_l = max(1, int(ms.group(1)))
+                        req = max(1, int(ms.group(2)) - s_l + 1)
+                    return _eval_followup(rsid, "direct_read", eff_dir, mode, ws_id, canon_root, eff_sess, s_l, lim=req)
     except (OSError, ValueError, TypeError):
         pass
     return None
+
+
+def validate_and_normalize_spool_text(raw_text: Any, eff_max_bytes: int) -> tuple[str, bytes] | None:
+    """Validate strict UTF-8 and NUL absence, normalize line endings to LF, and enforce byte ceiling."""
+    if eff_max_bytes < 1 or not isinstance(raw_text, (str, bytes)):
+        return None
+    if isinstance(raw_text, bytes):
+        if len(raw_text) > eff_max_bytes * 2:
+            return None
+        try:
+            raw_str = raw_text.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return None
+    else:
+        raw_str = raw_text
+    if len(raw_str) > eff_max_bytes * 2 or "\x00" in raw_str:
+        return None
+    norm = raw_str.replace("\r\n", "\n").replace("\r", "\n")
+    try:
+        raw_bytes = norm.encode("utf-8", errors="strict")
+    except UnicodeEncodeError:
+        return None
+    return (norm, raw_bytes) if len(raw_bytes) <= eff_max_bytes else None
+
+
+def build_spool_summary(
+    sid: str, lines: list[str], total_bytes: int, sha_hex: str, *,
+    head_lines: int = 25, tail_lines: int = 15, max_bytes: int = 3_072, min_saved_bytes: int = 2_048,
+) -> tuple[str, int] | None:
+    """Build bounded UTF-8 head/tail summary with CLI/MCP recovery hints or return None if savings too small."""
+    total_lines = len(lines)
+    h, t, drop_h = min(head_lines, total_lines), min(tail_lines, max(0, total_lines - head_lines)), True
+
+    def _fmt(sv: int, hd: list[str], tl: list[str]) -> str:
+        om = max(0, total_lines - len(hd) - len(tl))
+        parts = [
+            f"[CONTEXT-GUARD OUTPUT SPOOL: {sid} | {total_lines} lines, {total_bytes} B | sha256={sha_hex[:12]}]",
+            f"Saved {sv} B. Inspect slices without re-running:",
+            f"- CLI: cg-spool slice {sid} --start 1 --limit 120 | cg-spool grep {sid} --pattern '<regex>'",
+            f"- MCP: cg_spool_slice / cg_spool_grep (spool_id={sid})",
+            *([f"--- HEAD (lines 1..{len(hd)}) ---", *hd] if hd else []),
+            *([f"--- OMITTED ({om} lines; use cg-spool slice/grep) ---"] if om > 0 else []),
+            *([f"--- TAIL (lines {total_lines - len(tl) + 1}..{total_lines}) ---", *tl] if tl else []),
+        ]
+        return "\n".join(parts)
+
+    while h + t > 1 and len(_fmt(total_bytes, lines[:h], lines[-t:] if t else []).encode("utf-8")) > max_bytes:
+        t, h, drop_h = (t - 1, h, not drop_h) if (t > 0 and (not drop_h or h <= 1)) else (t, max(0, h - 1), not drop_h)
+    hd, tl, suf = lines[:h], (lines[-t:] if t else []), "\n...[summary truncated]"
+    if len(_fmt(total_bytes, hd, tl).encode("utf-8")) > max_bytes:
+        avail = max(0, max_bytes - len(_fmt(total_bytes, [""] if lines else [], []).encode("utf-8")) - len(suf.encode("utf-8")))
+        hd, tl = ([lines[0].encode("utf-8")[:avail].decode("utf-8", "ignore") + suf] if (lines and avail > 0) else []), []
+    summary = _fmt(max(0, total_bytes - len(_fmt(total_bytes, hd, tl).encode("utf-8"))), hd, tl)
+    if len(summary.encode("utf-8")) > max_bytes:
+        summary = summary.encode("utf-8")[: max_bytes - len(suf.encode("utf-8"))].decode("utf-8", "ignore") + suf
+    final_saved = max(0, total_bytes - len(summary.encode("utf-8")))
+    return (summary, final_saved) if final_saved >= min_saved_bytes else None
+
+
+def project_spool_in_memory(
+    raw_text: str | bytes, *, scope_key: str = "global", max_bytes: int = DEFAULT_MAX_SPOOL_ENTRY_BYTES,
+    min_bytes: int = 12_288, min_lines: int = 200,
+    head_lines: int = 25, tail_lines: int = 15, summary_max_bytes: int = 3_072, min_saved_bytes: int = 2_048,
+) -> tuple[str, list[str], bytes, str, str, int] | None:
+    """Validate, normalize, hash, and summarize an output payload purely in memory."""
+    if (vn := validate_and_normalize_spool_text(raw_text, max_bytes)) is None:
+        return None
+    norm, raw_bytes = vn
+    total_bytes, lines = len(raw_bytes), split_lines(norm)
+    if total_bytes < min_bytes and len(lines) < min_lines:
+        return None
+    sha_hex = hashlib.sha256(raw_bytes).hexdigest()
+    sid = compute_scoped_spool_id(scope_key, sha_hex)
+    built = build_spool_summary(
+        sid, lines, total_bytes, sha_hex, head_lines=head_lines, tail_lines=tail_lines,
+        max_bytes=summary_max_bytes, min_saved_bytes=min_saved_bytes,
+    )
+    return (sid, lines, raw_bytes, sha_hex, built[0], built[1]) if built is not None else None
+
+
+def has_tool_error_signal(payload: Mapping[str, Any], resp: Any) -> bool:
+    """Return True if a PostToolUse payload or response signals an error or non-zero exit code."""
+    if payload.get("hook_event_name") == "PostToolUseFailure" or str(payload.get("status") or "").lower() in ("error", "failed", "failure"):
+        return True
+    for obj in (payload, resp):
+        if isinstance(obj, Mapping) and (
+            obj.get("is_error") or obj.get("isError") or obj.get("error")
+            or any(isinstance((v := obj.get(k)), int) and not isinstance(v, bool) and v != 0 for k in ("exit_code", "exitCode", "return_code", "returncode"))
+        ):
+            return True
+    return False
+
+
+def extract_tool_payload_text(harness: str, resp: Any, is_shell: bool) -> tuple[str | bytes | None, str | None]:
+    """Extract raw tool output text/bytes and its structural shape from a PostToolUse response."""
+    if harness == "cursor" and isinstance(resp, str) and is_shell:
+        try:
+            if isinstance((parsed := json.loads(resp)), Mapping):
+                resp = parsed
+        except ValueError:
+            pass
+    if isinstance(resp, (str, bytes)):
+        return resp, ("bytes" if isinstance(resp, bytes) else "str")
+    if isinstance(resp, Mapping):
+        if harness == "cursor" and (resp.get("redacted") is True or has_tool_error_signal({}, resp)):
+            return None, None
+        keys = ("text", "output", "content", "stdout") if harness == "cursor" else ("output", "stdout")
+        return next(((resp[k], k) for k in keys if isinstance(resp.get(k), (str, bytes))), (None, None))
+    if isinstance(resp, list) and resp and all(isinstance(b, Mapping) and b.get("type") == "text" and isinstance(b.get("text"), str) for b in resp):
+        return "\n".join(b["text"] for b in resp), "blocks"
+    return None, None
+
+
+def byte_offset_for_line(lines: list[str], idx: int) -> int:
+    """Return UTF-8 byte offset of 0-based line index `idx` assuming LF line separators."""
+    return sum(len(lines[k].encode("utf-8")) + 1 for k in range(idx))
+
+
+def slice_verified_lines(
+    lines: list[str], start_line: int, limit: int, end_line: int | None,
+) -> tuple[dict[str, Any], tuple[int, int], tuple[int, int]]:
+    """Compute bounded slice result fields and half-open `(line_span, byte_span)` purely."""
+    total_lines, s_line = len(lines), max(1, int(start_line))
+    e_clamped = min(total_lines, int(end_line) if end_line is not None else (s_line + max(1, int(limit)) - 1))
+    empty = total_lines == 0 or s_line > total_lines or e_clamped < s_line
+    sel = [] if empty else lines[s_line - 1 : e_clamped]
+    content = "\n".join(sel)
+    lspan = (0, 0) if empty else (s_line - 1, e_clamped)
+    bspan = (0, 0) if empty else ((sb := byte_offset_for_line(lines, s_line - 1)), sb + len(content.encode("utf-8")))
+    fields = {
+        "start_line": s_line, "end_line": (s_line - 1 if empty else e_clamped), "returned_lines": len(sel),
+        "total_lines": total_lines, "truncated": (False if empty else e_clamped < total_lines), "content": content,
+    }
+    return fields, lspan, bspan
+
+
+def grep_verified_lines(
+    lines: list[str], rx: re.Pattern[str], max_matches: int, context_lines: int,
+) -> tuple[list[dict[str, Any]], bool, tuple[int, int], tuple[int, int]]:
+    """Run bounded regex search on lines and return `(matches, truncated, line_span, byte_span)`."""
+    eff_max, eff_ctx = max(1, min(200, int(max_matches))), max(0, min(10, int(context_lines)))
+    truncated, min_0, max_0 = False, len(lines), 0
+    matches: list[dict[str, Any]] = []
+    for idx, line_text in enumerate(lines):
+        if rx.search(line_text):
+            if (truncated := len(matches) >= eff_max):
+                break
+            b_start, a_end = max(0, idx - eff_ctx), min(len(lines), idx + 1 + eff_ctx)
+            min_0, max_0 = min(min_0, b_start), max(max_0, a_end)
+            matches.append({"line": idx + 1, "text": line_text, "before": lines[b_start:idx] if eff_ctx else [], "after": lines[idx + 1 : a_end] if eff_ctx else []})
+    lspan = (0, 0) if not matches else (min_0, max_0)
+    bspan = (0, 0) if not matches else (byte_offset_for_line(lines, min_0), byte_offset_for_line(lines, max_0 - 1) + len(lines[max_0 - 1].encode("utf-8")))
+    return matches, truncated, lspan, bspan
+
+
+_SELF_MCP_LEAVES = frozenset({"cg_spool_slice", "cg_spool_grep", "cg_spool_list"})
+_SELF_CLI_RE = re.compile(r"(?<![A-Za-z0-9_-])(?:cg-spool(?:\.(?:exe|cmd|bat))?|cg_spool\.py)(?![A-Za-z0-9_-])", re.I)
+_SKIP_SPOOL_TOOLS = frozenset({
+    "Read", "NotebookRead", "read_file", "view_file", "view_file_outline", "view_code_item", "Glob", "glob",
+    "Grep", "grep_search", "find_by_name", "Edit", "Write", "MultiEdit", "NotebookEdit", "EditFile", "WriteFile",
+    "StrReplace", "MultiStrReplace", "Delete", "DeleteFile", "edit_file", "write_file",
+    "replace_file_content", "multi_replace_file_content", "write_to_file", "apply_patch",
+})
+
+
+def prepare_post_tool_spool_candidate(
+    harness: str, payload: Mapping[str, Any], raw_text: str | bytes | None = None,
+) -> tuple[str, Mapping[str, Any], bool, str, Any, str | bytes, str | None, bool] | None:
+    """Validate and extract eligible PostToolUse spool inputs, returning None when skipped."""
+    tc = payload.get("toolCall")
+    tool_name = str(payload.get("tool_name") or (tc.get("name") if isinstance(tc, Mapping) else "") or "")
+    raw_in: Mapping[str, Any] = payload["tool_input"] if isinstance(payload.get("tool_input"), Mapping) else (
+        tc["args"] if isinstance(tc, Mapping) and isinstance(tc.get("args"), Mapping) else {}
+    )
+    is_shell = tool_name in _SHELL_TOOLS
+    rc = raw_in.get("command") or raw_in.get("cmd") or raw_in.get("CommandLine")
+    shell_cmd = rc if isinstance(rc, str) else (" ".join(str(x) for x in rc) if isinstance(rc, list) else "")
+    inner = str(raw_in.get("name") or raw_in.get("tool_name") or "") if tool_name == "call_mcp_tool" else tool_name
+    raw_resp = payload.get("tool_output") if harness == "cursor" else payload.get("tool_response", payload.get("tool_output"))
+    eligible = is_shell or tool_name.startswith(("mcp__", "MCP:")) or tool_name == "call_mcp_tool"
+    is_self = inner.rsplit("__", 1)[-1].rsplit(":", 1)[-1] in _SELF_MCP_LEAVES or (is_shell and bool(_SELF_CLI_RE.search(shell_cmd)))
+    if not tool_name or tool_name in _SKIP_SPOOL_TOOLS or not eligible or is_self or has_tool_error_signal(payload, raw_resp):
+        return None
+    ext_text, shape = extract_tool_payload_text(harness, raw_resp, is_shell)
+    eff_raw: str | bytes | None = raw_text if raw_text is not None else ext_text
+    if not isinstance(eff_raw, (str, bytes)):
+        return None
+    if raw_text is not None and shape is None:
+        shape = "bytes" if isinstance(raw_text, bytes) else "str"
+    up_trunc = bool(payload.get("truncated") or payload.get("is_truncated") or (isinstance(raw_resp, Mapping) and (raw_resp.get("truncated") or raw_resp.get("is_truncated"))))
+    return tool_name, raw_in, is_shell, shell_cmd, raw_resp, eff_raw, shape, up_trunc
+
+
+def prune_evicted_tombstones(
+    tombstones: dict[str, dict[str, Any]], now_ts: float, *, max_age: float = 7 * 86_400.0, max_tombstones: int = 128,
+) -> bool:
+    """Prune expired and oldest evicted tombstones in-place, preserving `evicting` tombstones."""
+    dirty = False
+    for old_sid in [s for s, t in tombstones.items() if t.get("state", "evicted") == "evicted" and (now_ts - float(t.get("evicted_at", 0.0))) > max_age]:
+        del tombstones[old_sid]
+        dirty = True
+    if len(tombstones) > max_tombstones:
+        evicted = sorted((s for s, t in tombstones.items() if t.get("state", "evicted") == "evicted"), key=lambda s: (float(tombstones[s].get("evicted_at", 0.0)), s))
+        for old_sid in evicted[: len(tombstones) - max_tombstones]:
+            del tombstones[old_sid]
+            dirty = True
+    return dirty
+
+
+def plan_gc_phase1(
+    index: dict[str, Any], *, max_age: float, max_entries: int, max_bytes: int, now_ts: float,
+    protect: str | None = None, probe_blob_corrupt: Callable[[str], str | None],
+    tombstone_max_age: float = 7 * 86_400.0, max_tombstones: int = 128, max_corrupt_entries: int = 64,
+) -> tuple[list[tuple[str, int]], set[str], bool]:
+    """Plan Phase-1 GC corrupt marks, TTL/LRU evictions, and bounded tombstones inside the spool lock."""
+    entries, tombstones, dirty = index["entries"], index.setdefault("tombstones", {}), False
+    for s, ent in entries.items():
+        if s != protect and ent.get("state", "available") == "available" and (cr := probe_blob_corrupt(s)) is not None:
+            ent["state"], ent["corrupt_reason"], ent["corrupted_at"], dirty = "corrupt", cr, now_ts, True
+    for old_c in [s for s, e in entries.items() if e.get("state") == "corrupt" and (now_ts - float(e.get("corrupted_at", e.get("created_at", 0.0)))) > tombstone_max_age]:
+        del entries[old_c]
+        dirty = True
+    corrupt_sids = sorted((s for s, e in entries.items() if e.get("state") == "corrupt"), key=lambda s: (float(entries[s].get("corrupted_at", entries[s].get("created_at", 0.0))), s))
+    for old_c in corrupt_sids[: max(0, len(corrupt_sids) - max_corrupt_entries)]:
+        del entries[old_c]
+        dirty = True
+    avail_sids = [s for s, e in entries.items() if e.get("state", "available") == "available"]
+    evict_reasons = {s: "ttl_expired" for s in avail_sids if s != protect and (now_ts - float(entries[s].get("last_accessed_at", entries[s].get("created_at", 0.0)))) > max_age}
+    rem_c = sum(1 for s in avail_sids if s not in evict_reasons)
+    rem_b = sum(max(0, int(entries[s].get("total_bytes") or 0)) for s in avail_sids if s not in evict_reasons)
+    lru_order = sorted((s for s in avail_sids if s != protect and s not in evict_reasons), key=lambda s: (float(entries[s].get("last_accessed_at", 0.0)), float(entries[s].get("created_at", 0.0)), s))
+    for sid in lru_order:
+        if rem_c <= max(0, max_entries) and rem_b <= max(0, max_bytes):
+            break
+        evict_reasons[sid] = "max_entries_lru" if rem_c > max(0, max_entries) else "max_bytes_lru"
+        rem_c, rem_b = rem_c - 1, rem_b - max(0, int(entries[sid].get("total_bytes") or 0))
+    for sid, reason in evict_reasons.items():
+        ent = entries.pop(sid)
+        tomb: dict[str, Any] = {
+            "spool_id": sid,
+            "state": "evicting",
+            "reason": reason,
+            "evicted_at": now_ts,
+            "workspace_id": str(ent.get("workspace_id") or ""),
+            "session_id": str(ent.get("session_id") or ""),
+            "total_bytes": max(0, int(ent.get("total_bytes") or 0)),
+        }
+        if isinstance(ent.get("canon_root"), str) and ent["canon_root"].strip():
+            tomb["canon_root"] = ent["canon_root"]
+        tombstones[sid], dirty = tomb, True
+    dirty = prune_evicted_tombstones(tombstones, now_ts, max_age=tombstone_max_age, max_tombstones=max_tombstones) or dirty
+    return [(sid, max(0, int(t.get("total_bytes") or 0))) for sid, t in tombstones.items() if t.get("state") == "evicting"], set(entries) | set(tombstones), dirty
+
+
+def read_spool_index_readonly(idx_path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    """Read and parse `spool_index.json` purely read-only without locks or quarantine."""
+    raw_bytes, err = read_blob_bytes(idx_path)
+    if err == "unsafe_path":
+        return None, "unsafe_path"
+    try:
+        parsed = parse_spool_index(json.loads(raw_bytes.decode("utf-8"))) if raw_bytes is not None else None
+    except (UnicodeDecodeError, ValueError, TypeError):
+        parsed = None
+    return parsed, None
+
+
+def _num_f(d: Mapping[str, Any], k: str) -> float | None:
+    return float(d[k]) if isinstance(d.get(k), (int, float)) and not isinstance(d.get(k), bool) else None
+
+
+def _num_i(d: Mapping[str, Any], k: str) -> int:
+    return max(0, int(d[k])) if isinstance(d.get(k), int) and not isinstance(d.get(k), bool) else 0
+
+
+def inspect_spool_entry_readonly(spool_id: str, eff_dir: Path) -> dict[str, Any]:
+    """Pure read-only inspection of one `spool_id` without locks, writes, warnings, or blob reads."""
+    base: dict[str, Any] = {
+        "spool_id": str(spool_id or ""), "found": False, "current_state": "unknown", "eviction_reason": None,
+        "corrupt_reason": None, "created_at": None, "last_accessed_at": None, "evicted_at": None,
+        "corrupted_at": None, "total_bytes": 0, "total_lines": 0, "blob_present": False,
+        "workspace_id": "", "session_id": "",
+    }
+    idx_path = eff_dir / "spool_index.json"
+    if check_unsafe_link(eff_dir) or (eff_dir.exists() and not eff_dir.is_dir()) or (eff_dir.is_dir() and check_unsafe_link(idx_path)):
+        return {**base, "corrupt_reason": "unsafe_path"}
+    if not eff_dir.is_dir() or not isinstance(spool_id, str) or not SPOOL_ID_RE.fullmatch(spool_id):
+        return base
+    parsed, idx_err = read_spool_index_readonly(idx_path)
+    if idx_err == "unsafe_path":
+        return {**base, "corrupt_reason": "unsafe_path"}
+    if parsed is None:
+        return base
+    blob_path = eff_dir / f"{spool_id}.txt"
+    blob_unsafe, blob_is_reg = check_unsafe_link(blob_path), False
+    if not blob_unsafe:
+        try:
+            is_r = stat.S_ISREG(os.lstat(str(blob_path)).st_mode)
+            blob_is_reg, blob_unsafe = is_r, not is_r
+        except FileNotFoundError:
+            blob_is_reg = False
+        except OSError:
+            blob_unsafe = True
+    if isinstance((ent := parsed["entries"].get(spool_id)), dict):
+        raw_st, ent_cr = str(ent.get("state") or "available"), ent.get("corrupt_reason")
+        if raw_st == "corrupt" or (raw_st == "available" and (blob_unsafe or not blob_is_reg)):
+            cur_st = "corrupt"
+            c_rsn: str | None = (
+                str(ent_cr) if isinstance(ent_cr, str) and ent_cr
+                else ("unsafe_path" if blob_unsafe else ("unexpectedly_missing" if not blob_is_reg else "corrupt"))
+            )
+        else:
+            cur_st, c_rsn = ("available" if raw_st == "available" else "unknown"), None
+        return {
+            **base, "spool_id": spool_id, "found": True, "current_state": cur_st, "corrupt_reason": c_rsn,
+            "created_at": _num_f(ent, "created_at"), "last_accessed_at": _num_f(ent, "last_accessed_at"),
+            "corrupted_at": _num_f(ent, "corrupted_at"), "total_bytes": _num_i(ent, "total_bytes"),
+            "total_lines": _num_i(ent, "total_lines"), "blob_present": blob_is_reg,
+            "workspace_id": str(ent.get("workspace_id") or ""), "session_id": str(ent.get("session_id") or ""),
+        }
+    if isinstance((tomb := parsed["tombstones"].get(spool_id)), dict):
+        t_st = str(tomb.get("state") or "evicted")
+        return {
+            **base, "spool_id": spool_id, "found": True, "blob_present": blob_is_reg,
+            "current_state": t_st if t_st in ("evicting", "evicted") else "evicted",
+            "eviction_reason": str(tomb.get("reason") or "ttl_expired"), "evicted_at": _num_f(tomb, "evicted_at"),
+            "total_bytes": _num_i(tomb, "total_bytes"),
+            "workspace_id": str(tomb.get("workspace_id") or ""), "session_id": str(tomb.get("session_id") or ""),
+        }
+    return base
+
+
+def inspect_spool_health_readonly(
+    eff_dir: Path, *, receipts_path: Path | None = None,
+    now_ts: float | None = None, ttl_seconds: float = 86_400.0,
+) -> dict[str, Any]:
+    """Pure read-only spool health summary for `cg_status --doctor` (no locks/writes/warnings)."""
+    rcpt_summary = summarize_receipts(receipts_path or receipts_path_for(eff_dir), now_ts=now_ts)
+    verified, rel_fail = int(rcpt_summary["delivery_verified_count"]), int(rcpt_summary["integrity_failures"])
+    if not eff_dir.is_dir() or check_unsafe_link(eff_dir):
+        return {
+            "spool_dir_exists": False, "entry_count": 0, "total_bytes": 0, "expired_count": 0,
+            "orphan_count": 0, "eviction_count": 0, "receipts": rcpt_summary,
+            "delivery_verified": verified, "reliability_failures": rel_fail,
+            "summary_line": "0 entries, 0 B (dir absent)",
+        }
+    ts = float(now_ts) if now_ts is not None else time.time()
+    parsed, _ = read_spool_index_readonly(eff_dir / "spool_index.json")
+    entries, tombstones = (parsed["entries"], parsed["tombstones"]) if parsed else ({}, {})
+    avail = [e for e in entries.values() if e.get("state", "available") == "available"]
+    total_b = sum(_num_i(e, "total_bytes") for e in avail)
+    expired = sum(1 for e in avail if (ts - float(e.get("last_accessed_at", e.get("created_at", 0.0)))) > ttl_seconds)
+    evicted = len(tombstones)
+    try:
+        orphans = sum(
+            1 for item in eff_dir.iterdir()
+            if (m := _BLOB_NAME_RE.fullmatch(item.name)) and m.group(1) not in entries
+            and not check_unsafe_link(item) and item.is_file()
+        )
+    except OSError:
+        orphans = 0
+    summary_line = (
+        f"{len(avail)} entries, {total_b} B ({expired} expired, {orphans} orphans, "
+        f"{evicted} evicted, {verified} verified, {rel_fail} integrity failures)"
+    )
+    return {
+        "spool_dir_exists": True, "entry_count": len(avail), "total_bytes": total_b, "expired_count": expired,
+        "orphan_count": orphans, "eviction_count": evicted, "receipts": rcpt_summary,
+        "delivery_verified": verified, "reliability_failures": rel_fail, "summary_line": summary_line,
+    }

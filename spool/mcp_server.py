@@ -5,13 +5,12 @@ from __future__ import annotations
 from collections import deque
 import json
 import os
-import sys
-import tempfile
 from pathlib import Path
+import sys
 from typing import Any, BinaryIO, Mapping, Sequence
 
-from hooks import state_store
-from spool.receipts import VALID_SPOOL_ISOLATIONS, check_unsafe_link, read_spool_isolation_config
+from core.platform_io import check_unsafe_link, read_plugin_version, write_json_atomic
+from spool.receipts import VALID_SPOOL_ISOLATIONS, read_spool_isolation_config
 from spool.store import grep_spool, list_spools, resolve_spool_dir, slice_spool
 
 _SERVER_NAME = "context-guard-spool"
@@ -55,16 +54,6 @@ _TOOL_SCHEMAS: list[dict[str, Any]] = [
 ]
 
 SPOOL_MCP_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = tuple(_TOOL_SCHEMAS)
-
-def _load_plugin_version(plugin_root: Path | None = None) -> str:
-    root = Path(plugin_root) if plugin_root is not None else state_store.resolve_plugin_root()
-    try:
-        data = json.loads((root / "plugin.json").read_text(encoding="utf-8"))
-        if isinstance(data, Mapping) and isinstance(data.get("version"), str) and data["version"].strip():
-            return data["version"].strip()
-    except (OSError, ValueError, TypeError):
-        pass
-    return "0.0.0"
 
 def _read_exact(stream: BinaryIO, count: int) -> bytes:
     chunks, remaining = [], count
@@ -176,7 +165,8 @@ def serve_stdio(
     """Serve JSON-RPC 2.0 MCP spool tools over stdio with server-side workspace isolation."""
     in_stream: BinaryIO = stdin if stdin is not None else sys.stdin.buffer
     out_stream: BinaryIO = stdout if stdout is not None else sys.stdout.buffer
-    eff_dir, version = (spool_dir if spool_dir is not None else resolve_spool_dir()), _load_plugin_version(plugin_root)
+    eff_dir = spool_dir if spool_dir is not None else resolve_spool_dir()
+    version = read_plugin_version(plugin_root, default="0.0.0")
     static_ws = workspace_root if workspace_root is not None else os.environ.get("CONTEXT_GUARD_WORKSPACE_ROOT")
     eff_sess = session_id if session_id is not None else os.environ.get("CONTEXT_GUARD_SESSION_ID")
 
@@ -270,20 +260,6 @@ def serve_stdio(
             continue
         _process_msg(framing, msg)
 
-def _write_json_atomic(path: Path, data: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2)
-            fh.write("\n")
-        if os.name != "nt":
-            os.chmod(tmp_path, 0o600)
-        os.replace(tmp_path, str(path))
-    except OSError:
-        Path(tmp_path).unlink(missing_ok=True)
-        raise
-
 def is_cursor_spool_mcp_configured(mcp_path: Path) -> bool:
     """Return True when Cursor `mcp.json` configures `context-guard-spool` with `--workspace` or `--workspace-root`."""
     target = Path(mcp_path).expanduser()
@@ -325,7 +301,7 @@ def sync_cursor_spool_mcp(
         if not dry_run:
             if journal is not None:
                 journal.record_file_backup(target)
-            _write_json_atomic(target, {"mcpServers": {_SERVER_NAME: desired}})
+            write_json_atomic(target, {"mcpServers": {_SERVER_NAME: desired}}, prefix=f".{target.name}.")
         return "created"
     raw = json.loads(target.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
@@ -337,7 +313,11 @@ def sync_cursor_spool_mcp(
         if not dry_run:
             if journal is not None:
                 journal.record_file_backup(target)
-            _write_json_atomic(target, {**raw, "mcpServers": {k: v for k, v in servers.items() if k != _SERVER_NAME}})
+            write_json_atomic(
+                target,
+                {**raw, "mcpServers": {k: v for k, v in servers.items() if k != _SERVER_NAME}},
+                prefix=f".{target.name}.",
+            )
         return "removed"
     if servers is not None and not isinstance(servers, Mapping):
         raise ValueError(f"Expected 'mcpServers' object in {target}")
@@ -348,5 +328,5 @@ def sync_cursor_spool_mcp(
     if not dry_run:
         if journal is not None:
             journal.record_file_backup(target)
-        _write_json_atomic(target, {**raw, "mcpServers": servers_map})
+        write_json_atomic(target, {**raw, "mcpServers": servers_map}, prefix=f".{target.name}.")
     return "updated"

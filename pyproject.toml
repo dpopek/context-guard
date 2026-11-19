@@ -4,7 +4,7 @@ pythonpath = ["."]
 
 [tool.mypy]
 python_version = "3.9"
-files = ["spool", "evidence", "hooks", "bin", "policies", "integrations"]
+files = ["core", "policies", "spool", "integrations", "hooks", "services", "evidence", "bin"]
 warn_unused_configs = true
 check_untyped_defs = true
 no_implicit_optional = true
@@ -18,7 +18,7 @@ follow_imports = "skip"
 [tool.ruff]
 target-version = "py39"
 line-length = 110
-src = ["spool", "evidence", "hooks", "bin", "policies", "integrations", "tests"]
+src = ["core", "policies", "spool", "integrations", "hooks", "services", "evidence", "bin", "tests"]
 
 [tool.ruff.lint]
 select = ["E9", "F63", "F7", "F82"]

@@ -1,4 +1,4 @@
-"""Modules in hooks/, bin/, policies/, integrations/, spool/, and evidence/ talk to each other through public names only."""
+"""Modules in core/, policies/, spool/, integrations/, hooks/, services/, evidence/, and bin/ talk through public names only."""
 from __future__ import annotations
 
 import ast
@@ -10,7 +10,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 _OPERATOR_HOME = Path.home()
-_PROD_PACKAGES = ("hooks", "bin", "policies", "integrations", "spool", "evidence")
+_PROD_PACKAGES = ("core", "policies", "spool", "integrations", "hooks", "services", "evidence", "bin")
 GENERIC_REPO_BASENAMES: frozenset[str] = frozenset({
     "project", "backend", "frontend", "production", "stage", "test", "upgradetest",
     "maintenance", "image", "docker", "native", "meta", "charts", "ci-cd",
@@ -246,7 +246,7 @@ MAX_JS_FILE_LOC = 500
 
 
 def test_production_module_loc_ceilings() -> None:
-    """Every production Python module in hooks/, bin/, policies/, integrations/, and spool/ must stay <= 800 LOC."""
+    """Every production Python module across all 8 production packages must stay <= 800 LOC."""
     violations: list[str] = []
     for folder in _PROD_PACKAGES:
         for path in sorted((ROOT / folder).glob("*.py")):
@@ -436,7 +436,7 @@ def test_outline_loc_ceiling_and_zero_hardcoded_user_paths() -> None:
     )
 
     dynamic_terms = _load_operator_private_terms()
-    for folder in ("bin", "hooks", "policies", "integrations", "spool", "evidence", "rules", "skills", "tests", "vscode-extension"):
+    for folder in (*_PROD_PACKAGES, "rules", "skills", "tests", "vscode-extension"):
         is_tests = folder == "tests"
         for src_file in sorted((ROOT / folder).rglob("*")):
             if not src_file.is_file() or src_file.suffix not in (".py", ".md", ".json", ".js"):
@@ -660,3 +660,105 @@ def test_python39_runtime_ast_compatibility_and_no_bare_except() -> None:
                         f"{rel}:{node.lineno} {node.func.id}(..., A | B) fails at runtime on Python 3.9; use a tuple (A, B)"
                     )
     assert violations == [], f"Python 3.9 runtime / bare-except violations: {violations}"
+
+
+_ALLOWED_LAYER_DEPS: dict[str, frozenset[str]] = {
+    "core": frozenset(),
+    "policies": frozenset({"core"}),
+    "spool": frozenset({"core", "policies"}),
+    "integrations": frozenset({"core"}),
+    "hooks": frozenset({"core", "policies", "spool", "integrations"}),
+    "services": frozenset({"core", "policies", "spool", "integrations", "hooks"}),
+    "evidence": frozenset({"core", "policies", "spool", "integrations", "hooks", "services"}),
+    "bin": frozenset({"core", "policies", "spool", "integrations", "hooks", "services", "evidence"}),
+}
+
+
+def _scan_package_import_edges(src: str, pkg: str, rel: str) -> list[tuple[str, str]]:
+    tree = ast.parse(src, filename=rel)
+    edges: list[tuple[str, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                target = alias.name.split(".")[0]
+                if target in _PROD_PACKAGES and target != pkg:
+                    edges.append((target, f"{rel}:{node.lineno} import {alias.name}"))
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0:
+                target = (node.module or "").split(".")[0]
+                if target in _PROD_PACKAGES and target != pkg:
+                    edges.append((target, f"{rel}:{node.lineno} from {node.module}"))
+            elif node.level >= 2:
+                if node.module:
+                    target = node.module.split(".")[0]
+                    if target in _PROD_PACKAGES and target != pkg:
+                        edges.append((target, f"{rel}:{node.lineno} from {'.' * node.level}{node.module}"))
+                else:
+                    for alias in node.names:
+                        target = alias.name.split(".")[0]
+                        if target in _PROD_PACKAGES and target != pkg:
+                            edges.append((target, f"{rel}:{node.lineno} from {'.' * node.level} import {alias.name}"))
+    return edges
+
+
+def test_zero_package_level_import_cycles_and_strict_layer_dag() -> None:
+    """Enforce zero package-level cycles (including lazy imports) and strict 8-layer DAG edges."""
+    pkg_graph: dict[str, set[str]] = {pkg: set() for pkg in _PROD_PACKAGES}
+    violations: list[str] = []
+    for pkg in _PROD_PACKAGES:
+        allowed = _ALLOWED_LAYER_DEPS[pkg]
+        for path in sorted((ROOT / pkg).glob("*.py")):
+            rel = path.relative_to(ROOT).as_posix()
+            for target_pkg, detail in _scan_package_import_edges(path.read_text(encoding="utf-8"), pkg, rel):
+                pkg_graph[pkg].add(target_pkg)
+                if target_pkg not in allowed:
+                    violations.append(f"{detail} (disallowed {pkg} -> {target_pkg})")
+    sccs = _tarjan_cyclic_sccs(pkg_graph)
+    assert sccs == [], f"Package-level import cycles detected: {sccs}"
+    assert violations == [], f"Layer DAG violations detected: {violations}"
+    assert _scan_package_import_edges("def f():\n    from bin import cg\n", "core", "core/x.py") == [
+        ("bin", "core/x.py:2 from bin")
+    ]
+
+
+def _find_prod_asserts(src: str, rel: str) -> list[str]:
+    tree = ast.parse(src, filename=rel)
+    return [f"{rel}:{node.lineno}" for node in ast.walk(tree) if isinstance(node, ast.Assert)]
+
+
+def test_zero_assert_statements_in_production_packages() -> None:
+    """Zero ast.Assert statements allowed across all 8 production packages."""
+    offenders = [
+        hit
+        for pkg in _PROD_PACKAGES
+        for path in sorted((ROOT / pkg).glob("*.py"))
+        for hit in _find_prod_asserts(path.read_text(encoding="utf-8"), path.relative_to(ROOT).as_posix())
+    ]
+    assert offenders == [], f"Production assert statements are forbidden: {offenders}"
+    assert _find_prod_asserts("def f(x):\n    assert x > 0\n", "core/x.py") == ["core/x.py:2"]
+
+
+def _find_identity_reexports(src: str, rel: str) -> list[str]:
+    tree = ast.parse(src, filename=rel)
+    hits: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.asname is not None and alias.asname == alias.name:
+                    hits.append(f"{rel}:{node.lineno} {alias.name} as {alias.asname}")
+    return hits
+
+
+def test_zero_identity_reexport_facades_in_production_packages() -> None:
+    """Zero identity re-export facades (from x import Y as Y / import x as x) in production packages."""
+    offenders = [
+        hit
+        for pkg in _PROD_PACKAGES
+        for path in sorted((ROOT / pkg).glob("*.py"))
+        for hit in _find_identity_reexports(path.read_text(encoding="utf-8"), path.relative_to(ROOT).as_posix())
+    ]
+    assert offenders == [], f"Identity re-export facades are forbidden: {offenders}"
+    assert _find_identity_reexports("from core.scrub import scrub_string as scrub_string\nimport os as os\n", "bin/x.py") == [
+        "bin/x.py:1 scrub_string as scrub_string",
+        "bin/x.py:2 os as os",
+    ]

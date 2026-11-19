@@ -1,13 +1,12 @@
-#!/usr/bin/env python3
 """Claude Code session preamble split per component and per plugin or MCP server, read from transcript attachments."""
 
 from __future__ import annotations
 
+from datetime import date, timedelta
 import hashlib
 import json
 from pathlib import Path
 import re
-from datetime import date, timedelta
 from typing import Any, Callable
 
 COMPONENTS = (

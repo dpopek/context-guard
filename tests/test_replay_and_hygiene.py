@@ -7,8 +7,9 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from bin import cg_status, outcomes_report, replay_benchmark
-from hooks import config
+from bin import cg_status
+from services import outcomes_report, replay_benchmark, status_service
+from hooks import config, drift_probe
 from spool import store as spool_store
 
 
@@ -43,7 +44,7 @@ def test_replay_covers_multi_harness_modes_pass2_and_outcomes_v4(capsys: Any) ->
         "by_key": {"claude|opus|output_spool": {"total": 2, "recovery": {}, "regret": {}}},
     })
     assert "output_spool" in rendered_out and "0 (0%)" in rendered_out
-    md_stats = cg_status.render_markdown_report(
+    md_stats = status_service.render_markdown_report(
         {"saved_bytes": 4000, "saved_tokens": 1000, "events": {"outputs_spooled": 3}, "by_harness": {}}
     )
     assert "outputs_spooled" in md_stats and "| 3 |" in md_stats
@@ -231,8 +232,8 @@ def test_doctor_security_drift_rendering_and_resilience(monkeypatch: Any, tmp_pa
             "remediation": "re-run install_harnesses.py",
         }
 
-    monkeypatch.setattr(config, "inspect_native_security_drift", _fake_drift, raising=False)
-    report = cg_status.run_doctor(
+    monkeypatch.setattr(drift_probe, "inspect_native_security_drift", _fake_drift, raising=False)
+    report = status_service.run_doctor(
         plugin_root=tmp_path,
         claude_settings_path=tmp_path / "claude.json",
         cursor_hooks_path=tmp_path / "cursor.json",
@@ -240,7 +241,7 @@ def test_doctor_security_drift_rendering_and_resilience(monkeypatch: Any, tmp_pa
     )
     assert "security_drift" in report
     assert report["security_drift"]["drift_codes"] == ["NATIVE_FAIL_CLOSED_DRIFT"]
-    md = cg_status.render_doctor_report(report)
+    md = status_service.render_doctor_report(report)
     assert "Native security sync" in md
     assert "NATIVE_FAIL_CLOSED_DRIFT" in md
     assert "degraded Claude < 2.1.295" in md
@@ -249,14 +250,14 @@ def test_doctor_security_drift_rendering_and_resilience(monkeypatch: Any, tmp_pa
     def _timeout_drift(**_kwargs: Any) -> dict[str, Any]:
         raise subprocess.TimeoutExpired(["claude"], 2)
 
-    monkeypatch.setattr(config, "inspect_native_security_drift", _timeout_drift, raising=False)
-    resilient = cg_status.run_doctor(plugin_root=tmp_path)
+    monkeypatch.setattr(drift_probe, "inspect_native_security_drift", _timeout_drift, raising=False)
+    resilient = status_service.run_doctor(plugin_root=tmp_path)
     assert "security_drift" in resilient
     assert "error" in resilient["security_drift"]
 
 
 def test_doctor_reports_spool_health_and_hook_mismatch(monkeypatch: Any, tmp_path: Path) -> None:
-    from bin.harness_status import CLAUDE_POST_SPOOL_MATCHER, CLAUDE_POST_SYNC_MATCHER
+    from services.harness_status import CLAUDE_POST_SPOOL_MATCHER, CLAUDE_POST_SYNC_MATCHER
 
     plugin_root = tmp_path / "plugin"
     (plugin_root / "hooks").mkdir(parents=True)
@@ -273,7 +274,7 @@ def test_doctor_reports_spool_health_and_hook_mismatch(monkeypatch: Any, tmp_pat
     config.clear_config_cache()
 
     spool_dir = tmp_path / "spool"
-    spool_store.build_post_tool_spool_response(
+    spool_store.spool_post_tool_output(
         "claude", {"tool_name": "Bash", "tool_input": {"command": "pytest"}, "tool_response": {"stdout": "\n".join(f"line {i}: " + ("x" * 70) for i in range(240))}, "cwd": str(tmp_path)},
         mode="active", session_id="s-doc", call_id="c-1", spool_dir=spool_dir,
     )
@@ -282,7 +283,7 @@ def test_doctor_reports_spool_health_and_hook_mismatch(monkeypatch: Any, tmp_pat
 
     claude_cfg = tmp_path / "claude.json"
     claude_cfg.write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "Read", "hooks": [{"type": "command", "command": f"python3 {pre_hook}"}]}]}}), encoding="utf-8")
-    report = cg_status.run_doctor(
+    report = status_service.run_doctor(
         plugin_root=plugin_root, claude_settings_path=claude_cfg,
         cursor_hooks_path=tmp_path / "cu.json", codex_hooks_path=tmp_path / "cx.json",
     )
@@ -290,7 +291,7 @@ def test_doctor_reports_spool_health_and_hook_mismatch(monkeypatch: Any, tmp_pat
     assert report["harness_details"]["claude"]["spool_hook_ok"] is False
     assert report["spool_health"]["entry_count"] == 1
     assert report["spool_health"]["orphan_count"] == 1
-    md = cg_status.render_doctor_report(report)
+    md = status_service.render_doctor_report(report)
     assert "spool post-hook mismatch" in md and "Output spool" in md and "WARN" in md
 
     claude_cfg.write_text(json.dumps({"hooks": {
@@ -300,7 +301,7 @@ def test_doctor_reports_spool_health_and_hook_mismatch(monkeypatch: Any, tmp_pat
             {"matcher": CLAUDE_POST_SPOOL_MATCHER, "hooks": [{"type": "command", "command": f"python3 {post_hook}", "timeout": 10}]},
         ],
     }}), encoding="utf-8")
-    ok_report = cg_status.run_doctor(
+    ok_report = status_service.run_doctor(
         plugin_root=plugin_root, claude_settings_path=claude_cfg,
         cursor_hooks_path=tmp_path / "cu.json", codex_hooks_path=tmp_path / "cx.json",
     )
@@ -327,14 +328,14 @@ def test_doctor_warns_on_reliability_failures_and_outcomes_receipt_scoping(
     cursor_mcp = tmp_path / "cursor_mcp.json"
     cursor_mcp.write_text(json.dumps({"mcpServers": {"context-guard-spool": {"command": "python3", "args": ["bin/cg_spool.py", "mcp"]}}}), encoding="utf-8")
 
-    doc = cg_status.run_doctor(
+    doc = status_service.run_doctor(
         plugin_root=tmp_path, claude_settings_path=tmp_path / "cl.json",
         cursor_hooks_path=tmp_path / "cu.json", codex_hooks_path=tmp_path / "cx.json",
         cursor_mcp_path=cursor_mcp,
     )
     assert doc["spool_health"]["reliability_failures"] == 1
     assert doc["harness_details"]["cursor"]["cursor_mcp_stale"] is True
-    md = cg_status.render_doctor_report(doc)
+    md = status_service.render_doctor_report(doc)
     assert "| Output spool | `WARN` |" in md
     assert "missing --workspace" in md
 

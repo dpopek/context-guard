@@ -8,7 +8,7 @@ from typing import Any, Iterator
 
 import pytest
 
-from bin import cg_status, install_harnesses, token_usage, usage_report
+from services import installer_service, status_service, token_usage, usage_report
 from hooks import config as hooks_config, model_identity, outcomes, telemetry
 
 _LIVE_OPERATOR_TARGETS = (
@@ -56,7 +56,7 @@ def isolated_user_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     cfg_path = home_dir / ".config" / "context-guard" / "config.json"
     monkeypatch.setenv("CONTEXT_GUARD_CONFIG_PATH", str(cfg_path))
     monkeypatch.setattr(hooks_config, "DEFAULT_USER_CONFIG_PATH", cfg_path)
-    monkeypatch.setattr(install_harnesses, "DEFAULT_CURSOR_MCP_PATH", home_dir / ".cursor" / "mcp.json", raising=False)
+    monkeypatch.setattr(installer_service, "DEFAULT_CURSOR_MCP_PATH", home_dir / ".cursor" / "mcp.json", raising=False)
     if "CONTEXT_GUARD_SPOOL_DIR" not in os.environ:
         monkeypatch.setenv("CONTEXT_GUARD_SPOOL_DIR", str(tmp_path / "default-telemetry" / "spool"))
     hooks_config.clear_config_cache()
@@ -85,7 +85,7 @@ def _isolate_telemetry_ledgers(
     if "CONTEXT_GUARD_SPOOL_DIR" not in os.environ:
         monkeypatch.setenv("CONTEXT_GUARD_SPOOL_DIR", str(tmp_path / "default-telemetry" / "spool"))
     monkeypatch.setattr(hooks_config, "DEFAULT_USER_CONFIG_PATH", isolated_home / ".config" / "context-guard" / "config.json")
-    monkeypatch.setattr(install_harnesses, "DEFAULT_CURSOR_MCP_PATH", isolated_home / ".cursor" / "mcp.json", raising=False)
+    monkeypatch.setattr(installer_service, "DEFAULT_CURSOR_MCP_PATH", isolated_home / ".cursor" / "mcp.json", raising=False)
     hooks_config.clear_config_cache()
     monkeypatch.setattr(telemetry, "DEFAULT_TELEMETRY_PATH", tmp_path / "default-telemetry" / "stats.json")
     monkeypatch.setattr(outcomes, "DEFAULT_OUTCOMES_PATH", tmp_path / "default-telemetry" / "outcomes.json")
@@ -115,8 +115,8 @@ def _isolate_token_usage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
 @pytest.fixture(autouse=True)
 def _isolate_update_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep the HUD from reading the checkout's update.json or starting a real release check."""
-    monkeypatch.setattr(cg_status, "DEFAULT_UPDATE_PATH", tmp_path / "default-telemetry" / "update.json")
-    monkeypatch.setattr(cg_status, "spawn_update_check", lambda: None)
+    monkeypatch.setattr(status_service, "DEFAULT_UPDATE_PATH", tmp_path / "default-telemetry" / "update.json")
+    monkeypatch.setattr(status_service, "spawn_update_check", lambda: None)
 
 
 @pytest.fixture(autouse=True)

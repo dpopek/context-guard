@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import os
 import re
-import shlex
-from typing import Iterator
 
-from hooks.file_io import normalize_cmd_basename
+from core.shell_lexer import (
+    first_pipeline_segment, first_statement, normalize_cmd_basename, split_leading_cd_prefix,
+    split_pipeline, split_shell_segments, strip_command_wrappers, tokenize_shell_segment, unquoted_text,
+)
 
-_LEADING_CD_PREFIX_RE = re.compile(r"^(\s*cd\s+(?:\"[^\"]+\"|'[^']+'|[^;&|<>`\n]+?)\s*(?:&&|;)\s*)(.+)$", re.DOTALL)
 _SHELL_CHAIN_OPERATORS = (";", "&&", "||", "|", "\n", "`", "$(")
 _SHELL_REDIRECTION_OPERATORS = (">", "<")
 _SKIP_REDIR_TOKENS = frozenset({">", ">>", "1>", "1>>", "2>", "2>>", "&>", "&>>", "<", "<<", "<<-", "<<<", "0<", "0<<", "0<<<"})
@@ -46,54 +46,11 @@ _GREP_BIN_RE = re.compile(r"^((?:[\w./-]+/)?grep)\s+(.+)$", re.DOTALL)
 _GREP_RECURSIVE_FLAG_RE = re.compile(r"(?:^|\s)(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)(?:\s|$)")
 _SHELL_READER_BINS = frozenset({"cat", "head", "tail", "sed", "awk", "less", "bat", "nl"})
 _UNBOUNDED_SHELL_DUMP_BINS = frozenset({"cat", "less", "bat", "nl"})
-
-
-def split_leading_cd_prefix(command: str) -> tuple[str, str]:
-    """Split a leading `cd <dir> && ...` or `cd <dir>; ...` prefix from the remainder."""
-    match = _LEADING_CD_PREFIX_RE.match(command)
-    return (match.group(1), match.group(2)) if match else ("", command)
+_RTK_UNBALANCED_RE = re.compile(r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:env\s+)?(?:[^\s;|&()\"']*/)?rtk(?:\.exe)?(?:\s|$)")
 
 
 def _split_tokens(text: str) -> list[str] | None:
-    if "\\" in text:
-        out: list[str] = []
-        has_drive, tok_len, quote, i, n = False, 0, "", 0, len(text)
-        while i < n:
-            ch = text[i]
-            if quote:
-                out.append(ch)
-                if ch == "\\" and quote == '"' and i + 1 < n:
-                    i += 1
-                    out.append(text[i])
-                elif ch == quote:
-                    quote = ""
-            elif ch in ("'", '"'):
-                quote = ch
-                out.append(ch)
-            elif ch.isspace() or ch in "|&;()<>=":
-                has_drive, tok_len = False, 0
-                out.append(ch)
-            elif ch == "\\" and i + 1 < n:
-                nxt = text[i + 1]
-                if nxt == "\\":
-                    out.append("\\\\\\\\" if os.name == "nt" and tok_len == 0 else "\\\\")
-                elif (has_drive or os.name == "nt") and not nxt.isspace() and nxt not in "\"'|&;<>()$`":
-                    out.append("\\\\" + nxt)
-                else:
-                    out.append("\\" + nxt)
-                tok_len += 1
-                i += 1
-            else:
-                if tok_len == 1 and ch == ":" and out[-1].isalpha():
-                    has_drive = True
-                tok_len += 1
-                out.append(ch)
-            i += 1
-        text = "".join(out)
-    try:
-        return shlex.split(text)
-    except ValueError:
-        return None
+    return tokenize_shell_segment(text, os_name=os.name)
 
 
 def _effective_cwd(cd_prefix: str, cwd: str | None) -> str | None:
@@ -107,53 +64,6 @@ def _effective_cwd(cd_prefix: str, cwd: str | None) -> str | None:
         return cwd
     target_dir = os.path.expanduser(raw_dir)
     return target_dir if (os.path.isabs(target_dir) or not cwd) else os.path.join(cwd, target_dir)
-
-
-def _iter_unquoted(text: str) -> Iterator[tuple[int, str]]:
-    quote, escaped = "", False
-    for idx, ch in enumerate(text):
-        if escaped:
-            escaped = False
-        elif ch == "\\" and quote != "'":
-            escaped = True
-        elif quote:
-            quote = "" if ch == quote else quote
-        elif ch in ("'", '"'):
-            quote = ch
-        else:
-            yield idx, ch
-
-
-def _unquoted_text(text: str) -> str:
-    return "".join(ch for _, ch in _iter_unquoted(text))
-
-
-def _first_statement(text: str) -> str:
-    n = len(text)
-    for idx, ch in _iter_unquoted(text):
-        if ch in (";", "\n") or (ch == "|" and idx + 1 < n and text[idx + 1] == "|"):
-            return text[:idx]
-        if ch == "&":
-            prev = text[idx - 1] if idx > 0 else ""
-            nxt = text[idx + 1] if idx + 1 < n else ""
-            if nxt == "&" or (prev not in (">", "<", "|") and nxt != ">"):
-                return text[:idx]
-    return text
-
-
-def _split_pipeline(statement: str) -> list[str]:
-    parts: list[str] = []
-    start = 0
-    for idx, ch in _iter_unquoted(statement):
-        if ch == "|":
-            parts.append(statement[start:idx])
-            start = idx + (2 if idx + 1 < len(statement) and statement[idx + 1] == "&" else 1)
-    parts.append(statement[start:])
-    return parts
-
-
-def _first_pipeline_segment(text: str) -> str:
-    return _split_pipeline(_first_statement(text))[0]
 
 
 def _resolve_shell_targets(tokens: list[str], eff_cwd: str | None) -> list[str]:
@@ -200,7 +110,7 @@ def _is_sed_in_place(args: list[str]) -> bool:
 def is_outline_pull(command_line: str) -> bool:
     """Return True iff single command asks the outline CLI (`cg-outline` / `outline.py`) for a file skeleton."""
     _, remainder = split_leading_cd_prefix(command_line)
-    if any(op in _unquoted_text(remainder) for op in _SHELL_CHAIN_OPERATORS + _SHELL_REDIRECTION_OPERATORS):
+    if any(op in unquoted_text(remainder) for op in _SHELL_CHAIN_OPERATORS + _SHELL_REDIRECTION_OPERATORS):
         return False
     return bool(_SHELL_OUTLINE_CMD_RE.match(remainder.strip()))
 
@@ -210,8 +120,7 @@ def extract_outline_pull_targets(command_line: str, cwd: str | None = None) -> l
     if not is_outline_pull(command_line):
         return []
     cd_prefix, remainder = split_leading_cd_prefix(command_line)
-    tokens = _split_tokens(remainder)
-    if not tokens:
+    if not (tokens := _split_tokens(remainder)):
         return []
     idx = next((i for i, t in enumerate(tokens) if normalize_cmd_basename(t) in ("outline.py", "cg-outline")), -1)
     return _resolve_shell_targets(tokens[idx + 1 :], _effective_cwd(cd_prefix, cwd)) if idx >= 0 else []
@@ -219,15 +128,14 @@ def extract_outline_pull_targets(command_line: str, cwd: str | None = None) -> l
 
 def is_unbounded_shell_dump(command_line: str) -> bool:
     """Return True iff the first pipeline segment invokes an unbounded shell file dumper."""
-    tokens = _split_tokens(_first_pipeline_segment(split_leading_cd_prefix(command_line)[1]))
+    tokens = _split_tokens(first_pipeline_segment(split_leading_cd_prefix(command_line)[1]))
     return bool(tokens and normalize_cmd_basename(tokens[0]) in _UNBOUNDED_SHELL_DUMP_BINS)
 
 
 def extract_shell_read_targets(command_line: str, cwd: str | None = None) -> list[str]:
     """Return deduplicated existing file targets read by the first pipeline segment."""
     cd_prefix, remainder = split_leading_cd_prefix(command_line)
-    tokens = _split_tokens(_first_pipeline_segment(remainder))
-    if not tokens:
+    if not (tokens := _split_tokens(first_pipeline_segment(remainder))):
         return []
     bin_name = normalize_cmd_basename(tokens[0])
     if bin_name not in _SHELL_READER_BINS or (bin_name == "sed" and _is_sed_in_place(tokens[1:])):
@@ -349,15 +257,16 @@ def is_bounded_shell_read(command_line: str, total_lines: int | None = None, max
     """Return True iff the first shell statement stays within `max_lines` of bounded output."""
     bound: int | None = None
     upstream_is_raw = True
-    for seg in _split_pipeline(_first_statement(split_leading_cd_prefix(command_line)[1])):
-        tokens = _split_tokens(seg)
-        if not tokens:
+    for seg in split_pipeline(first_statement(split_leading_cd_prefix(command_line)[1])):
+        if not (tokens := _split_tokens(seg)):
             return False
         cmd = normalize_cmd_basename(tokens[0])
         if cmd in ("cat", "nl", "bat"):
             continue
         eff_total = total_lines if upstream_is_raw else bound
-        stage = _head_tail_bound(cmd, tokens[1:], eff_total) if cmd in ("head", "tail") else (_sed_bound(tokens[1:], eff_total) if cmd == "sed" else None)
+        stage = _head_tail_bound(cmd, tokens[1:], eff_total) if cmd in ("head", "tail") else (
+            _sed_bound(tokens[1:], eff_total) if cmd == "sed" else None
+        )
         upstream_is_raw = False
         if cmd not in ("head", "tail", "sed"):
             bound = None
@@ -375,8 +284,7 @@ def _pytest_has_verbosity_flags(command: str) -> bool:
 
 
 def _grep_should_inject_file_excludes(args_str: str) -> bool:
-    tokens = _split_tokens(args_str)
-    if tokens is None:
+    if (tokens := _split_tokens(args_str)) is None:
         return False
     after_dd = False
     for tok in tokens:
@@ -393,7 +301,10 @@ def _grep_should_inject_file_excludes(args_str: str) -> bool:
 
 def _grep_targets_excluded_dir(args_str: str) -> bool:
     tokens = _split_tokens(args_str)
-    return True if tokens is None else any(_GREP_EXCLUDED_DIRS.intersection(t.replace("\\", "/").split("/")) for t in [t for t in tokens if not t.startswith("-")][1:])
+    return True if tokens is None else any(
+        _GREP_EXCLUDED_DIRS.intersection(t.replace("\\", "/").split("/"))
+        for t in [t for t in tokens if not t.startswith("-")][1:]
+    )
 
 
 def _has_double_dash_or_bad_quotes(command: str) -> bool:
@@ -405,20 +316,18 @@ def rewrite_quiet_cli_flags(command_line: str, *, enable_atlassian_twg: bool = F
     """Append output-trimming flags to single-statement test runners, bare git status, or recursive grep."""
     cd_prefix, remainder = split_leading_cd_prefix(command_line.strip())
     stripped = remainder.strip()
-    if any(op in _unquoted_text(stripped) for op in (*_SHELL_CHAIN_OPERATORS, "&", *_SHELL_REDIRECTION_OPERATORS)):
+    if any(op in unquoted_text(stripped) for op in (*_SHELL_CHAIN_OPERATORS, "&", *_SHELL_REDIRECTION_OPERATORS)):
         return None
     if enable_atlassian_twg and "twg" in stripped:
         from integrations.atlassian_twg import rewrite_twg_cli_command
 
-        twg_rewritten = rewrite_twg_cli_command(command_line)
-        if twg_rewritten is not None:
+        if (twg_rewritten := rewrite_twg_cli_command(command_line)) is not None:
             return twg_rewritten
     if any(op in stripped for op in ("\n", "`", "$(")):
         return None
-    grep_match = _GREP_BIN_RE.match(stripped)
-    if grep_match:
+    if (grep_match := _GREP_BIN_RE.match(stripped)):
         raw_args = grep_match.group(2)
-        unquoted_args = f" {_unquoted_text(raw_args)} "
+        unquoted_args = f" {unquoted_text(raw_args)} "
         if _GREP_RECURSIVE_FLAG_RE.search(unquoted_args) and "--exclude-dir" not in unquoted_args and not _grep_targets_excluded_dir(raw_args):
             extra = f" {_GREP_FILE_EXCLUDE_FLAGS}" if _grep_should_inject_file_excludes(raw_args) else ""
             return f"{cd_prefix}{grep_match.group(1)} {_GREP_CACHE_EXCLUDE_FLAGS}{extra} {raw_args}"
@@ -437,41 +346,12 @@ def command_uses_rtk(command_line: str) -> bool:
     """Return True if any shell segment in `command_line` invokes `rtk` (incl. env/path prefixes)."""
     if not isinstance(command_line, str) or not command_line.strip():
         return False
-    segs: list[str] = []
-    start = 0
-    for idx, ch in _iter_unquoted(command_line):
-        if ch in ";\n|&()":
-            segs.append(command_line[start:idx])
-            start = idx + 1
-    segs.append(command_line[start:])
-    for seg in segs:
-        if not seg.strip():
-            continue
-        toks = _split_tokens(seg)
-        if toks is None:
-            if re.match(r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:env\s+)?(?:[^\s;|&()\"']*/)?rtk(?:\.exe)?(?:\s|$)", seg):
+    for seg in split_shell_segments(command_line, include_subshells=True):
+        if (toks := _split_tokens(seg)) is None:
+            if _RTK_UNBALANCED_RE.match(seg):
                 return True
             continue
-        i = 0
-        while i < len(toks):
-            tok = toks[i]
-            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
-                i += 1
-                continue
-            if tok in ("env", "command", "exec", "nohup", "time", "builtin") and not (
-                tok == "command" and i + 1 < len(toks) and toks[i + 1] in ("-v", "-V")
-            ):
-                i += 1
-                while i < len(toks) and toks[i].startswith("-") and toks[i] != "--":
-                    i += 1
-                continue
-            if normalize_cmd_basename(tok) == "rtk":
-                return True
-            break
+        stripped = strip_command_wrappers(toks)
+        if stripped and normalize_cmd_basename(stripped[0]) == "rtk":
+            return True
     return False
-
-
-__all__ = [
-    "command_uses_rtk", "extract_outline_pull_targets", "extract_shell_read_targets", "is_bounded_shell_read",
-    "is_outline_pull", "is_unbounded_shell_dump", "rewrite_quiet_cli_flags", "split_leading_cd_prefix",
-]

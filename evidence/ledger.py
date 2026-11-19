@@ -5,15 +5,18 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
-import hashlib, json, os, re, stat, tempfile
+import hashlib, json, os, stat, tempfile
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
-from hooks import file_io, harness_adapter, outcomes, post_tool_use, state_store
+from core.platform_io import read_plugin_version, utc_now_iso_z
+from core.scrub import scrub_home_paths, scrub_value
+from hooks import config as hooks_config, file_io, harness_adapter, outcomes, post_tool_use, state_store
+from policies import governor as policies_governor
 from policies.api import (
-    ADAPTER_CONTRACT_VERSION, CapabilityAttestationKey, CapabilityRequirementV1,
-    EvidenceEnvironmentMetadataV1, HARNESS_OUTPUT_CAPABILITIES, RECEIPT_SCHEMA_VERSION,
-    VALID_CAPABILITY_EVIDENCE_LEVELS, VALID_TURN_CORRELATIONS,
+    ADAPTER_CONTRACT_VERSION, CapabilityAttestationKey, CapabilityRequirementV1, CircuitBreakerStateV1,
+    EvidenceEnvironmentMetadataV1, GOVERNOR_SCHEMA_VERSION, HARNESS_OUTPUT_CAPABILITIES,
+    NON_TRIPPING_SIGNALS, RECEIPT_SCHEMA_VERSION, VALID_CAPABILITY_EVIDENCE_LEVELS, VALID_TURN_CORRELATIONS,
 )
 from spool import receipts as spool_receipts
 
@@ -25,49 +28,14 @@ REQUIRED_EVIDENCE_CAPABILITIES: tuple[str, ...] = (
 )
 
 _O_FLAGS = getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-_POSIX_HOME_RE = re.compile(r"(?<![A-Za-z0-9_])/(?:Users|home)/[A-Za-z0-9._-]+")
-_WIN_HOME_RE = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z]:(?:[/\\]|\\\\)Users(?:[/\\]|\\\\)[A-Za-z0-9._-]+", re.I)
-_PATH_SCRUB_KEYS = frozenset({
-    "config_path", "repo_map_path", "workspace_root", "transcript_path", "state_dir", "home_dir",
-    "stats_path", "outcomes_path", "usage_path", "update_path", "shadow_path", "spool_dir", "receipts_path", "cwd",
-})
 _CAPABILITY_RANK = {level: idx for idx, level in enumerate(VALID_CAPABILITY_EVIDENCE_LEVELS)}
 
 __all__ = [
     "DEFAULT_EVENT_LEDGER_FILENAME", "EVENT_LEDGER_SCHEMA_VERSION", "REQUIRED_EVIDENCE_CAPABILITIES",
     "append_durable_events", "build_capability_attestation_key", "collect_environment_metadata",
     "compute_hook_config_fingerprint", "derive_outcomes_from_ledger", "ingest_context_receipts",
-    "resolve_capability_requirement", "run_cursor_cli_conformance",
+    "resolve_capability_requirement", "run_cursor_cli_conformance", "run_governor_release_gates",
 ]
-
-
-def _utc_now_iso_z() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _scrub_home_paths(text: str) -> str:
-    cleaned = text
-    try:
-        home_p = Path.home()
-        for cand in (str(home_p), str(home_p.resolve())):
-            if cand and cand not in ("/", "\\"):
-                cleaned = cleaned.replace(cand, "[redacted-path]")
-    except (RuntimeError, OSError):
-        pass
-    return _WIN_HOME_RE.sub("[redacted-path]", _POSIX_HOME_RE.sub("[redacted-path]", cleaned))
-
-
-def _scrub_value(val: Any) -> Any:
-    if isinstance(val, Mapping):
-        return {
-            ks: _scrub_value(val[k]) for k in sorted(val, key=str)
-            if (ks := str(k)).lower() not in _PATH_SCRUB_KEYS and not ks.lower().endswith(("_path", "_paths", "_dir", "_dirs"))
-        }
-    if isinstance(val, (list, tuple)):
-        return [_scrub_value(item) for item in val]
-    if isinstance(val, str):
-        return _scrub_home_paths(val)
-    return val if isinstance(val, (bool, int, float)) or val is None else _scrub_home_paths(str(val))
 
 
 def _lock_path_for(ledger_path: Path) -> Path:
@@ -188,13 +156,13 @@ def _is_nonempty_baseline(raw: Any) -> bool:
 def _normalize_baseline(raw: Mapping[str, Any] | None) -> dict[str, Any] | None:
     if raw is None or not _is_nonempty_baseline(raw):
         return None
-    scrubbed = _scrub_value(raw)
+    scrubbed = scrub_value(raw)
     return dict(scrubbed) if isinstance(scrubbed, Mapping) and _is_nonempty_baseline(scrubbed) else None
 
 
 def _empty_ledger_doc() -> dict[str, Any]:
     return {
-        "schema_version": EVENT_LEDGER_SCHEMA_VERSION, "updated_at": _utc_now_iso_z(),
+        "schema_version": EVENT_LEDGER_SCHEMA_VERSION, "updated_at": utc_now_iso_z(),
         "events": [], "seen_event_ids": [], "migrated_outcomes_baseline": None, "corrupt_source_lines": 0,
     }
 
@@ -305,7 +273,7 @@ def _write_ledger_events(
         if (not existed_on_disk) or appended > 0 or (norm_base is not None and norm_base != doc.get("migrated_outcomes_baseline")) or new_corrupt != prev_corrupt:
             if norm_base is not None:
                 doc["migrated_outcomes_baseline"] = norm_base
-            doc["corrupt_source_lines"], doc["updated_at"] = new_corrupt, _utc_now_iso_z()
+            doc["corrupt_source_lines"], doc["updated_at"] = new_corrupt, utc_now_iso_z()
             spool_receipts.atomic_write_bytes(ledger_path, (json.dumps(doc, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8"))
         derived = _derive_from_doc(doc)
         return {
@@ -396,20 +364,24 @@ def compute_hook_config_fingerprint(
     """Compute canonical sha256:<64hex> fingerprint of Context-Guard config and scrubbed hook registration."""
     rt_out: dict[str, Any] = {}
     if isinstance(runtime_cfg, Mapping):
-        base = _scrub_value({k: v for k, v in runtime_cfg.items() if k != "policy_packs"})
+        base = scrub_value({k: v for k, v in runtime_cfg.items() if k != "policy_packs"})
         if isinstance(base, Mapping):
             rt_out.update(base)
         packs = [
             {
                 "id": str(e.get("id") or ""), "enabled": bool(e.get("enabled", True)), "kind": str(e.get("kind") or "security"),
                 "scopes": list(e.get("scopes") or ()), "tree_sha256": str(e.get("tree_sha256") or ""),
-                "settings": _scrub_value(e.get("settings")) if isinstance(e.get("settings"), Mapping) else {},
+                "settings": scrub_value(e.get("settings")) if isinstance(e.get("settings"), Mapping) else {},
             }
             for e in (runtime_cfg.get("policy_packs") or ()) if isinstance(e, Mapping)
         ]
         if packs:
             rt_out["policy_packs"] = sorted(packs, key=lambda item: item["id"])
-    canonical = {"harness_id": str(harness_id or "").strip().lower() or "unknown", "runtime_cfg": rt_out, "hook_payload": _scrub_value(hook_payload) if isinstance(hook_payload, Mapping) else {}}
+    canonical = {
+        "harness_id": str(harness_id or "").strip().lower() or "unknown",
+        "runtime_cfg": rt_out,
+        "hook_payload": scrub_value(hook_payload) if isinstance(hook_payload, Mapping) else {},
+    }
     return "sha256:" + hashlib.sha256(json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
 
 
@@ -419,8 +391,8 @@ def build_capability_attestation_key(
 ) -> CapabilityAttestationKey:
     """Construct CapabilityAttestationKey without implying runtime verification."""
     return CapabilityAttestationKey(
-        harness_id=_scrub_home_paths(str(harness_id or "").strip()) or "unknown",
-        harness_build_id=_scrub_home_paths(str(harness_build_id or "").strip()) or "unavailable",
+        harness_id=scrub_home_paths(str(harness_id or "").strip()) or "unknown",
+        harness_build_id=scrub_home_paths(str(harness_build_id or "").strip()) or "unavailable",
         adapter_version=str(adapter_version or "").strip() or ADAPTER_CONTRACT_VERSION,
         hook_config_fingerprint=str(hook_config_fingerprint or "").strip(),
         capability_id=str(capability_id or "").strip(),
@@ -428,13 +400,14 @@ def build_capability_attestation_key(
 
 
 def _static_capability_ceiling(harness_id: str, capability_id: str) -> str:
-    caps = HARNESS_OUTPUT_CAPABILITIES.get(harness_id)
+    clean_harness = str(harness_id or "").strip().lower()
+    caps = HARNESS_OUTPUT_CAPABILITIES.get(clean_harness)
     if caps is None:
         return "unsupported"
     flags = {
         "pre_tool_interception": True, "output_replacement": caps.can_replace_tool_output,
         "native_fail_closed": caps.has_native_fail_closed_hook, "content_verified_reads": caps.supports_content_verified_reads,
-        "prompt_cache_telemetry": harness_id != "cursor",
+        "prompt_cache_telemetry": clean_harness != "cursor",
     }
     return "harness_exposed" if flags.get(capability_id, False) else "unsupported"
 
@@ -447,9 +420,22 @@ def resolve_capability_requirement(
     has_evidence = isinstance(verification_evidence, str) and bool(verification_evidence.strip())
     eff_claim = claimed_level if claimed_level in _CAPABILITY_RANK else "unsupported"
     ceiling = _static_capability_ceiling(key.harness_id, key.capability_id)
+    if ceiling == "unsupported":
+        source = (
+            scrub_home_paths(verification_evidence.strip())
+            if (eff_claim != "runtime_verified" and has_evidence and verification_evidence is not None)
+            else f"static_contract:{key.harness_id}:unsupported"
+        )
+        return CapabilityRequirementV1(
+            capability_id=key.capability_id,
+            evidence_level="unsupported",
+            attestation_key=asdict(key),
+            verification_source=source,
+            runtime_verified=False,
+        )
     if eff_claim == "runtime_verified" and bool(runtime_probe_passed) and has_evidence:
         evidence_level, runtime_verified = "runtime_verified", True
-        source = _scrub_home_paths(verification_evidence.strip()) if verification_evidence is not None else "runtime_probe"
+        source = scrub_home_paths(verification_evidence.strip()) if verification_evidence is not None else "runtime_probe"
     else:
         capped_claim = "harness_exposed" if eff_claim == "runtime_verified" else eff_claim
         evidence_level = VALID_CAPABILITY_EVIDENCE_LEVELS[min(_CAPABILITY_RANK[capped_claim], _CAPABILITY_RANK[ceiling])]
@@ -457,7 +443,7 @@ def resolve_capability_requirement(
         if eff_claim == "runtime_verified":
             source = f"downgraded_without_runtime_probe:{key.harness_id}:{evidence_level}"
         elif has_evidence and verification_evidence is not None:
-            source = _scrub_home_paths(verification_evidence.strip())
+            source = scrub_home_paths(verification_evidence.strip())
         else:
             source = f"static_contract:{key.harness_id}:{evidence_level}"
     return CapabilityRequirementV1(
@@ -466,29 +452,15 @@ def resolve_capability_requirement(
     )
 
 
-def _read_manifest_version(plugin_root: Path | None = None) -> str:
-    root = Path(plugin_root) if plugin_root is not None else state_store.resolve_plugin_root()
-    manifest = root / "plugin.json"
-    if plugin_root is None and not manifest.is_file():
-        manifest = Path(__file__).resolve().parent.parent / "plugin.json"
-    try:
-        data = json.loads(manifest.read_text(encoding="utf-8"))
-        if isinstance(data, Mapping) and isinstance(data.get("version"), str) and data["version"].strip():
-            return data["version"].strip()
-    except (OSError, ValueError, TypeError):
-        pass
-    return "unavailable"
-
-
 def collect_environment_metadata(
     harness_id: str, *, model_id: str, harness_build_id: str | None = None,
     runtime_cfg: Mapping[str, Any] | None = None, hook_payload: Mapping[str, Any] | None = None,
     runtime_verifications: Mapping[str, str] | None = None, plugin_root: Path | None = None,
 ) -> EvidenceEnvironmentMetadataV1:
     """Collect full EvidenceEnvironmentMetadataV1 with manifest context_guard_version and capability evidence."""
-    clean_harness = _scrub_home_paths(str(harness_id or "").strip().lower()) or "unknown"
-    clean_build = _scrub_home_paths(str(harness_build_id or "").strip()) or "unavailable"
-    clean_model = _scrub_home_paths(str(model_id or "").strip()) or "unknown"
+    clean_harness = scrub_home_paths(str(harness_id or "").strip().lower()) or "unknown"
+    clean_build = scrub_home_paths(str(harness_build_id or "").strip()) or "unavailable"
+    clean_model = scrub_home_paths(str(model_id or "").strip()) or "unknown"
     fingerprint = compute_hook_config_fingerprint(clean_harness, runtime_cfg=runtime_cfg, hook_payload=hook_payload)
     verifications = runtime_verifications if isinstance(runtime_verifications, Mapping) else {}
     reqs: list[CapabilityRequirementV1] = []
@@ -501,7 +473,7 @@ def collect_environment_metadata(
             reqs.append(resolve_capability_requirement(key, claimed_level="harness_exposed"))
     return EvidenceEnvironmentMetadataV1(
         harness_id=clean_harness, harness_build_id=clean_build, adapter_version=ADAPTER_CONTRACT_VERSION,
-        hook_config_fingerprint=fingerprint, context_guard_version=_read_manifest_version(plugin_root=plugin_root),
+        hook_config_fingerprint=fingerprint, context_guard_version=read_plugin_version(plugin_root=plugin_root),
         model_id=clean_model, attestation_key_implies_runtime_verified=False, required_capabilities=reqs,
     )
 
@@ -521,9 +493,18 @@ def _run_cursor_conformance_in_dir(root: Path) -> dict[str, Any]:
     sample_text = "\n".join(sample_lines) + "\n"
     sample_file.write_text(sample_text, encoding="utf-8")
     cfg_path.write_text("{}", encoding="utf-8")
-    norm_shell = harness_adapter.normalize_pre_tool_payload({"session_id": "cu-conf", "call_id": "cu-sh-1", "tool_name": "Shell", "tool_input": {"command": "pytest -q"}, "cwd": str(root)}, cli_harness="cursor")
-    norm_read = harness_adapter.normalize_pre_tool_payload({"session_id": "cu-conf", "call_id": "cu-rd-1", "tool_name": "Read", "tool_input": {"file_path": str(sample_file), "offset": 1, "limit": 3}, "cwd": str(root)}, cli_harness="cursor")
-    norm_mcp = harness_adapter.normalize_pre_tool_payload({"session_id": "cu-conf", "call_id": "cu-mcp-1", "tool_name": "MCP:acme_srv:list_items", "tool_input": {"limit": 10}, "cwd": str(root)}, cli_harness="cursor")
+    norm_shell = harness_adapter.normalize_pre_tool_payload(
+        {"session_id": "cu-conf", "call_id": "cu-sh-1", "tool_name": "Shell", "tool_input": {"command": "pytest -q"}, "cwd": str(root)},
+        cli_harness="cursor",
+    )
+    norm_read = harness_adapter.normalize_pre_tool_payload(
+        {"session_id": "cu-conf", "call_id": "cu-rd-1", "tool_name": "Read", "tool_input": {"file_path": str(sample_file), "offset": 1, "limit": 3}, "cwd": str(root)},
+        cli_harness="cursor",
+    )
+    norm_mcp = harness_adapter.normalize_pre_tool_payload(
+        {"session_id": "cu-conf", "call_id": "cu-mcp-1", "tool_name": "MCP:acme_srv:list_items", "tool_input": {"limit": 10}, "cwd": str(root)},
+        cli_harness="cursor",
+    )
     deny_out = harness_adapter.format_pre_tool_output({"decision": "deny", "reason": "conformance_block"}, norm_shell)
     deny_hso = deny_out.get("hookSpecificOutput") if isinstance(deny_out, Mapping) else None
     file_sha = file_io.compute_file_sha256(str(sample_file)) or ""
@@ -531,20 +512,45 @@ def _run_cursor_conformance_in_dir(root: Path) -> dict[str, Any]:
     canon_sample = os.path.realpath(str(sample_file))
     with state_store.locked_state(state_dir) as txn:
         txn.state.setdefault("files", {})[canon_sample] = {
-            "sha256": file_sha, "reads": [],
-            "pending_reads": {"cu-rd-1": {"exec_start": 1, "delivered_end": 3, "slice_bytes": len(sample_text.encode("utf-8")), "byte_offset": 0, "step": 1, "sha256": file_sha, "expected_norm_sha256": norm_sha, "is_trim": False, "synthetic_id": False}},
+            "sha256": file_sha,
+            "reads": [],
+            "pending_reads": {
+                "cu-rd-1": {
+                    "exec_start": 1, "delivered_end": 3, "slice_bytes": len(sample_text.encode("utf-8")),
+                    "byte_offset": 0, "step": 1, "sha256": file_sha, "expected_norm_sha256": norm_sha,
+                    "is_trim": False, "synthetic_id": False,
+                },
+            },
         }
         txn.dirty = True
     saved_env = {k: os.environ.get(k) for k in ("CONTEXT_GUARD_CONFIG_PATH", "CONTEXT_GUARD_SPOOL_DIR")}
     try:
         os.environ["CONTEXT_GUARD_CONFIG_PATH"], os.environ["CONTEXT_GUARD_SPOOL_DIR"] = str(cfg_path), str(spool_dir)
-        post_tool_use.handle_post_tool_use("cursor", {"session_id": "cu-conf", "call_id": "cu-rd-1", "tool_name": "Read", "tool_input": {"file_path": str(sample_file), "offset": 1, "limit": 3}, "tool_output": sample_text, "cwd": str(root)}, stats_path=root / "telemetry_stats.json", state_dir=state_dir)
+        hooks_config.clear_config_cache()
+        post_tool_use.handle_post_tool_use(
+            "cursor",
+            {
+                "session_id": "cu-conf", "call_id": "cu-rd-1", "tool_name": "Read",
+                "tool_input": {"file_path": str(sample_file), "offset": 1, "limit": 3},
+                "tool_output": sample_text, "cwd": str(root),
+            },
+            stats_path=root / "telemetry_stats.json",
+            state_dir=state_dir,
+        )
     finally:
         for k, v in saved_env.items():
-            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        hooks_config.clear_config_cache()
     confirmed_reads = ((state_store.read_state_snapshot(state_dir).get("files") or {}).get(canon_sample) or {}).get("reads") or []
     caps, runtime_caps = HARNESS_OUTPUT_CAPABILITIES.get("cursor"), harness_adapter.probe_runtime_capabilities("cursor")
-    fingerprint = compute_hook_config_fingerprint("cursor", runtime_cfg={}, hook_payload={"hooks": {"preToolUse": [{"command": "python3 hooks/pre_tool_use.py --harness cursor", "matcher": "Shell|Read", "failClosed": True}]}})
+    fingerprint = compute_hook_config_fingerprint(
+        "cursor",
+        runtime_cfg={},
+        hook_payload={"hooks": {"preToolUse": [{"command": "python3 hooks/pre_tool_use.py --harness cursor", "matcher": "Shell|Read", "failClosed": True}]}},
+    )
     checks = {
         "normalize_shell": norm_shell.harness == "cursor" and norm_shell.canonical_tool == "run_command",
         "normalize_read": norm_read.harness == "cursor" and norm_read.canonical_tool == "read_file",
@@ -574,3 +580,142 @@ def run_cursor_cli_conformance(work_dir: Path | None = None) -> dict[str, Any]:
         return _run_cursor_conformance_in_dir(Path(work_dir))
     with tempfile.TemporaryDirectory(prefix="cg_cursor_conf_") as td:
         return _run_cursor_conformance_in_dir(Path(td))
+
+
+def _run_builtin_release_gates() -> tuple[dict[str, bool], list[dict[str, Any]]]:
+    with tempfile.TemporaryDirectory(prefix="cg_gov_replay_") as td:
+        root = Path(td)
+        static_cfg: dict[str, Any] = {
+            "read_confirm_policy": "bounded", "policy_packs": [], "legacy_security_keys": (),
+            "optimizers": {"range_trim": "active", "auto_outline": "active", "cli_rewrites": "auto", "output_spool": "off"},
+        }
+        parity_out = policies_governor.apply_runtime_governor(static_cfg, "antigravity", state_dir=root / "empty", payload={"tool_name": "view_file"})
+        g_parity = parity_out == static_cfg and parity_out["optimizers"] == static_cfg["optimizers"]
+
+        d_prov = root / "prov"
+        c_prov = policies_governor.evaluate_capability_contract(
+            policies_governor.build_capability_attestation_key("claude", "dynamic_tool_mutation", hook_config_fingerprint="sha256:" + "0" * 64),
+            claimed_level="provider_supported", verification_evidence="provider_api:tool_search",
+        )
+        att_prov = policies_governor.attest_capability("claude", "dynamic_tool_mutation", verification_evidence="model_api:tools", state_dir=d_prov)
+        gov_prov = policies_governor.evaluate_governor("claude", runtime_cfg={"optimizers": {"dynamic_tool_mutation": "active", "output_spool": "active"}}, state_dir=d_prov)
+        g_provider = bool(
+            c_prov["provider_only_rejected"] and not c_prov["runtime_verified"]
+            and att_prov["provider_only_rejected"] and not att_prov["runtime_verified"]
+            and gov_prov["decisions"]["dynamic_tool_mutation"]["selected_mode"] != "active"
+        )
+
+        d_upg = root / "upg"
+        policies_governor.attest_capability("claude", "output_replacement", verification_evidence="client_spool_ok", harness_build_id="1.0.0", adapter_version="harness_adapter_v1", state_dir=d_upg)
+        ok_b1 = policies_governor.evaluate_governor("claude", harness_build_id="1.0.0", state_dir=d_upg)["capabilities"]["output_replacement"]["runtime_verified"]
+        inv_b2 = policies_governor.evaluate_governor("claude", harness_build_id="2.0.0", state_dir=d_upg)["capabilities"]["output_replacement"]
+        inv_ad = policies_governor.evaluate_governor("claude", harness_build_id="1.0.0", adapter_version="harness_adapter_v2", state_dir=d_upg)["capabilities"]["output_replacement"]
+        g_upgrade = bool(
+            ok_b1 and not inv_b2["runtime_verified"] and inv_b2["invalidated_reason"] == "build_changed"
+            and not inv_ad["runtime_verified"] and inv_ad["invalidated_reason"] == "adapter_changed"
+        )
+
+        d_cfg, cfg_a = root / "cfg", {"optimizers": {"output_spool": "active"}}
+        cfg_b = {"optimizers": {"output_spool": "active"}, "read_confirm_policy": "bounded"}
+        policies_governor.attest_capability("claude", "output_replacement", verification_evidence="client_spool_ok", runtime_cfg=cfg_a, state_dir=d_cfg)
+        inv_cfg = policies_governor.evaluate_governor("claude", runtime_cfg=cfg_b, state_dir=d_cfg)["capabilities"]["output_replacement"]
+        inv_unk = policies_governor.evaluate_governor("claude", runtime_cfg=cfg_a, state_dir=d_cfg, payload_known=False)
+        g_config = bool(
+            not inv_cfg["runtime_verified"] and inv_cfg["invalidated_reason"] == "config_fingerprint_changed"
+            and inv_unk["capabilities"]["output_replacement"]["invalidated_reason"] == "unknown_payload"
+            and inv_unk["decisions"]["output_spool"]["selected_mode"] == "passthrough"
+        )
+
+        d_brk = root / "brk"
+        soft_st: CircuitBreakerStateV1 | None = None
+        for sig in NON_TRIPPING_SIGNALS:
+            soft_st = policies_governor.record_governor_signal("output_spool", sig, state_dir=d_brk)
+        hard_st = policies_governor.record_governor_signal("output_spool", "integrity_mismatch", state_dir=d_brk)
+        g_breaker = bool(
+            soft_st is not None and soft_st["ignored_signals"] == len(NON_TRIPPING_SIGNALS) and not soft_st["tripped"]
+            and policies_governor.is_optimizer_tripped("output_spool", state_dir=d_brk) and hard_st["tripped"] and hard_st["state"] == "open"
+        )
+
+        bad_r = policies_governor.reset_circuit_breaker("output_spool", state_dir=d_brk)
+        empty_r = policies_governor.reset_circuit_breaker("output_spool", state_dir=d_brk, verification_passed=True, verification_evidence="   ")
+        still_open = policies_governor.is_optimizer_tripped("output_spool", state_dir=d_brk)
+        good_r = policies_governor.reset_circuit_breaker("output_spool", state_dir=d_brk, verification_passed=True, verification_evidence="spool_verified")
+        g_hysteresis = bool(
+            not bad_r["ok"] and bad_r["error"] == "hysteresis_requires_verification_or_operator_reset"
+            and not empty_r["ok"] and still_open and good_r["ok"] and not policies_governor.is_optimizer_tripped("output_spool", state_dir=d_brk)
+        )
+
+        sec_cfg: dict[str, Any] = {
+            "policy_packs": [{"id": "sec_guard", "enabled": True, "kind": "security", "scopes": ["shell_command"]}],
+            "legacy_security_keys": ("restricted_bq_datasets",),
+            "optimizers": {"range_trim": "active", "auto_outline": "active", "cli_rewrites": "auto", "output_spool": "active"},
+        }
+        policies_governor.record_governor_signal("output_spool", "guarantee_loss", state_dir=d_brk)
+        bad_payload: Any = "unknown"
+        sec_out = policies_governor.apply_runtime_governor(sec_cfg, "antigravity", state_dir=d_brk, payload=bad_payload)
+        sec_eval = policies_governor.evaluate_governor("antigravity", runtime_cfg=sec_cfg, state_dir=d_brk, payload_known=False)
+        g_security = bool(
+            not sec_eval["security_enforcement_lowered"] and sec_out["policy_packs"] == sec_cfg["policy_packs"]
+            and sec_out["legacy_security_keys"] == sec_cfg["legacy_security_keys"]
+            and all(v == "off" for v in sec_out["optimizers"].values())
+        )
+
+        ev_fail = policies_governor.evaluate_governor(
+            "claude", runtime_cfg={"optimizers": {"output_spool": "active"}},
+            evidence_gate_required=True, evidence_report={"gate_verdict": {"ok": False}}, state_dir=root / "ev",
+        )
+        ev_pass = policies_governor.evaluate_governor(
+            "claude", runtime_cfg={"optimizers": {"output_spool": "active"}},
+            evidence_gate_required=True, evidence_report={"gate_verdict": {"ok": True}}, state_dir=root / "ev",
+        )
+        g_evidence = bool(
+            not ev_fail["evidence_gate_passed"] and ev_fail["decisions"]["output_spool"]["selected_mode"] == "shadow"
+            and ev_fail["decisions"]["output_spool"]["reason"] == "evidence_gate_not_passed"
+            and ev_pass["evidence_gate_passed"] and ev_pass["decisions"]["output_spool"]["selected_mode"] == "active"
+        )
+
+    gates = {
+        "static_config_parity": g_parity, "provider_only_rejected": g_provider,
+        "harness_upgrade_invalidation": g_upgrade, "config_change_invalidation": g_config,
+        "breaker_trips_only_on_hard_failures": g_breaker, "hysteresis_enforced": g_hysteresis,
+        "security_never_lowered": g_security, "evidence_gate_enforced": g_evidence,
+    }
+    return gates, [{"id": name, "gate": name, "passed": passed} for name, passed in gates.items()]
+
+
+def run_governor_release_gates(scenarios: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
+    """Deterministically verify all 8 Governor release gates (and optional custom scenarios) in isolation."""
+    gates, results = _run_builtin_release_gates()
+    custom_ok = True
+    if scenarios is not None:
+        with tempfile.TemporaryDirectory(prefix="cg_gov_custom_") as td:
+            for idx, raw in enumerate(scenarios):
+                if not isinstance(raw, Mapping):
+                    custom_ok = False
+                    results.append({"id": f"custom_{idx}", "gate": "custom", "passed": False})
+                    continue
+                raw_cfg, raw_rep = raw.get("runtime_cfg"), raw.get("evidence_report")
+                res = policies_governor.evaluate_governor(
+                    str(raw.get("harness_id") or "claude"),
+                    runtime_cfg=raw_cfg if isinstance(raw_cfg, Mapping) else None,
+                    state_dir=Path(td) / f"s_{idx}",
+                    harness_build_id=str(raw.get("harness_build_id") or "unavailable"),
+                    adapter_version=str(raw.get("adapter_version") or ADAPTER_CONTRACT_VERSION),
+                    payload_known=bool(raw.get("payload_known", True)),
+                    require_runtime_verified=bool(raw.get("require_runtime_verified", False)),
+                    evidence_report=raw_rep if isinstance(raw_rep, Mapping) else None,
+                    evidence_gate_required=bool(raw.get("evidence_gate_required", False)),
+                )
+                exp_modes, passed = raw.get("expected_modes"), not res["security_enforcement_lowered"]
+                if isinstance(exp_modes, Mapping):
+                    passed = passed and all(
+                        opt in res["decisions"] and res["decisions"][opt]["selected_mode"] == mode
+                        for opt, mode in exp_modes.items()
+                    )
+                custom_ok = custom_ok and passed
+                results.append({"id": str(raw.get("id") or f"custom_{idx}"), "gate": "custom", "passed": passed})
+    passed_count = sum(1 for v in gates.values() if v)
+    return {
+        "schema_version": GOVERNOR_SCHEMA_VERSION, "ok": bool(passed_count == 8 and custom_ok),
+        "checks_passed": passed_count, "checks_total": 8, "gates": gates, "scenarios": results,
+    }

@@ -5,38 +5,21 @@ from __future__ import annotations
 import json
 import os
 import re
-import tempfile
 from collections import deque
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from hooks.outline import MAX_OUTLINE_FILE_BYTES, OUTLINE_EXTENSIONS, extract_outline_symbols
-
-
-@dataclass(frozen=True)
-class PendingUnwrapWrite:
-    """Deferred atomic file write for an unwrapped artifact payload."""
-
-    target_path: Path
-    content: str
-
-
-@dataclass(frozen=True)
-class PreparedOutline:
-    """In-memory outline result prepared without touching disk for unwrapped artifacts."""
-
-    total_lines: int
-    outline_text: str
-    unwrapped_target: Path | None = None
-    pending_write: PendingUnwrapWrite | None = None
+from core.contracts import (
+    MAX_FORMAT_JSON_BYTES, MAX_OUTLINE_FILE_BYTES, PendingUnwrapWrite, PreparedOutline,
+    finalize_outline_text, materialize_unwrap_write,
+)
+from hooks.outline import OUTLINE_EXTENSIONS, extract_outline_symbols
 
 AUTO_OUTLINE_LINE_THRESHOLD = 150
 MCP_OUTPUT_OUTLINE_MIN_BYTES = 16 * 1024  # 16 KB minimum before inspecting MCP output.txt
 ANTIGRAVITY_FULL_TRANSCRIPT_NAME = "transcript_full.jsonl"
 TRANSCRIPT_FILENAMES = frozenset({"transcript.jsonl", ANTIGRAVITY_FULL_TRANSCRIPT_NAME})
 ANTIGRAVITY_FULL_TRANSCRIPT_GLOB = f"*/.system_generated/logs/{ANTIGRAVITY_FULL_TRANSCRIPT_NAME}"
-MAX_FORMAT_JSON_BYTES = 512 * 1024  # 512 KB cap for pretty-printing 1-line JSON to disk
 NON_SYMBOL_OUTLINE_PREFIXES = ("# [WARN:", "# [INFO:", "imports:", "package ")
 
 
@@ -61,47 +44,6 @@ def classify_special_read_target(canon: str) -> SpecialReadTarget:
     )
 
 
-def _write_text_atomic(target_path: Path, text: str) -> str | None:
-    """Atomically write text to target_path and return its canonical realpath."""
-    tmp_name: str | None = None
-    try:
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=str(target_path.parent),
-            prefix=f".{target_path.name}.", suffix=".tmp", delete=False,
-        ) as tmp_fh:
-            tmp_name = tmp_fh.name
-            tmp_fh.write(text)
-            tmp_fh.flush()
-        os.replace(tmp_name, target_path)
-        return os.path.realpath(str(target_path))
-    except OSError:
-        if tmp_name:
-            try:
-                os.unlink(tmp_name)
-            except OSError:
-                pass
-        return None
-
-
-def materialize_unwrap_write(pending: PendingUnwrapWrite | None) -> str | None:
-    """Atomically persist a deferred unwrap payload to disk and return its canonical path."""
-    if pending is None:
-        return None
-    return _write_text_atomic(pending.target_path, pending.content)
-
-
-def finalize_outline_text(prepared: PreparedOutline, actual_unwrapped: str | None) -> str:
-    """Reconcile the planned unwrapped path in `prepared.outline_text` with `actual_unwrapped`."""
-    if prepared.unwrapped_target is None:
-        return prepared.outline_text
-    planned_canon = os.path.realpath(str(prepared.unwrapped_target))
-    planned_token = f", unwrapped at {planned_canon}"
-    if actual_unwrapped:
-        return prepared.outline_text.replace(planned_token, f", unwrapped at {actual_unwrapped}")
-    return prepared.outline_text.replace(planned_token, "")
-
-
 def _unwrapped_suffix(target_path: Path | None) -> str:
     return f", unwrapped at {os.path.realpath(str(target_path))}" if target_path is not None else ""
 
@@ -123,49 +65,40 @@ def prepare_mcp_step_outline(file_path: Path, st_size: int) -> PreparedOutline |
         return None
 
     if isinstance(data, dict):
-        content = data.get("content")
-        raw_name = data.get("file_path") or data.get("file_name")
+        content, raw_name = data.get("content"), data.get("file_path") or data.get("file_name")
         if isinstance(content, str) and isinstance(raw_name, str) and raw_name.strip():
             safe_name = re.split(r"[/\\]", raw_name.strip())[-1]
             if safe_name and safe_name not in (".", "..", "output.txt"):
-                inner_ext = Path(safe_name).suffix.lower()
-                lines = content.splitlines()
+                inner_ext, lines = Path(safe_name).suffix.lower(), content.splitlines()
                 total_lines = len(lines)
                 if total_lines > AUTO_OUTLINE_LINE_THRESHOLD or len(content) >= MCP_OUTPUT_OUTLINE_MIN_BYTES:
                     target_path = file_path.parent / safe_name
                     pending = PendingUnwrapWrite(target_path=target_path, content=content)
-                    planned_canon = os.path.realpath(str(target_path))
-                    header = f"# {raw_name.strip()} ({total_lines} LOC, unwrapped at {planned_canon})"
+                    header = f"# {raw_name.strip()} ({total_lines} LOC, unwrapped at {os.path.realpath(str(target_path))})"
                     if inner_ext in OUTLINE_EXTENSIONS:
                         symbols = extract_outline_symbols(content, inner_ext)
                         if any(not s.lstrip().startswith(NON_SYMBOL_OUTLINE_PREFIXES) for s in symbols):
                             return PreparedOutline(total_lines, f"{header}\n" + "\n".join(symbols), target_path, pending)
                     preview = [f"  L{idx + 1}: {line[:200]}" for idx, line in enumerate(lines[:15])]
-                    outline_text = header + "\npreview (first 15 lines):\n" + "\n".join(preview)
-                    return PreparedOutline(total_lines, outline_text, target_path, pending)
+                    return PreparedOutline(total_lines, header + "\npreview (first 15 lines):\n" + "\n".join(preview), target_path, pending)
 
-        rows = data.get("rows")
-        if isinstance(rows, list) and len(rows) > 20:
-            target_bq: Path | None = None
-            pending_bq: PendingUnwrapWrite | None = None
+        if isinstance((rows := data.get("rows")), list) and len(rows) > 20:
+            target_bq, pending_bq = None, None
             if st_size <= MAX_FORMAT_JSON_BYTES and len(raw_text.splitlines()) <= 5:
                 target_bq = file_path.parent / "output_formatted.json"
                 pending_bq = PendingUnwrapWrite(target_bq, json.dumps(data, indent=2, ensure_ascii=False))
             schema_fields: list[str] = []
-            schema_obj = data.get("schema")
-            if isinstance(schema_obj, dict) and isinstance(schema_obj.get("fields"), list):
+            if isinstance((schema_obj := data.get("schema")), dict) and isinstance(schema_obj.get("fields"), list):
                 schema_fields = [
                     f"{f['name']}: {f.get('type') or 'ANY'}"
-                    for f in schema_obj["fields"]
-                    if isinstance(f, dict) and f.get("name")
+                    for f in schema_obj["fields"] if isinstance(f, dict) and f.get("name")
                 ]
             if not schema_fields and isinstance(rows[0], dict):
                 schema_fields = [f"{k}: ANY" for k in rows[0]]
             summary_lines = [
                 f"# BigQuery/Tabular JSON result ({len(rows)} rows){_unwrapped_suffix(target_bq)} [{st_size} bytes]",
                 f"columns: {', '.join(schema_fields)}" if schema_fields else "columns: (untyped)",
-                "sample_rows (first 3):",
-                *_json_samples(rows, "row"),
+                "sample_rows (first 3):", *_json_samples(rows, "row"),
             ]
             return PreparedOutline(len(rows), "\n".join(summary_lines), target_bq, pending_bq)
 
@@ -175,10 +108,8 @@ def prepare_mcp_step_outline(file_path: Path, st_size: int) -> PreparedOutline |
             (v for k in ("items", "results", "values") for v in (data.get(k),) if isinstance(v, list) and len(v) > 5),
             None,
         )
-
     if items_list is not None:
-        target_list: Path | None = None
-        pending_list: PendingUnwrapWrite | None = None
+        target_list, pending_list = None, None
         formatted_line_count = max(len(items_list), AUTO_OUTLINE_LINE_THRESHOLD + 1)
         if st_size <= MAX_FORMAT_JSON_BYTES:
             formatted_json = json.dumps(data, indent=2, ensure_ascii=False)
@@ -189,11 +120,9 @@ def prepare_mcp_step_outline(file_path: Path, st_size: int) -> PreparedOutline |
         summary_lines = [
             f"# MCP JSON collection ({len(items_list)} items{_unwrapped_suffix(target_list)}) [{st_size} bytes]",
             f"item_keys: {', '.join(first_keys)}" if first_keys else "item_keys: (non-dict)",
-            "sample_items (first 3):",
-            *_json_samples(items_list, "item"),
+            "sample_items (first 3):", *_json_samples(items_list, "item"),
         ]
         return PreparedOutline(formatted_line_count, "\n".join(summary_lines), target_list, pending_list)
-
     return None
 
 
@@ -204,11 +133,6 @@ def unwrap_and_outline_mcp_output(file_path: Path, st_size: int) -> tuple[int, s
         return None
     unwrapped_canon = materialize_unwrap_write(prepared.pending_write)
     return (prepared.total_lines, finalize_outline_text(prepared, unwrapped_canon), unwrapped_canon)
-
-
-def unwrap_and_outline_mcp_step_output(file_path: Path, st_size: int) -> tuple[int, str, str | None] | None:
-    """Backwards-compatible alias for `unwrap_and_outline_mcp_output`."""
-    return unwrap_and_outline_mcp_output(file_path, st_size)
 
 
 def _format_transcript_jsonl_line(line_no: int, raw_bytes: bytes) -> str:
@@ -229,7 +153,7 @@ def _format_transcript_jsonl_line(line_no: int, raw_bytes: bytes) -> str:
 
 
 def build_transcript_jsonl_outline(
-    file_path: Path, st_size: int, max_hash_bytes: int = 10 * 1024 * 1024, start_line: int = 1, end_line: int = -1
+    file_path: Path, st_size: int, max_hash_bytes: int = 10 * 1024 * 1024, start_line: int = 1, end_line: int = -1,
 ) -> tuple[int, str, str | None] | None:
     """Build a streaming step index outline for large transcript.jsonl / transcript_full.jsonl files."""
     if st_size < MCP_OUTPUT_OUTLINE_MIN_BYTES or st_size > max_hash_bytes:
@@ -253,7 +177,6 @@ def build_transcript_jsonl_outline(
         return None
     if total_lines == 0:
         return None
-
     combined_map = dict([*first_items, *span_items, *last_items])
     summary_lines = [f"# {file_path.name} ({total_lines} JSONL lines, {st_size} bytes)"]
     prev_lno = 0
@@ -263,4 +186,3 @@ def build_transcript_jsonl_outline(
         summary_lines.append(_format_transcript_jsonl_line(lno, combined_map[lno]))
         prev_lno = lno
     return (total_lines, "\n".join(summary_lines), None)
-

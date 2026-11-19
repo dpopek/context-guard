@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from bin.migration_guard import RollbackJournal
+from services.migration_guard import RollbackJournal
 from spool.mcp_server import is_cursor_spool_mcp_configured, serve_stdio, sync_cursor_spool_mcp
 from spool.store import spool_tool_output
 

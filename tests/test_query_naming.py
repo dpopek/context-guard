@@ -1,4 +1,4 @@
-"""Functions named like queries do not write state; hooks/, policies/, integrations/, spool/ never import bin/."""
+"""Functions named like queries do not write state; core/, hooks/, policies/, integrations/, spool/, services/, evidence/ never import bin/."""
 from __future__ import annotations
 
 import ast
@@ -23,7 +23,7 @@ FORBIDDEN_CALL_PREFIXES = ("save", "record_", "_record_", "_commit_", "write_")
 SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
 
 ALLOWED_QUERY_MUTATORS = {
-    "hooks/telemetry.py::read_json_object_or_quarantine": (
+    "core/platform_io.py::read_json_object_or_quarantine": (
         "the quarantine side effect is in the name"
     ),
 }
@@ -124,7 +124,9 @@ def test_state_writing_functions_carry_command_names() -> None:
 
 def test_query_named_functions_do_not_write_state() -> None:
     found: dict[str, list[str]] = {}
-    for label, source in _sources("hooks/*.py", "bin/*.py", "policies/*.py", "integrations/*.py", "spool/*.py"):
+    for label, source in _sources(
+        "core/*.py", "hooks/*.py", "services/*.py", "bin/*.py", "policies/*.py", "integrations/*.py", "spool/*.py"
+    ):
         found.update(query_violations(source, label))
     unexpected, stale = allow_list_problems(found, ALLOWED_QUERY_MUTATORS)
     assert unexpected == [], "query-named functions that write state (rename them):\n" + "\n".join(unexpected)
@@ -134,10 +136,15 @@ def test_query_named_functions_do_not_write_state() -> None:
 def test_hooks_never_import_bin() -> None:
     offenders = [
         entry
-        for label, source in _sources("hooks/*.py", "policies/*.py", "integrations/*.py", "spool/*.py")
+        for label, source in _sources(
+            "core/*.py", "hooks/*.py", "policies/*.py", "integrations/*.py", "spool/*.py", "services/*.py", "evidence/*.py"
+        )
         for entry in bin_imports(source, label)
     ]
-    assert offenders == [], "hooks/, policies/, integrations/, spool/ must not import bin/:\n" + "\n".join(offenders)
+    assert offenders == [], (
+        "core/, hooks/, policies/, integrations/, spool/, services/, evidence/ must not import bin/:\n"
+        + "\n".join(offenders)
+    )
 
 
 def _violations_of(source: str) -> dict[str, list[str]]:

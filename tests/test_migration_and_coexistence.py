@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from bin.migration_guard import RollbackJournal, StagedPackTransaction, preflight_migration_check
+from services.migration_guard import RollbackJournal, StagedPackTransaction, preflight_migration_check
 from hooks.config import REQUIRED_CONFIG_KEYS
 from hooks.policy_engine import PolicyPackLoadError
 from policies.api import ALL_SECURITY_SCOPES
@@ -402,7 +402,7 @@ def test_staged_tx_uses_resolved_default_config_path_under_isolated_env(isolated
 def test_integrated_pack_source_rolls_back_pack_dir_and_config_json_on_preflight_or_install_failure(
     isolated_user_env: Path, tmp_path: Path
 ) -> None:
-    from bin import install_harnesses
+    from services import installer_service
     from hooks.config import clear_config_cache
 
     claude_cfg = tmp_path / "claude" / "settings.json"
@@ -415,7 +415,7 @@ def test_integrated_pack_source_rolls_back_pack_dir_and_config_json_on_preflight
 
     src_v1 = tmp_path / "pack-v1"
     _make_pack(src_v1, extra_files={"ver.py": "VER = 'v1'\n"})
-    install_harnesses.install_all(
+    installer_service.install_all(
         claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
         codex_hooks_path=codex_cfg, codex_config_path=codex_toml, pack_source=src_v1,
     )
@@ -431,7 +431,7 @@ def test_integrated_pack_source_rolls_back_pack_dir_and_config_json_on_preflight
     bad_src = tmp_path / "pack-bad"
     _make_pack(bad_src, broken_syntax=True)
     with pytest.raises(PolicyPackLoadError):
-        install_harnesses.install_all(
+        installer_service.install_all(
             claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
             codex_hooks_path=codex_cfg, codex_config_path=codex_toml, pack_source=bad_src,
         )
@@ -444,7 +444,7 @@ def test_integrated_pack_source_rolls_back_pack_dir_and_config_json_on_preflight
     _make_pack(src_v2, extra_files={"ver.py": "VER = 'v2'\n"})
     cursor_cfg.write_text("{corrupt-json", encoding="utf-8")
     with pytest.raises(RuntimeError, match="harness installation error"):
-        install_harnesses.install_all(
+        installer_service.install_all(
             claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
             codex_hooks_path=codex_cfg, codex_config_path=codex_toml, pack_source=src_v2,
         )
@@ -459,8 +459,8 @@ def test_claude_2_1_295_registers_on_failure_block_older_falls_back_and_doctor_d
     isolated_user_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import subprocess
-    from bin import cg_status, install_harnesses
-    from hooks import config as hooks_config
+    from services import installer_service, status_service
+    from hooks import config as hooks_config, drift_probe
 
     claude_cfg = tmp_path / "claude" / "settings.json"
     cursor_cfg = tmp_path / "cursor" / "hooks.json"
@@ -472,7 +472,7 @@ def test_claude_2_1_295_registers_on_failure_block_older_falls_back_and_doctor_d
 
     # Inactive security: neither onFailure nor failClosed written
     hooks_config.clear_config_cache()
-    install_harnesses.install_all(
+    installer_service.install_all(
         claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
         codex_hooks_path=codex_cfg, codex_config_path=codex_toml, claude_version=(2, 1, 295),
     )
@@ -485,15 +485,15 @@ def test_claude_2_1_295_registers_on_failure_block_older_falls_back_and_doctor_d
         def __init__(self, rc: int, out: str) -> None:
             self.returncode, self.stdout, self.stderr = rc, out, ""
 
-    assert hooks_config.probe_claude_cli_version(runner=lambda *_a, **_kw: _Proc(0, "2.1.295 (Claude Code)\n")) == (2, 1, 295)
-    assert hooks_config.probe_claude_cli_version(runner=lambda *_a, **_kw: _Proc(1, "2.1.295")) is None
-    assert hooks_config.probe_claude_cli_version(runner=lambda *_a, **_kw: (_ for _ in ()).throw(subprocess.TimeoutExpired("claude", 2))) is None
-    assert hooks_config.probe_claude_cli_version(runner=lambda *_a, **_kw: (_ for _ in ()).throw(FileNotFoundError("nope"))) is None
+    assert drift_probe.probe_claude_cli_version(runner=lambda *_a, **_kw: _Proc(0, "2.1.295 (Claude Code)\n")) == (2, 1, 295)
+    assert drift_probe.probe_claude_cli_version(runner=lambda *_a, **_kw: _Proc(1, "2.1.295")) is None
+    assert drift_probe.probe_claude_cli_version(runner=lambda *_a, **_kw: (_ for _ in ()).throw(subprocess.TimeoutExpired("claude", 2))) is None
+    assert drift_probe.probe_claude_cli_version(runner=lambda *_a, **_kw: (_ for _ in ()).throw(FileNotFoundError("nope"))) is None
 
     # Active security pack with Claude >= 2.1.295 writes onFailure=block & Cursor failClosed=True
     sec_src = tmp_path / "sec-src"
     _make_pack(sec_src)
-    install_harnesses.install_all(
+    installer_service.install_all(
         claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
         codex_hooks_path=codex_cfg, codex_config_path=codex_toml,
         pack_source=sec_src, claude_version=(2, 1, 295),
@@ -503,34 +503,34 @@ def test_claude_2_1_295_registers_on_failure_block_older_falls_back_and_doctor_d
     cu_295 = json.loads(cursor_cfg.read_text(encoding="utf-8"))["hooks"]["preToolUse"][0]
     assert cl_295["onFailure"] == "block" and cl_295["timeout"] == 15
     assert cu_295["failClosed"] is True and cu_295["timeout"] == 10
-    drift_ok = hooks_config.inspect_native_security_drift(
+    drift_ok = drift_probe.inspect_native_security_drift(
         hooks_config.load_runtime_config(),
         claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
         codex_hooks_path=codex_cfg, codex_config_path=codex_toml, claude_version=(2, 1, 295),
     )
     assert drift_ok["ok"] is True and drift_ok["drift_codes"] == []
-    assert any("27833" in n for n in drift_ok["codex"]["notices"])
+    assert any("apply_patch" in n and "trust_level" in n for n in drift_ok["codex"]["notices"])
 
     # Older Claude CLI (< 2.1.295) omits onFailure and sets degraded_older_cli without false drift
-    install_harnesses.install_all(
+    installer_service.install_all(
         claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
         codex_hooks_path=codex_cfg, codex_config_path=codex_toml, claude_version=(2, 1, 294),
     )
     cl_294 = json.loads(claude_cfg.read_text(encoding="utf-8"))["hooks"]["PreToolUse"][0]["hooks"][0]
     assert "onFailure" not in cl_294
-    drift_old = hooks_config.inspect_native_security_drift(
+    drift_old = drift_probe.inspect_native_security_drift(
         hooks_config.load_runtime_config(),
         claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
         codex_hooks_path=codex_cfg, codex_config_path=codex_toml, claude_version=(2, 1, 294),
     )
     assert drift_old["ok"] is True and drift_old["claude"]["degraded_older_cli"] is True
-    monkeypatch.setattr(install_harnesses, "probe_claude_cli_version", lambda: (2, 1, 295))
-    install_harnesses.install_all(
+    monkeypatch.setattr(installer_service, "probe_claude_cli_version", lambda: (2, 1, 295))
+    installer_service.install_all(
         claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
         codex_hooks_path=codex_cfg, codex_config_path=codex_toml, claude_version=None,
     )
     assert json.loads(claude_cfg.read_text(encoding="utf-8"))["hooks"]["PreToolUse"][0]["hooks"][0]["onFailure"] == "block"
-    assert hooks_config.inspect_native_security_drift(
+    assert drift_probe.inspect_native_security_drift(
         hooks_config.load_runtime_config(),
         claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
         codex_hooks_path=codex_cfg, codex_config_path=codex_toml, claude_version=None, probe_claude=False,
@@ -540,18 +540,18 @@ def test_claude_2_1_295_registers_on_failure_block_older_falls_back_and_doctor_d
     cu_raw = json.loads(cursor_cfg.read_text(encoding="utf-8"))
     cu_raw["hooks"]["preToolUse"][0].pop("failClosed", None)
     cursor_cfg.write_text(json.dumps(cu_raw), encoding="utf-8")
-    drift_bad = hooks_config.inspect_native_security_drift(
+    drift_bad = drift_probe.inspect_native_security_drift(
         hooks_config.load_runtime_config(),
         claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
         codex_hooks_path=codex_cfg, codex_config_path=codex_toml, claude_version=(2, 1, 295),
     )
     assert drift_bad["ok"] is False and "NATIVE_FAIL_CLOSED_DRIFT" in drift_bad["drift_codes"]
-    doc = cg_status.run_doctor(
+    doc = status_service.run_doctor(
         claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg, codex_hooks_path=codex_cfg,
     )
     assert "security_drift" in doc and "NATIVE_FAIL_CLOSED_DRIFT" in doc["security_drift"]["drift_codes"]
     assert doc["security_drift"]["ok"] is False
-    doc_md = cg_status.render_doctor_report(doc)
+    doc_md = status_service.render_doctor_report(doc)
     assert "Native security sync" in doc_md and "WARN" in doc_md
     assert "NATIVE_FAIL_CLOSED_DRIFT" in doc_md
 
@@ -587,7 +587,7 @@ def test_install_all_ide_old_version_removal_rolls_back_on_failure_and_commits_o
     isolated_user_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """IDE old-version removal is restored on install_all rollback and finalized on commit."""
-    from bin import install_harnesses
+    from services import installer_service
 
     repo_root = Path(__file__).resolve().parent.parent
     cur_ver = json.loads((repo_root / "vscode-extension" / "package.json").read_text(encoding="utf-8"))["version"]
@@ -634,7 +634,7 @@ def test_install_all_ide_old_version_removal_rolls_back_on_failure_and_commits_o
     # 1. Non-monkeypatched failure via corrupt cursor_cfg triggers rollback after IDE extension updates
     cursor_cfg.write_text("{corrupt-json", encoding="utf-8")
     with pytest.raises(RuntimeError, match="harness installation error"):
-        install_harnesses.install_all(
+        installer_service.install_all(
             claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
             codex_hooks_path=codex_cfg, codex_config_path=codex_toml,
             cursor_extensions_dir=cursor_ext_dir, antigravity_extensions_dir=ag_ext_dir,
@@ -651,9 +651,9 @@ def test_install_all_ide_old_version_removal_rolls_back_on_failure_and_commits_o
             assert len(list(cursor_ext_dir.glob(".rollback-del-*"))) == 1
             raise OSError("simulated late outline failure")
 
-        mp.setattr(install_harnesses, "install_outline_pull", _fail_after_ide)
+        mp.setattr(installer_service, "install_outline_pull", _fail_after_ide)
         with pytest.raises(OSError, match="simulated late outline failure"):
-            install_harnesses.install_all(
+            installer_service.install_all(
                 claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
                 codex_hooks_path=codex_cfg, codex_config_path=codex_toml,
                 cursor_extensions_dir=cursor_ext_dir, antigravity_extensions_dir=ag_ext_dir,
@@ -662,7 +662,7 @@ def test_install_all_ide_old_version_removal_rolls_back_on_failure_and_commits_o
     _assert_rolled_back()
 
     # 3. Subsequent successful install_all removes 4.3.0 and cleans all .rollback-* dirs on commit()
-    res = install_harnesses.install_all(
+    res = installer_service.install_all(
         claude_settings_path=claude_cfg, cursor_hooks_path=cursor_cfg,
         codex_hooks_path=codex_cfg, codex_config_path=codex_toml,
         cursor_extensions_dir=cursor_ext_dir, antigravity_extensions_dir=ag_ext_dir,
@@ -679,3 +679,59 @@ def test_install_all_ide_old_version_removal_rolls_back_on_failure_and_commits_o
         }
         assert list(ext_dir.glob(".rollback-*")) == []
         assert list(ext_dir.glob(".staging-*")) == []
+
+
+def test_corrupt_native_configs_surface_warning_and_drift_instead_of_empty_dict(
+    isolated_user_env: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from hooks import config as hooks_config, drift_probe
+
+    claude_cfg = tmp_path / "claude" / "settings.json"
+    cursor_cfg = tmp_path / "cursor" / "hooks.json"
+    codex_cfg = tmp_path / "codex" / "hooks.json"
+    codex_toml = tmp_path / "codex" / "config.toml"
+    claude_cfg.parent.mkdir(parents=True, exist_ok=True)
+    claude_cfg.write_text("{corrupt json", encoding="utf-8")
+
+    # Security inactive: corrupt .claude/settings.json still warns and reports ok=False + corrupt_configs
+    capsys.readouterr()
+    res_inactive = drift_probe.inspect_native_security_drift(
+        {"policy_packs": [], "legacy_security_keys": ()},
+        claude_settings_path=claude_cfg,
+        cursor_hooks_path=cursor_cfg,
+        codex_hooks_path=codex_cfg,
+        codex_config_path=codex_toml,
+    )
+    err_inactive = capsys.readouterr().err
+    assert "corrupt" in err_inactive.lower()
+    assert res_inactive["ok"] is False
+    assert str(claude_cfg) in res_inactive["corrupt_configs"]
+    assert res_inactive["drift_codes"] == []
+
+    # Security active: corrupt .claude/settings.json surfaces NATIVE_FAIL_CLOSED_DRIFT + corrupt_configs
+    res_active = drift_probe.inspect_native_security_drift(
+        {"policy_packs": [{"id": "sec", "kind": "security", "enabled": True}], "legacy_security_keys": ()},
+        claude_settings_path=claude_cfg,
+        cursor_hooks_path=cursor_cfg,
+        codex_hooks_path=codex_cfg,
+        codex_config_path=codex_toml,
+    )
+    err_active = capsys.readouterr().err
+    assert "corrupt" in err_active.lower()
+    assert res_active["ok"] is False
+    assert str(claude_cfg) in res_active["corrupt_configs"]
+    assert "NATIVE_FAIL_CLOSED_DRIFT" in res_active["drift_codes"]
+
+    # scan_hooks_for_rtk: silent when missing, warns on corrupt JSON
+    ws_missing = tmp_path / "ws_missing"
+    ws_missing.mkdir()
+    capsys.readouterr()
+    assert hooks_config.scan_hooks_for_rtk(cwd=ws_missing, home=isolated_user_env) is False
+    assert capsys.readouterr().err == ""
+
+    ws_corrupt = tmp_path / "ws_corrupt"
+    (ws_corrupt / ".claude").mkdir(parents=True)
+    (ws_corrupt / ".claude" / "settings.json").write_text("{broken", encoding="utf-8")
+    assert hooks_config.scan_hooks_for_rtk(cwd=ws_corrupt, home=isolated_user_env) is False
+    assert "corrupt" in capsys.readouterr().err.lower()
+

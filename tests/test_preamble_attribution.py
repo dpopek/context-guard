@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from bin.preamble_attribution import (
+from services.preamble_attribution import (
     CLAUDE_CLI_HARNESS,
     CLAUDE_DESKTOP_HARNESS,
     CODEX_CLI_HARNESS,
@@ -29,7 +29,7 @@ from bin.preamble_attribution import (
     summarize_parts,
     usage_keys,
 )
-from bin.token_usage import (
+from services.token_usage import (
     antigravity_model_from_record,
     empty_usage_state,
     ingest_transcripts,

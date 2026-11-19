@@ -597,3 +597,89 @@ def test_pre_invocation_pre_compact_and_session_end_invalidate_shadow_and_close_
     r2 = handle_pre_invocation({"conversationId": "s-drift", "initialNumSteps": 2}, state_dir=str(sd2))
     assert r2 == {}
 
+
+def test_pre_invocation_runs_drift_probe_outside_locked_state(
+    isolated_user_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from core.platform_io import LOCK_EX, LOCK_NB, LOCK_UN, flock
+    from hooks import config as cfg_mod, drift_probe, policy_engine, pre_compact, pre_invocation, session_end, state_store
+
+    cfg_file = isolated_user_env / ".config" / "context-guard" / "config.json"
+    cfg_file.parent.mkdir(parents=True, exist_ok=True)
+    cfg_file.write_text(json.dumps({"restricted_bq_datasets": ["raw_sales"]}), encoding="utf-8")
+    cfg_mod.clear_config_cache()
+
+    sd = tmp_path / "lock-check"
+    sd.mkdir()
+    lock_file = sd / ".context_guard_state.lock"
+
+    # Confirm LOCK_EX | LOCK_NB fails with BlockingIOError when locked_state IS held.
+    with state_store.locked_state(sd):
+        with open(lock_file, "a+", encoding="utf-8") as fh:
+            with pytest.raises(BlockingIOError):
+                flock(fh.fileno(), LOCK_EX | LOCK_NB)
+
+    probe_states: list[bool] = []
+
+    def _probe_checking_lock() -> tuple[int, int, int]:
+        with open(lock_file, "a+", encoding="utf-8") as fh:
+            try:
+                flock(fh.fileno(), LOCK_EX | LOCK_NB)
+            except BlockingIOError:
+                probe_states.append(True)
+                return (2, 1, 295)
+            flock(fh.fileno(), LOCK_UN)
+            probe_states.append(False)
+        return (2, 1, 295)
+
+    monkeypatch.setattr(drift_probe, "probe_claude_cli_version", _probe_checking_lock)
+    res1 = handle_pre_invocation({"conversationId": "s-lock", "initialNumSteps": 5}, state_dir=str(sd))
+    assert res1 == {}
+    assert probe_states == [False]
+    state_obj = json.loads((sd / ".context_guard_state.json").read_text(encoding="utf-8"))
+    assert state_obj.get("drift_warned") is True
+
+    # Second call does not re-probe once drift_warned is persisted.
+    res2 = handle_pre_invocation({"conversationId": "s-lock", "initialNumSteps": 6}, state_dir=str(sd))
+    assert res2 == {}
+    assert probe_states == [False]
+
+    # Transition notifications in pre_invocation, pre_compact, and session_end also run unlocked.
+    transition_events: list[tuple[str, bool]] = []
+
+    def _record_transition(event: str, state: dict[str, object], _cfg: object) -> None:
+        with open(lock_file, "a+", encoding="utf-8") as fh:
+            try:
+                flock(fh.fileno(), LOCK_EX | LOCK_NB)
+            except BlockingIOError:
+                transition_events.append((event, True))
+                return
+            flock(fh.fileno(), LOCK_UN)
+            transition_events.append((event, False))
+
+    monkeypatch.setattr(pre_invocation, "notify_session_transition", _record_transition)
+    monkeypatch.setattr(pre_compact, "notify_session_transition", _record_transition)
+    monkeypatch.setattr(policy_engine, "notify_session_transition", _record_transition)
+
+    handle_pre_invocation({"conversationId": "s-lock", "initialNumSteps": 2}, state_dir=str(sd))
+    pre_compact.handle_pre_compact({"session_id": "s-lock"}, state_dir=str(sd))
+    session_end.handle_session_end({"session_id": "s-lock"}, state_dir=str(sd))
+    assert transition_events == [("rewind", False), ("compact", False), ("session_end", False)]
+
+
+def test_pre_compact_handles_value_and_type_errors_fail_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from hooks import pre_compact
+
+    sd = tmp_path / "pc-err"
+    sd.mkdir()
+    (sd / ".context_guard_state.json").write_text(json.dumps({"files": {}, "read_ledger_schema": 2}), encoding="utf-8")
+
+    def _bad_compaction(_state: dict[str, object], checkpoint_step: int | None = None) -> None:
+        _ = checkpoint_step
+        raise ValueError("corrupt step value")
+
+    monkeypatch.setattr(pre_compact, "apply_compaction_boundary", _bad_compaction)
+    assert pre_compact.handle_pre_compact({"session_id": "s-err"}, state_dir=str(sd)) == {}
+    assert "pre_compact skipped: ValueError" in capsys.readouterr().err

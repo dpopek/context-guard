@@ -8,8 +8,8 @@ import sys
 from pathlib import Path
 
 from bin import cg
-from bin.install_harnesses import check_status, install_all, uninstall_all
-from bin.instruction_block import (
+from services.installer_service import check_status, install_all, uninstall_all
+from services.instruction_block import (
     BLOCK_BODY,
     BLOCK_END,
     BLOCK_START,
@@ -122,7 +122,7 @@ def test_shim_runs_the_outline_cli(tmp_path: Path) -> None:
 
 
 def test_shim_never_replaces_or_removes_a_foreign_file(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr("bin.instruction_block.IS_WINDOWS", False)
+    monkeypatch.setattr("services.instruction_block.IS_WINDOWS", False)
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     foreign = bin_dir / "cg-outline"
@@ -151,7 +151,7 @@ def test_install_all_skips_shim_and_blocks_unless_requested(tmp_path: Path) -> N
 
 
 def test_install_and_uninstall_all_manage_shim_and_blocks(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr("bin.instruction_block.IS_WINDOWS", False)
+    monkeypatch.setattr("services.instruction_block.IS_WINDOWS", False)
     configs = _configs(tmp_path)
     bin_dir = tmp_path / "localbin"
     with_text = tmp_path / "gemini" / "GEMINI.md"
@@ -237,7 +237,7 @@ def test_crlf_user_text_stays_byte_identical(tmp_path: Path) -> None:
 def test_install_all_reports_instruction_and_shim_errors_instead_of_raising(
     tmp_path: Path, monkeypatch
 ) -> None:
-    monkeypatch.setattr("bin.instruction_block.IS_WINDOWS", False)
+    monkeypatch.setattr("services.instruction_block.IS_WINDOWS", False)
     configs = _configs(tmp_path)
     bin_dir = tmp_path / "localbin"
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.defpath}")
@@ -316,7 +316,7 @@ def test_cg_and_budget_shims_execute_and_respect_foreign_files(tmp_path: Path, m
         for shim_name, marker, _ in shims:
             assert remove_shim(bin_dir, shim_name=shim_name, marker=marker) is True and not (bin_dir / shim_name).exists()
 
-    monkeypatch.setattr("bin.instruction_block.IS_WINDOWS", False)
+    monkeypatch.setattr("services.instruction_block.IS_WINDOWS", False)
     bin_dir.mkdir(exist_ok=True)
     for shim_name, marker, script_name in shims:
         foreign = bin_dir / shim_name

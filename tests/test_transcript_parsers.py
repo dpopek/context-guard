@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from bin.transcript_parsers import (
+from services.transcript_parsers import (
     UsageEvent,
     antigravity_model_from_record,
     codex_model_from_record,

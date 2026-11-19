@@ -350,7 +350,7 @@ def test_python_modules_resolve_default_paths_from_plugin_root_and_env_override(
     tmp_path: Path, monkeypatch
 ) -> None:
     import sys
-    from bin import install_harnesses
+    from services import installer_service
     from hooks import state_store
 
     repo_root = Path(__file__).resolve().parent.parent
@@ -373,16 +373,17 @@ def test_python_modules_resolve_default_paths_from_plugin_root_and_env_override(
     probe_script = (
         f"import json, sys; sys.path.insert(0, {str(repo_root)!r})\n"
         "from hooks import outcomes, telemetry\n"
-        "from bin import cg_status, install_harnesses, token_usage, update_check\n"
+        "from bin import update_check\n"
+        "from services import installer_service, status_service, token_usage\n"
         "print(json.dumps({\n"
         "  'telemetry': str(telemetry.DEFAULT_TELEMETRY_PATH),\n"
         "  'outcomes': str(outcomes.DEFAULT_OUTCOMES_PATH),\n"
         "  'token_usage': str(token_usage.DEFAULT_USAGE_PATH),\n"
-        "  'cg_update': str(cg_status.DEFAULT_UPDATE_PATH),\n"
-        "  'cg_update_script': str(cg_status.UPDATE_CHECK_SCRIPT),\n"
-        "  'cg_version': cg_status.plugin_version(),\n"
+        "  'cg_update': str(status_service.DEFAULT_UPDATE_PATH),\n"
+        "  'cg_update_script': str(status_service.UPDATE_CHECK_SCRIPT),\n"
+        "  'cg_version': status_service.plugin_version(),\n"
         "  'update_root': str(update_check.ROOT),\n"
-        "  'install_root': str(install_harnesses.DEFAULT_PLUGIN_ROOT),\n"
+        "  'install_root': str(installer_service.DEFAULT_PLUGIN_ROOT),\n"
         "}))\n"
     )
 
@@ -430,8 +431,8 @@ def test_python_modules_resolve_default_paths_from_plugin_root_and_env_override(
     patched_root.mkdir()
     claude_cfg = tmp_path / "claude-settings.json"
     claude_cfg.write_text("{}\n", encoding="utf-8")
-    monkeypatch.setattr(install_harnesses, "DEFAULT_PLUGIN_ROOT", patched_root)
-    install_harnesses.install_all(
+    monkeypatch.setattr(installer_service, "DEFAULT_PLUGIN_ROOT", patched_root)
+    installer_service.install_all(
         claude_settings_path=claude_cfg,
         cursor_hooks_path=tmp_path / "cursor-hooks.json",
         codex_hooks_path=tmp_path / "codex-hooks.json",

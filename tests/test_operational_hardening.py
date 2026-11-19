@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from bin.migration_guard import RollbackJournal, StagedPackTransaction, preflight_migration_check
+from services.migration_guard import RollbackJournal, StagedPackTransaction, preflight_migration_check
 from evidence import ledger as evidence_ledger
 from hooks import config, outcomes, policy_engine, post_tool_use, pre_tool_use, state_store
 from hooks.policy_engine import PolicyPackLoadError
@@ -388,8 +388,9 @@ def test_hardening_disk_full_enospc_and_corrupt_files_fail_safe_without_temp_lea
 
     with monkeypatch.context() as mp:
         mp.setattr(os, "replace", _enospc_replace)
-        with state_store.locked_state(sdir) as txn:
-            txn.state["auto_step_seq"], txn.dirty = 7, True
+        with pytest.raises(state_store.StatePersistenceError):
+            with state_store.locked_state(sdir) as txn:
+                txn.state["auto_step_seq"], txn.dirty = 7, True
         assert spool_store.spool_tool_output(
             _make_spool_text("enospc_blob"), session_id="s_full", call_id="c_full",
             harness="claude", tool_name="Bash", workspace_root=ws, spool_dir=spool_dir,

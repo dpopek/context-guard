@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
+import sys
 from typing import Any, Mapping
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 if str(_PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(_PACKAGE_ROOT))
 
-from hooks.state_store import resolve_plugin_root  # noqa: E402
+from core.platform_io import read_plugin_version  # noqa: E402
 
 _SUBCOMMANDS: tuple[str, ...] = (
     "budget",
@@ -52,14 +52,6 @@ Generate a structural symbol and line-range outline for source files.
 options:
   -h, --help  show this help message and exit
 """
-
-
-def _read_plugin_version() -> str:
-    root = resolve_plugin_root()
-    manifest = root / "plugin.json"
-    if not manifest.is_file():
-        manifest = _PACKAGE_ROOT / "plugin.json"
-    return str(json.loads(manifest.read_text(encoding="utf-8"))["version"])
 
 
 def _render_doctor_contracts_section(doc: Mapping[str, Any]) -> str:
@@ -117,11 +109,11 @@ def run_doctor_cli(argv: list[str] | None = None) -> int:
             print(json.dumps({"ok": False, "error": "invalid_arguments"}))
         return 2
 
-    from bin import cg_status
     from evidence.conformance import build_capability_limitation_matrix, build_deprecation_policy
     from policies.api import CORE_SCHEMA_VERSIONS, DOCTOR_SCHEMA_VERSION, POLICY_API_VERSION
+    from services import status_service
 
-    doc: dict[str, Any] = dict(cg_status.run_doctor())
+    doc: dict[str, Any] = dict(status_service.run_doctor())
     doc["schema_version"] = DOCTOR_SCHEMA_VERSION
     doc["policy_api_version"] = POLICY_API_VERSION
     doc["core_schema_versions"] = dict(CORE_SCHEMA_VERSIONS)
@@ -132,7 +124,7 @@ def run_doctor_cli(argv: list[str] | None = None) -> int:
     if ns.json:
         print(json.dumps(doc, indent=2))
     else:
-        rendered = cg_status.render_doctor_report(doc)
+        rendered = status_service.render_doctor_report(doc)
         if ns.contracts:
             rendered += _render_doctor_contracts_section(doc)
         print(rendered, end="")
@@ -190,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         print(_HELP_TEXT, end="")
         return 0
     if args[0] in ("-V", "--version"):
-        print(f"context-guard {_read_plugin_version()}")
+        print(f"context-guard {read_plugin_version()}")
         return 0
 
     cmd, rest = args[0], args[1:]

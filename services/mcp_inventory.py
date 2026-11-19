@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Passive MCP config/cache discovery, usage correlation, overlap detection, and opt-in stdio probe."""
 
 from __future__ import annotations
@@ -8,21 +7,16 @@ import os
 import queue
 import re
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
 from typing import IO, Any, Mapping, Sequence
 
-_PACKAGE_ROOT = Path(__file__).resolve().parent.parent
-if str(_PACKAGE_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PACKAGE_ROOT))
-
-from bin.codex_toml import parse_codex_mcp_servers  # noqa: E402
-from bin.preamble_attribution import CODEX_TOOL_BYTES_PER_TOKEN, cap_parts_to_measured, median, server_key  # noqa: E402
-from hooks import state_store  # noqa: E402
-from spool.mcp_server import SPOOL_MCP_TOOL_SCHEMAS  # noqa: E402
-from spool.receipts import same_workspace_dir  # noqa: E402
+from core.platform_io import read_plugin_version
+from services.codex_toml import parse_codex_mcp_servers
+from services.preamble_attribution import CODEX_TOOL_BYTES_PER_TOKEN, cap_parts_to_measured, median, server_key
+from spool.mcp_server import SPOOL_MCP_TOOL_SCHEMAS
+from spool.receipts import same_workspace_dir
 
 SUPPORTED_HARNESSES: tuple[str, ...] = ("antigravity", "claude", "codex", "cursor")
 DEFAULT_PROBE_TIMEOUT_S: float = 3.0
@@ -51,6 +45,7 @@ _SECRET_KV_RE = re.compile(r"(?i)\b(?:bearer\s+\S+|(?:token|api[_-]?key|secret|p
 _SPOOL_SCHEMA_BYTES = len(json.dumps(SPOOL_MCP_TOOL_SCHEMAS, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
 _SPOOL_TOOL_NAMES = tuple(str(item["name"]) for item in SPOOL_MCP_TOOL_SCHEMAS)
 
+
 def _rel_to(target: Path, base: Path) -> Path | None:
     try:
         return target.relative_to(base)
@@ -60,9 +55,11 @@ def _rel_to(target: Path, base: Path) -> Path | None:
         except (OSError, RuntimeError, ValueError):
             return None
 
+
 def _redact_user_paths(text: str) -> str:
     cleaned = _WIN_USER_RE.sub("~", text)
     return _POSIX_USER_RE.sub("~", cleaned.replace("\\", "/") if cleaned != text else cleaned)
+
 
 def format_display_path(path: Path, home: Path, workspace_root: Path | None = None) -> str:
     """Format a path relative to workspace or home without exposing OS user directories."""
@@ -72,6 +69,7 @@ def format_display_path(path: Path, home: Path, workspace_root: Path | None = No
     if (rel_home := _rel_to(target, eff_home)) is not None:
         return "~" if str(rel_home) == "." else f"~/{rel_home.as_posix()}"
     return _redact_user_paths(target.as_posix())
+
 
 def _sanitize_text(text: str, home: Path, workspace_root: Path | None = None) -> str:
     out = str(text)
@@ -89,22 +87,16 @@ def _sanitize_text(text: str, home: Path, workspace_root: Path | None = None) ->
             pass
     return _redact_user_paths(_SECRET_KV_RE.sub("<redacted>", _URL_RE.sub("<url>", out)))
 
+
 def _cmd_basename(cmd: str | None) -> str | None:
     if not isinstance(cmd, str) or not (cleaned := cmd.strip()):
         return None
     return Path(cleaned.replace("\\", "/")).name or None
 
+
 def _nonneg_int(val: Any) -> int:
     return val if isinstance(val, int) and not isinstance(val, bool) and val > 0 else 0
 
-def _plugin_version() -> str:
-    try:
-        data = json.loads((state_store.resolve_plugin_root() / "plugin.json").read_text(encoding="utf-8"))
-        if isinstance(data, Mapping) and isinstance(data.get("version"), str) and data["version"].strip():
-            return data["version"].strip()
-    except (OSError, ValueError, TypeError):
-        pass
-    return "0.0.0"
 
 def _make_server_record(
     name: str, harness: str, scope: str, source: str, transport: str, enabled: bool, command_basename: str | None
@@ -120,10 +112,12 @@ def _make_server_record(
         "probe_duration_ms": None, "probe_error": None,
     }
 
+
 def _is_bundled_spool(name: str, command: str | None, args: Sequence[str]) -> bool:
     if name == "context-guard-spool":
         return True
     return any(isinstance(t, str) and t.strip() and Path(t.strip().replace("\\", "/")).name == "cg_spool.py" for t in (command, *args))
+
 
 def _apply_bundled_spool(srv: dict[str, Any]) -> None:
     divisor = CODEX_TOOL_BYTES_PER_TOKEN if srv["harness"] == "codex" else 4
@@ -132,6 +126,7 @@ def _apply_bundled_spool(srv: dict[str, Any]) -> None:
         "tool_names": list(_SPOOL_TOOL_NAMES), "schema_bytes": _SPOOL_SCHEMA_BYTES,
         "schema_bytes_evidence": "measured", "estimated_tokens": _SPOOL_SCHEMA_BYTES // divisor, "token_evidence": "estimated",
     })
+
 
 def _apply_antigravity_cache(srv: dict[str, Any], cache_dir: Path) -> bool:
     if not cache_dir.is_dir():
@@ -159,6 +154,7 @@ def _apply_antigravity_cache(srv: dict[str, Any], cache_dir: Path) -> bool:
     })
     return True
 
+
 def _read_json_mapping(
     cfg_path: Path, harness: str, home: Path, workspace_root: Path | None, issues: list[dict[str, str]]
 ) -> Mapping[str, Any] | None:
@@ -181,12 +177,14 @@ def _read_json_mapping(
         return None
     return raw
 
+
 def _json_transport(cfg: Mapping[str, Any], allow_server_url: bool) -> str:
     if cfg.get("type") in ("http", "sse") or any(
         isinstance((v := cfg.get(k)), str) and v.strip() for k in (("serverUrl", "url") if allow_server_url else ("url",))
     ):
         return "http"
     return "stdio" if isinstance((cmd := cfg.get("command")), str) and cmd.strip() else "unknown"
+
 
 def _add_json_servers(
     servers_obj: Any, harness: str, scope: str, source: str, disabled_names: set[str], allow_server_url: bool,
@@ -209,7 +207,11 @@ def _add_json_servers(
         raw_args = [str(x) for x in cfg["args"] if isinstance(x, str)] if isinstance(cfg.get("args"), list) else []
         raw_cwd = cfg.get("cwd") if isinstance(cfg.get("cwd"), str) and cfg["cwd"].strip() else None
         raw_env = cfg.get("env")
-        env_map = {str(k): str(v) for k, v in raw_env.items() if isinstance(k, str) and isinstance(v, (str, int, float, bool))} if isinstance(raw_env, Mapping) else {}
+        env_map = (
+            {str(k): str(v) for k, v in raw_env.items() if isinstance(k, str) and isinstance(v, (str, int, float, bool))}
+            if isinstance(raw_env, Mapping)
+            else {}
+        )
         enabled = not bool(cfg.get("disabled") is True or name in disabled_names)
         if cfg.get("disabled") is True:
             disabled_names.add(name)
@@ -217,7 +219,13 @@ def _add_json_servers(
         if not (cache_root is not None and _apply_antigravity_cache(rec, cache_root / name)) and _is_bundled_spool(name, raw_cmd, raw_args):
             _apply_bundled_spool(rec)
         out_servers.append(rec)
-        out_probes.append({"command": raw_cmd.strip(), "args": raw_args, "env": env_map, "cwd": raw_cwd} if rec["transport"] == "stdio" and raw_cmd and raw_cmd.strip() else None)
+        probe_spec = (
+            {"command": raw_cmd.strip(), "args": raw_args, "env": env_map, "cwd": raw_cwd}
+            if rec["transport"] == "stdio" and raw_cmd and raw_cmd.strip()
+            else None
+        )
+        out_probes.append(probe_spec)
+
 
 def _workspace_key_matches(raw_key: str, workspace_root: Path) -> bool:
     if raw_key == str(workspace_root) or same_workspace_dir(raw_key, workspace_root):
@@ -228,6 +236,7 @@ def _workspace_key_matches(raw_key: str, workspace_root: Path) -> bool:
         return os.path.normcase(str(Path(raw_key).resolve())) == os.path.normcase(str(workspace_root.resolve()))
     except (OSError, RuntimeError):
         return False
+
 
 def _discover_antigravity(
     home: Path, workspace_root: Path | None, servers: list[dict[str, Any]], probes: list[dict[str, Any] | None], issues: list[dict[str, str]]
@@ -249,10 +258,14 @@ def _discover_antigravity(
         for srv_dir in subdirs:
             if srv_dir.name in seen_names:
                 continue
-            rec = _make_server_record(srv_dir.name, "antigravity", "user", format_display_path(srv_dir, home, workspace_root), "ide_managed", srv_dir.name not in disabled_names, None)
+            rec = _make_server_record(
+                srv_dir.name, "antigravity", "user", format_display_path(srv_dir, home, workspace_root),
+                "ide_managed", srv_dir.name not in disabled_names, None,
+            )
             if _apply_antigravity_cache(rec, srv_dir):
                 servers.append(rec)
                 probes.append(None)
+
 
 def _discover_claude(
     home: Path, workspace_root: Path | None, servers: list[dict[str, Any]], probes: list[dict[str, Any] | None], issues: list[dict[str, str]]
@@ -269,13 +282,23 @@ def _discover_claude(
                 if isinstance(proj_key, str) and isinstance(proj_val, Mapping) and _workspace_key_matches(proj_key, workspace_root):
                     if isinstance(proj_val.get("disabledMcpjsonServers"), list):
                         disabled_mcpjson.update(str(x) for x in proj_val["disabledMcpjsonServers"] if isinstance(x, str))
-                    _add_json_servers(proj_val.get("mcpServers"), "claude", "workspace", disp, set(), False, servers, probes, seen_filter=seen_ws, issues=issues)
+                    _add_json_servers(
+                        proj_val.get("mcpServers"), "claude", "workspace", disp, set(), False,
+                        servers, probes, seen_filter=seen_ws, issues=issues,
+                    )
     if (sdata := _read_json_mapping(settings_json := home / ".claude" / "settings.json", "claude", home, workspace_root, issues)) is not None:
         if isinstance(sdata.get("disabledMcpjsonServers"), list):
             disabled_mcpjson.update(str(x) for x in sdata["disabledMcpjsonServers"] if isinstance(x, str))
-        _add_json_servers(sdata.get("mcpServers"), "claude", "user", format_display_path(settings_json, home, workspace_root), set(), False, servers, probes, issues=issues)
+        _add_json_servers(
+            sdata.get("mcpServers"), "claude", "user", format_display_path(settings_json, home, workspace_root),
+            set(), False, servers, probes, issues=issues,
+        )
     if workspace_root is not None and (mdata := _read_json_mapping(dot_mcp := workspace_root / ".mcp.json", "claude", home, workspace_root, issues)) is not None:
-        _add_json_servers(mdata.get("mcpServers"), "claude", "workspace", format_display_path(dot_mcp, home, workspace_root), disabled_mcpjson, False, servers, probes, issues=issues)
+        _add_json_servers(
+            mdata.get("mcpServers"), "claude", "workspace", format_display_path(dot_mcp, home, workspace_root),
+            disabled_mcpjson, False, servers, probes, issues=issues,
+        )
+
 
 def _discover_cursor(
     home: Path, workspace_root: Path | None, servers: list[dict[str, Any]], probes: list[dict[str, Any] | None], issues: list[dict[str, str]]
@@ -285,7 +308,11 @@ def _discover_cursor(
         targets.append((workspace_root / ".cursor" / "mcp.json", "workspace"))
     for cfg_path, scope in targets:
         if (data := _read_json_mapping(cfg_path, "cursor", home, workspace_root, issues)) is not None:
-            _add_json_servers(data.get("mcpServers"), "cursor", scope, format_display_path(cfg_path, home, workspace_root), set(), True, servers, probes, issues=issues)
+            _add_json_servers(
+                data.get("mcpServers"), "cursor", scope, format_display_path(cfg_path, home, workspace_root),
+                set(), True, servers, probes, issues=issues,
+            )
+
 
 def _discover_codex(
     home: Path, workspace_root: Path | None, servers: list[dict[str, Any]], probes: list[dict[str, Any] | None], issues: list[dict[str, str]]
@@ -307,13 +334,23 @@ def _discover_codex(
             raw_args = [str(x) for x in entry["args"] if isinstance(x, str)] if isinstance(entry.get("args"), list) else []
             raw_cwd = entry.get("cwd") if isinstance(entry.get("cwd"), str) and entry["cwd"].strip() else None
             raw_env = entry.get("env")
-            env_map = {str(k): str(v) for k, v in raw_env.items() if isinstance(k, str) and isinstance(v, (str, int, float, bool))} if isinstance(raw_env, Mapping) else {}
+            env_map = (
+                {str(k): str(v) for k, v in raw_env.items() if isinstance(k, str) and isinstance(v, (str, int, float, bool))}
+                if isinstance(raw_env, Mapping)
+                else {}
+            )
             transport = "http" if isinstance(raw_url, str) and raw_url.strip() else ("stdio" if isinstance(raw_cmd, str) and raw_cmd.strip() else "unknown")
             rec = _make_server_record(str(entry["name"]), "codex", scope, disp, transport, bool(entry.get("enabled", True)), _cmd_basename(raw_cmd))
             if _is_bundled_spool(rec["name"], raw_cmd, raw_args):
                 _apply_bundled_spool(rec)
             servers.append(rec)
-            probes.append({"command": raw_cmd.strip(), "args": raw_args, "env": env_map, "cwd": raw_cwd} if transport == "stdio" and isinstance(raw_cmd, str) and raw_cmd.strip() else None)
+            probe_spec = (
+                {"command": raw_cmd.strip(), "args": raw_args, "env": env_map, "cwd": raw_cwd}
+                if transport == "stdio" and isinstance(raw_cmd, str) and raw_cmd.strip()
+                else None
+            )
+            probes.append(probe_spec)
+
 
 def _discover_configs_internal(
     home: Path, workspace_root: Path | None = None, *, harnesses: Sequence[str] | None = None
@@ -328,6 +365,7 @@ def _discover_configs_internal(
         dispatch[harness](eff_home, eff_ws, servers, probes, issues)
     return servers, probes, issues
 
+
 def discover_passive_mcp_configs(
     home: Path, workspace_root: Path | None = None, *, harnesses: Sequence[str] | None = None
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
@@ -335,12 +373,14 @@ def discover_passive_mcp_configs(
     servers, _probes, issues = _discover_configs_internal(home, workspace_root, harnesses=harnesses)
     return servers, issues
 
+
 def _decode_json_dict(raw: bytes) -> dict[str, Any] | None:
     try:
         obj = json.loads(raw.decode("utf-8"))
         return obj if isinstance(obj, dict) else None
     except (UnicodeDecodeError, ValueError):
         return None
+
 
 def _consume_rpc_frames(buf: bytearray) -> tuple[list[dict[str, Any]], bool]:
     msgs: list[dict[str, Any]] = []
@@ -366,8 +406,11 @@ def _consume_rpc_frames(buf: bytearray) -> tuple[list[dict[str, Any]], bool]:
         if sep == -1:
             return (msgs, True) if len(buf) > 16384 else (msgs, False)
         content_len = next(
-            (int(v) for h in bytes(buf[:sep]).decode("ascii", errors="replace").splitlines()
-             if h.lower().startswith("content-length:") and (v := h.split(":", 1)[1].strip()).isdigit()),
+            (
+                int(v)
+                for h in bytes(buf[:sep]).decode("ascii", errors="replace").splitlines()
+                if h.lower().startswith("content-length:") and (v := h.split(":", 1)[1].strip()).isdigit()
+            ),
             None,
         )
         if content_len is None or content_len < 0:
@@ -382,6 +425,7 @@ def _consume_rpc_frames(buf: bytearray) -> tuple[list[dict[str, Any]], bool]:
         msgs.append(obj)
     return msgs, False
 
+
 def _pump_stdout(stream: IO[bytes], out_q: queue.Queue[bytes | None], max_bytes: int) -> None:
     read1_fn, seen = getattr(stream, "read1", None), 0
     try:
@@ -395,12 +439,14 @@ def _pump_stdout(stream: IO[bytes], out_q: queue.Queue[bytes | None], max_bytes:
     finally:
         out_q.put(None)
 
+
 def _drain_stderr(stream: IO[bytes]) -> None:
     try:
         while stream.read(4096):
             pass
     except (OSError, ValueError):
         pass
+
 
 def _probe_result(
     status: str, start: float, *, tool_names: list[str] | None = None, schema_bytes: int | None = None, error: str | None = None
@@ -412,9 +458,11 @@ def _probe_result(
         "probe_duration_ms": round((time.monotonic() - start) * 1000.0, 2), "probe_error": error,
     }
 
+
 def _send_rpc(stdin: IO[bytes], payload: Mapping[str, Any]) -> None:
     stdin.write(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8") + b"\n")
     stdin.flush()
+
 
 def _cleanup_proc(proc: subprocess.Popen[bytes], threads: Sequence[threading.Thread]) -> None:
     if proc.stdin is not None:
@@ -442,6 +490,7 @@ def _cleanup_proc(proc: subprocess.Popen[bytes], threads: Sequence[threading.Thr
                 pass
     for th in threads:
         th.join(timeout=0.1)
+
 
 def probe_stdio_mcp_server(
     command: str, args: Sequence[str] = (), env: Mapping[str, str] | None = None, cwd: Path | None = None,
@@ -472,7 +521,19 @@ def probe_stdio_mcp_server(
         for th in threads:
             th.start()
         try:
-            _send_rpc(proc.stdin, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "context-guard", "version": _plugin_version()}}})
+            _send_rpc(
+                proc.stdin,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "clientInfo": {"name": "context-guard", "version": read_plugin_version(default="0.0.0")},
+                    },
+                },
+            )
         except OSError:
             return _probe_result("protocol_error", start, error="stdin closed during initialize")
 
@@ -512,6 +573,7 @@ def probe_stdio_mcp_server(
                     return _probe_result("ok", start, tool_names=names, schema_bytes=sbytes)
     finally:
         _cleanup_proc(proc, threads)
+
 
 def analyze_mcp_overlaps(servers: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Detect duplicate active server definitions, duplicate tool names, and native tool overlaps."""
@@ -553,7 +615,11 @@ def analyze_mcp_overlaps(servers: Sequence[Mapping[str, Any]]) -> list[dict[str,
                 "kind": "duplicate_tool_name", "harness": harness, "tool_name": tname,
                 "servers": sorted(providers.values()), "detail": f"Tool `{tname}` exposed by multiple active servers in {harness}",
             })
-    return sorted(overlaps, key=lambda r: (str(r.get("kind") or ""), str(r.get("harness") or ""), str(r.get("normalized_key") or r.get("tool_name") or ""), str(r.get("category") or "")))
+    return sorted(
+        overlaps,
+        key=lambda r: (str(r.get("kind") or ""), str(r.get("harness") or ""), str(r.get("normalized_key") or r.get("tool_name") or ""), str(r.get("category") or "")),
+    )
+
 
 def _extract_transcript_medians(usage_state: Mapping[str, Any] | None) -> dict[tuple[str, str], int]:
     if not isinstance(usage_state, Mapping):
@@ -576,6 +642,7 @@ def _extract_transcript_medians(usage_state: Mapping[str, Any] | None) -> dict[t
             for k, total in per_key.items():
                 buckets.setdefault((harness, k), []).append(total)
     return {pair: median(vals) for pair, vals in buckets.items() if vals and median(vals) > 0}
+
 
 def _correlate_usage(
     servers: list[dict[str, Any]], probes: list[dict[str, Any] | None],
@@ -610,6 +677,7 @@ def _correlate_usage(
         servers.append(rec)
         probes.append(None)
 
+
 def collect_mcp_inventory(
     home: Path, workspace_root: Path | None = None, usage_state: Mapping[str, Any] | None = None, *,
     harnesses: Sequence[str] | None = None, probe: bool = False,
@@ -633,7 +701,8 @@ def collect_mcp_inventory(
             raw_cmd, raw_args, raw_cwd = str(spec["command"]), list(spec["args"]), spec["cwd"]
             if eff_ws is not None:
                 ws_str = str(eff_ws)
-                raw_cmd, raw_args = raw_cmd.replace("${workspaceFolder}", ws_str), [a.replace("${workspaceFolder}", ws_str) for a in raw_args]
+                raw_cmd = raw_cmd.replace("${workspaceFolder}", ws_str)
+                raw_args = [a.replace("${workspaceFolder}", ws_str) for a in raw_args]
                 raw_cwd = raw_cwd.replace("${workspaceFolder}", ws_str) if raw_cwd else None
             if any(_UNRESOLVED_TMPL_RE.search(tok) for tok in (raw_cmd, *raw_args, raw_cwd or "")):
                 srv["probe_status"] = "skipped_missing_workspace"

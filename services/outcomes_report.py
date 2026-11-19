@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from typing import Any, Mapping
 
-from bin.tariffs import TARIFF_EFFECTIVE_DATE, attribute_turn_cost, resolve_model_tariff
+from services.tariffs import TARIFF_EFFECTIVE_DATE, attribute_turn_cost, resolve_model_tariff
 
 COST_ATTRIBUTION_BASIS = (
     "1/k step-weighted share of mean (harness, model) API list event cost; "

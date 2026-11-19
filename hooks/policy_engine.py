@@ -1,58 +1,34 @@
-"""Stage-2 scoped fail-closed policy pack evaluation and lifecycle dispatch."""
-
+"""Scoped fail-closed policy pack evaluation and lifecycle dispatch."""
 from __future__ import annotations
 
-import os
-import re
+import dataclasses, os, re
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
+from core.platform_io import warn
 from hooks.config import LEGACY_SECURITY_DOMAIN_MAP, resolve_user_config_path
 from hooks.harness_adapter import NormalizedToolCall
-from hooks.state_store import warn
-from policies.api import (
-    ALL_SECURITY_SCOPES,
-    PolicyContext,
-    PolicyDecision,
-    PolicyPackManifest,
-    PolicyPostContext,
-)
+from policies.api import ALL_SECURITY_SCOPES, PolicyContext, PolicyDecision, PolicyPackManifest, PolicyPostContext
 from policies.loader import (
-    PACK_MODULE_PREFIX,
-    SAFE_PACK_ID_RE,
-    PolicyPackLoadError,
-    clear_pack_cache,
-    compile_verified_manifest,
-    get_cached_manifest,
-    normalize_pack_ns,
-    verify_pack_tree_bytes,
+    SAFE_PACK_ID_RE, PolicyPackLoadError, clear_pack_cache, compile_verified_manifest,
+    get_cached_manifest, normalize_pack_ns, verify_pack_tree_bytes,
 )
 
 __all__ = [
-    "PolicyPackLoadError",
-    "SAFE_PACK_ID_RE",
-    "apply_overwrite_to_call",
-    "apply_policy_packs",
-    "apply_policy_packs_with_records",
-    "clear_pack_cache",
-    "infer_tool_scopes",
-    "load_verified_policy_pack",
-    "normalize_pack_ns",
-    "notify_session_transition",
-    "reconcile_post_transform",
-    "run_post_tool_hooks",
-    "run_pre_decision_hooks",
-    "verify_policy_pack_tree",
-    "verify_security_policies_post_transform",
+    "PolicyPackLoadError", "SAFE_PACK_ID_RE", "apply_overwrite_to_call", "apply_policy_packs",
+    "apply_policy_packs_with_records", "clear_pack_cache", "infer_tool_scopes", "load_verified_policy_pack",
+    "normalize_pack_ns", "notify_session_transition", "reconcile_post_transform", "run_post_tool_hooks",
+    "run_pre_decision_hooks", "verify_policy_pack_tree", "verify_security_policies_post_transform", "warn",
 ]
 
-_READ_ONLY_TOOLS = frozenset({"read_file", "view_file"})
+_READ_ONLY_TOOLS = frozenset({"read_file", "view_file", "notebookread"})
 _MUTATING_TOOLS = frozenset({
     "edit_file", "write_file", "edit", "multiedit", "multi_edit", "write", "notebookedit", "strreplace", "multistrreplace",
     "editfile", "writefile", "deletefile", "delete", "delete_file", "create_file", "replace_file_content",
     "multi_replace_file_content", "write_to_file", "apply_patch",
 })
 _SHELL_TOOLS = frozenset({"run_command", "bash", "shell", "exec", "exec_command", "shell_command", "run_terminal_cmd"})
+_PATH_ARG_KEYS = ("Path", "AbsolutePath", "TargetFile", "file_path", "path", "notebook_path", "filePath")
 
 
 def _trusted_pack_roots(config_path: Path | None = None, extra_roots: tuple[Path, ...] = ()) -> tuple[Path, ...]:
@@ -74,20 +50,15 @@ def _trusted_pack_roots(config_path: Path | None = None, extra_roots: tuple[Path
 
 
 def verify_policy_pack_tree(
-    pack_root: Path,
-    entry: Mapping[str, Any],
-    *,
-    trusted_roots: tuple[Path, ...] = (),
-    cwd: str | None = None,
-    config_path: Path | None = None,
+    pack_root: Path, entry: Mapping[str, Any], *,
+    trusted_roots: tuple[Path, ...] = (), cwd: str | None = None, config_path: Path | None = None,
 ) -> dict[str, bytes]:
     """Verify pack tree security and hashes against trusted roots, returning verified source bytes."""
-    eff_roots = _trusted_pack_roots(config_path=config_path, extra_roots=trusted_roots)
-    return verify_pack_tree_bytes(pack_root, entry, trusted_roots=eff_roots, cwd=cwd)
+    return verify_pack_tree_bytes(pack_root, entry, trusted_roots=_trusted_pack_roots(config_path=config_path, extra_roots=trusted_roots), cwd=cwd)
 
 
 def load_verified_policy_pack(
-    entry: Mapping[str, Any], *, config_path: Path | None = None, cwd: str | None = None
+    entry: Mapping[str, Any], *, config_path: Path | None = None, cwd: str | None = None,
 ) -> PolicyPackManifest:
     """Verify and compile a PolicyPackManifest strictly from verified in-memory bytes."""
     pack_id = str(entry.get("id") or "")
@@ -95,26 +66,38 @@ def load_verified_policy_pack(
     raw_path = entry.get("path")
     if not isinstance(raw_path, str) or not raw_path.strip() or Path(raw_path).expanduser().name != "pack.py":
         raise PolicyPackLoadError(f"pack entrypoint must be pack.py for {pack_id!r}")
-    pack_root = Path(raw_path).expanduser().parent
-    tree_sha = str(entry.get("tree_sha256") or "")
-    cached = get_cached_manifest(pack_id, pack_root, tree_sha)
-    if cached is not None:
+    pack_root, tree_sha = Path(raw_path).expanduser().parent, str(entry.get("tree_sha256") or "")
+    if (cached := get_cached_manifest(pack_id, pack_root, tree_sha)) is not None:
         return cached
-    verified_bytes = verify_policy_pack_tree(pack_root, entry, config_path=config_path, cwd=cwd)
-    return compile_verified_manifest(pack_id, pack_root, verified_bytes, tree_sha)
+    return compile_verified_manifest(pack_id, pack_root, verify_policy_pack_tree(pack_root, entry, config_path=config_path, cwd=cwd), tree_sha)
 
 
 def infer_tool_scopes(norm: NormalizedToolCall) -> tuple[str, ...]:
     """Infer security policy scopes (`file_mutation`, `shell_command`, `mcp_call`) for a normalized tool call."""
     ctool, otool = norm.canonical_tool.lower(), norm.original_tool_name.lower()
     scopes: list[str] = []
-    if ctool not in _READ_ONLY_TOOLS and (norm.mutated_paths or ctool in _MUTATING_TOOLS or otool in _MUTATING_TOOLS):
+    if ctool not in _READ_ONLY_TOOLS and (norm.mutated_paths or ctool == "delete_file" or ctool in _MUTATING_TOOLS or otool in _MUTATING_TOOLS):
         scopes.append("file_mutation")
     if ctool in _SHELL_TOOLS or otool in _SHELL_TOOLS:
         scopes.append("shell_command")
     if ctool == "call_mcp_tool" or otool.startswith(("mcp_", "mcp:", "mcp__")) or ctool.startswith(("mcp_", "mcp:", "mcp__")):
         scopes.append("mcp_call")
     return tuple(scopes)
+
+
+def _canonical_path(raw: str, cwd: str | None) -> str:
+    joined = raw if (os.path.isabs(raw) or raw.startswith("/") or not cwd) else os.path.join(cwd, raw)
+    return os.path.realpath(joined).replace("\\", "/")
+
+
+def _prefix_variants(pref: str) -> tuple[str, ...]:
+    norm = pref.replace("\\", "/")
+    if os.path.isabs(pref) or pref.startswith("/"):
+        real = os.path.realpath(pref).replace("\\", "/")
+        if pref.endswith(("/", "\\")) and not real.endswith("/"):
+            real += "/"
+        return (real,) if real == norm else (norm, real)
+    return (norm,)
 
 
 def _fallback_matches_entry(norm: NormalizedToolCall, scope: str, matchers: Any) -> bool:
@@ -124,21 +107,16 @@ def _fallback_matches_entry(norm: NormalizedToolCall, scope: str, matchers: Any)
     if scope == "file_mutation":
         if not isinstance(prefixes, (list, tuple)):
             return True
-        cands = [str(p).replace("\\", "/") for p in norm.mutated_paths if str(p).strip()]
-        cands.extend(
-            str(norm.canonical_args.get(k)).strip().replace("\\", "/")
-            for k in ("Path", "AbsolutePath", "TargetFile", "file_path", "path")
-            if isinstance(norm.canonical_args.get(k), str) and str(norm.canonical_args.get(k)).strip()
-        )
-        return any(isinstance(pref, str) and pref and pref.replace("\\", "/") in c for c in cands for pref in prefixes)
+        raw_cands = [s for p in norm.mutated_paths if (s := str(p).strip())]
+        raw_cands.extend(v.strip() for k in _PATH_ARG_KEYS if isinstance((v := norm.canonical_args.get(k)), str) and v.strip())
+        cands = [_canonical_path(raw, norm.cwd) for raw in raw_cands]
+        return any(pv in c for c in cands for pref in prefixes if isinstance(pref, str) and pref for pv in _prefix_variants(pref))
     if scope == "shell_command":
         cmds = matchers.get("shell_commands")
         if not isinstance(cmds, (list, tuple)) and not isinstance(prefixes, (list, tuple)):
             return True
         cmd = str(norm.canonical_args.get("CommandLine") or "")
-        return (
-            isinstance(cmds, (list, tuple)) and any(isinstance(c, str) and c and re.search(rf"\b{re.escape(c)}\b", cmd) for c in cmds)
-        ) or (
+        return (isinstance(cmds, (list, tuple)) and any(isinstance(c, str) and c and re.search(rf"\b{re.escape(c)}\b", cmd) for c in cmds)) or (
             isinstance(prefixes, (list, tuple)) and any(isinstance(pref, str) and pref and pref in cmd for pref in prefixes)
         )
     if scope == "mcp_call":
@@ -167,9 +145,7 @@ def _scoped_fail_closed(norm: NormalizedToolCall, entry: Mapping[str, Any] | Non
     if not declared or len(declared) != len(raw_scopes):
         return {"decision": "deny", "reason": reason}
     matchers = entry.get("fallback_matchers")
-    if any(sc in declared and _fallback_matches_entry(norm, sc, matchers) for sc in tool_scopes):
-        return {"decision": "deny", "reason": reason}
-    return None
+    return {"decision": "deny", "reason": reason} if any(sc in declared and _fallback_matches_entry(norm, sc, matchers) for sc in tool_scopes) else None
 
 
 def _pack_namespace_collisions(packs: list[Mapping[str, Any]]) -> set[str]:
@@ -190,26 +166,29 @@ def _pack_namespace_collisions(packs: list[Mapping[str, Any]]) -> set[str]:
     return bad
 
 
+def _is_pack_collision(pid: str, collisions: set[str]) -> bool:
+    if pid in collisions:
+        return True
+    try:
+        return normalize_pack_ns(pid) in collisions
+    except PolicyPackLoadError:
+        return True
+
+
 def _with_overwrite(norm: NormalizedToolCall, overwrite: Mapping[str, Any]) -> NormalizedToolCall:
     ow = dict(overwrite)
     new_orig, new_canon, mutated = {**norm.original_tool_input, **ow}, {**norm.canonical_args, **ow}, norm.mutated_paths
     if norm.canonical_tool == "run_command" and "CommandLine" not in ow and isinstance(ow.get("command") or ow.get("cmd"), str):
         new_canon["CommandLine"] = str(ow.get("command") or ow.get("cmd"))
-    for k in ("Path", "AbsolutePath", "TargetFile", "file_path", "path"):
-        v = ow.get(k)
-        if isinstance(v, str) and v.strip():
+    for k in _PATH_ARG_KEYS:
+        if isinstance((v := ow.get(k)), str) and v.strip():
             raw = v.strip()
             resolved = raw if (os.path.isabs(raw) or raw.startswith("/") or not norm.cwd) else str(Path(norm.cwd) / raw)
-            new_canon.setdefault("Path", resolved)
-            if norm.canonical_tool not in _READ_ONLY_TOOLS and norm.mutated_paths:
+            new_canon["Path"] = resolved
+            if norm.canonical_tool.lower() not in _READ_ONLY_TOOLS and (norm.mutated_paths or norm.canonical_tool.lower() in _MUTATING_TOOLS):
                 mutated = (resolved,)
             break
-    return NormalizedToolCall(
-        harness=norm.harness, canonical_tool=norm.canonical_tool, canonical_args=new_canon,
-        original_tool_name=norm.original_tool_name, original_tool_input=new_orig,
-        session_id=norm.session_id, step_idx=norm.step_idx, cwd=norm.cwd,
-        artifact_dir=norm.artifact_dir, mutated_paths=mutated, permission_mode=norm.permission_mode, call_id=norm.call_id,
-    )
+    return dataclasses.replace(norm, canonical_args=new_canon, original_tool_input=new_orig, mutated_paths=mutated)
 
 
 def apply_overwrite_to_call(norm: NormalizedToolCall, overwrite: Mapping[str, Any]) -> NormalizedToolCall:
@@ -245,7 +224,7 @@ def _run_policy_pass(
         kind, pid = str(entry.get("kind") or "security"), str(entry.get("id") or "")
         if security_only and kind != "security":
             continue
-        if pid in collisions or f"{PACK_MODULE_PREFIX}{re.sub(r'[^a-z0-9_]', '_', pid)}" in collisions:
+        if _is_pack_collision(pid, collisions):
             if kind == "security" and tool_scopes:
                 return {"decision": "deny", "reason": f"CONTEXT-GUARD PACK COLLISION (fail-closed): {pid}"}, eval_records, cur_norm, (cur_overwrite or None), True
             if kind != "security":
@@ -257,16 +236,15 @@ def _run_policy_pass(
                 raise PolicyPackLoadError(f"manifest kind {manifest.kind!r} does not match entry kind {kind!r}")
         except PolicyPackLoadError as exc:
             if kind == "security":
-                deny_dec = _scoped_fail_closed(cur_norm, entry, f"CONTEXT-GUARD SECURITY PACK ERROR (fail-closed): {exc}")
-                if deny_dec is not None:
+                if (deny_dec := _scoped_fail_closed(cur_norm, entry, f"CONTEXT-GUARD SECURITY PACK ERROR (fail-closed): {exc}")) is not None:
                     return deny_dec, eval_records, cur_norm, (cur_overwrite or None), True
             else:
                 warn(f"optimization pack {pid!r} skipped: {exc}")
             continue
-        if kind == "security" and manifest.kind == "security":
+        if kind == "security":
             covered_security_domains.update(str(d) for d in manifest.covered_domains)
         ctx = PolicyContext(
-            harness=cur_norm.harness, call_id=getattr(cur_norm, "call_id", "") or "", canonical_tool=cur_norm.canonical_tool,
+            harness=cur_norm.harness, call_id=cur_norm.call_id, canonical_tool=cur_norm.canonical_tool,
             canonical_args=dict(cur_norm.canonical_args), mutated_paths=cur_norm.mutated_paths,
             original_tool_name=cur_norm.original_tool_name, tool_input=dict(cur_norm.original_tool_input),
             cwd=cur_norm.cwd, session_id=cur_norm.session_id, step_idx=cur_norm.step_idx,
@@ -278,8 +256,7 @@ def _run_policy_pass(
             p_dec = manifest.evaluate(ctx)
         except Exception as exc:
             if kind == "security":
-                deny_dec = _scoped_fail_closed(cur_norm, entry, f"CONTEXT-GUARD POLICY EVALUATE ERROR (fail-closed): {type(exc).__name__}")
-                if deny_dec is not None:
+                if (deny_dec := _scoped_fail_closed(cur_norm, entry, f"CONTEXT-GUARD POLICY EVALUATE ERROR (fail-closed): {type(exc).__name__}")) is not None:
                     return deny_dec, eval_records, cur_norm, (cur_overwrite or None), True
             else:
                 warn(f"optimization pack {pid!r} crashed: {type(exc).__name__}")
@@ -305,11 +282,9 @@ def apply_policy_packs_with_records(
     norm: NormalizedToolCall, runtime_cfg: Mapping[str, Any], *,
     state_dir_path: Path | None = None, session_state_snapshot: Mapping[str, Any] | None = None, security_only: bool = False,
 ) -> tuple[dict[str, Any] | None, list[tuple[PolicyPackManifest, PolicyContext, PolicyDecision | None]], NormalizedToolCall, dict[str, Any] | None]:
-    """Evaluate active policy packs with Stage-2 scoped fail-closed fallback and pure evaluate() records."""
-    dec, recs, out_norm, ow, _ = _run_policy_pass(
-        norm, runtime_cfg, state_dir_path=state_dir_path,
-        session_state_snapshot=session_state_snapshot, security_only=security_only,
-    )
+    """Evaluate active policy packs with scoped fail-closed fallback and pure evaluate() records."""
+    dec, recs, out_norm, ow, _ = _run_policy_pass(norm, runtime_cfg, state_dir_path=state_dir_path,
+                                                   session_state_snapshot=session_state_snapshot, security_only=security_only)
     return dec, recs, out_norm, ow
 
 
@@ -318,10 +293,17 @@ def apply_policy_packs(
     state_dir_path: Path | None = None, session_state_snapshot: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Evaluate configured policy packs and return block decision or Pass-1 overwrite decision if any."""
-    dec, _, _, overwrite = apply_policy_packs_with_records(
-        norm, runtime_cfg, state_dir_path=state_dir_path, session_state_snapshot=session_state_snapshot, security_only=False
-    )
+    dec, _, _, overwrite = apply_policy_packs_with_records(norm, runtime_cfg, state_dir_path=state_dir_path, session_state_snapshot=session_state_snapshot)
     return dec if dec is not None else ({"decision": "allow", "overwrite": overwrite} if overwrite else None)
+
+
+def _verify_security_with_status(
+    transformed_norm: NormalizedToolCall, runtime_cfg: Mapping[str, Any], *,
+    state_dir_path: Path | None = None, session_state_snapshot: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, bool]:
+    dec, _, _, _, sec_err = _run_policy_pass(transformed_norm, runtime_cfg, state_dir_path=state_dir_path,
+                                             session_state_snapshot=session_state_snapshot, security_only=True)
+    return dec, sec_err
 
 
 def verify_security_policies_post_transform(
@@ -330,56 +312,33 @@ def verify_security_policies_post_transform(
 ) -> dict[str, Any] | None:
     """Re-verify transformed tool arguments against security packs without side effects."""
     _ = verify_only
-    dec, _, _, _ = apply_policy_packs_with_records(
-        transformed_norm, runtime_cfg, state_dir_path=state_dir_path, session_state_snapshot=session_state_snapshot, security_only=True
-    )
+    dec, _ = _verify_security_with_status(transformed_norm, runtime_cfg, state_dir_path=state_dir_path, session_state_snapshot=session_state_snapshot)
     return dec
 
 
 def reconcile_post_transform(
     candidate_norm: NormalizedToolCall, runtime_cfg: Mapping[str, Any], *,
-    fallback_norm: NormalizedToolCall | None = None,
-    state_dir_path: Path | None = None, session_state_snapshot: Mapping[str, Any] | None = None,
-    verify_fn: Callable[..., dict[str, Any] | None] | None = None,
+    fallback_norm: NormalizedToolCall | None = None, state_dir_path: Path | None = None,
+    session_state_snapshot: Mapping[str, Any] | None = None, verify_fn: Callable[..., Any] | None = None,
 ) -> tuple[str, dict[str, Any] | None]:
-    """Run Pass-2 4-case resolution: `'allow'` candidate, `'discard'` to safe fallback, or `'deny'`."""
-    if verify_fn is not None:
-        p2_dec = verify_fn(
-            candidate_norm, runtime_cfg, state_dir_path=state_dir_path,
-            session_state_snapshot=session_state_snapshot,
-        )
-        if p2_dec is None:
-            return "allow", None
-        if fallback_norm is None:
-            return "deny", p2_dec
-        fb_dec = verify_fn(
-            fallback_norm, runtime_cfg, state_dir_path=state_dir_path,
-            session_state_snapshot=session_state_snapshot,
-        )
-        return ("deny", fb_dec) if fb_dec is not None else ("discard", None)
-    p2_dec, _, _, _, sec_err = _run_policy_pass(
-        candidate_norm, runtime_cfg, state_dir_path=state_dir_path,
-        session_state_snapshot=session_state_snapshot, security_only=True,
-    )
+    """Run Pass-2 resolution: `'allow'` candidate, `'discard'` to safe fallback, or `'deny'`."""
+    def _verify(target: NormalizedToolCall) -> tuple[dict[str, Any] | None, bool]:
+        if verify_fn is not None and verify_fn is not verify_security_policies_post_transform:
+            res = verify_fn(target, runtime_cfg, state_dir_path=state_dir_path, session_state_snapshot=session_state_snapshot)
+            return (res[0], bool(res[1])) if isinstance(res, tuple) and len(res) == 2 else (res, False)
+        return _verify_security_with_status(target, runtime_cfg, state_dir_path=state_dir_path, session_state_snapshot=session_state_snapshot)
+
+    p2_dec, sec_err = _verify(candidate_norm)
     if p2_dec is None:
         return "allow", None
     if sec_err or fallback_norm is None:
         return "deny", p2_dec
-    fb_dec, _, _, _, _ = _run_policy_pass(
-        fallback_norm, runtime_cfg, state_dir_path=state_dir_path,
-        session_state_snapshot=session_state_snapshot, security_only=True,
-    )
+    fb_dec, _ = _verify(fallback_norm)
     return ("deny", fb_dec) if fb_dec is not None else ("discard", None)
 
 
-def run_pre_decision_hooks(
-    eval_records: list[tuple[PolicyPackManifest, PolicyContext, PolicyDecision | None]],
-) -> bool:
-    """Invoke side-effect callbacks for evaluated packs outside locked_state().
-
-    Returns False if any callback raised OSError (so callers can apply fail-open
-    fallbacks for retryable hatches backed by disk state), True otherwise.
-    """
+def run_pre_decision_hooks(eval_records: list[tuple[PolicyPackManifest, PolicyContext, PolicyDecision | None]]) -> bool:
+    """Invoke side-effect callbacks for evaluated packs outside locked_state()."""
     saved_ok = True
     for manifest, ctx, dec in eval_records:
         if manifest.on_pre_decision is not None:
@@ -394,15 +353,22 @@ def run_pre_decision_hooks(
 
 
 def _iter_enabled_manifests(runtime_cfg: Mapping[str, Any], *, cwd: str | None = None) -> Iterator[tuple[PolicyPackManifest, dict[str, Any]]]:
+    packs = [p for p in (runtime_cfg.get("policy_packs") or []) if isinstance(p, Mapping) and p.get("enabled", True)]
+    collisions = _pack_namespace_collisions(packs)
     cfg_path_raw = runtime_cfg.get("config_path")
     cfg_path = Path(str(cfg_path_raw)) if isinstance(cfg_path_raw, str) and cfg_path_raw else None
-    for entry in runtime_cfg.get("policy_packs") or []:
-        if not isinstance(entry, Mapping) or not entry.get("enabled", True):
+    for entry in packs:
+        pid = str(entry.get("id") or "")
+        if _is_pack_collision(pid, collisions):
+            warn(f"policy pack namespace collision skipped: {pid}")
             continue
         try:
-            yield load_verified_policy_pack(entry, config_path=cfg_path, cwd=cwd), dict(entry.get("settings") or {})
-        except PolicyPackLoadError:
-            continue
+            manifest = load_verified_policy_pack(entry, config_path=cfg_path, cwd=cwd)
+            if manifest.kind != (kind := str(entry.get("kind") or "security")):
+                raise PolicyPackLoadError(f"manifest kind {manifest.kind!r} does not match entry kind {kind!r}")
+            yield manifest, dict(entry.get("settings") or {})
+        except PolicyPackLoadError as exc:
+            warn(f"policy pack {pid!r} skipped: {exc}")
 
 
 def run_post_tool_hooks(post_ctx: PolicyPostContext, runtime_cfg: Mapping[str, Any]) -> None:
@@ -410,13 +376,7 @@ def run_post_tool_hooks(post_ctx: PolicyPostContext, runtime_cfg: Mapping[str, A
     for manifest, settings in _iter_enabled_manifests(runtime_cfg, cwd=post_ctx.cwd):
         if manifest.on_tool_completed is not None:
             try:
-                manifest.on_tool_completed(PolicyPostContext(
-                    harness=post_ctx.harness, call_id=post_ctx.call_id, canonical_tool=post_ctx.canonical_tool,
-                    canonical_args=post_ctx.canonical_args, mutated_paths=post_ctx.mutated_paths,
-                    original_tool_name=post_ctx.original_tool_name, tool_input=post_ctx.tool_input,
-                    succeeded=post_ctx.succeeded, error=post_ctx.error, cwd=post_ctx.cwd,
-                    state_dir=post_ctx.state_dir, settings=settings,
-                ))
+                manifest.on_tool_completed(dataclasses.replace(post_ctx, settings=settings))
             except Exception as exc:
                 warn(f"on_tool_completed error ignored ({type(exc).__name__}): {exc}")
 

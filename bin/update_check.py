@@ -4,30 +4,32 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 import json
 import os
+from pathlib import Path
 import re
 import subprocess
 import sys
 import threading
-from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 if str(_PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(_PACKAGE_ROOT))
 
-fcntl: Any
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows
-    from hooks import file_io as fcntl
-
-from bin.harness_status import check_status  # noqa: E402
-from hooks.state_store import resolve_plugin_root, warn  # noqa: E402
-from hooks.telemetry import read_json_object_or_quarantine, write_json_atomic  # noqa: E402
+from core.platform_io import (  # noqa: E402
+    LOCK_EX,
+    LOCK_NB,
+    LOCK_UN,
+    flock,
+    read_json_object_or_quarantine,
+    resolve_plugin_root,
+    warn,
+    write_json_atomic,
+)
+from services.harness_status import check_status  # noqa: E402
 
 ROOT = resolve_plugin_root()
 
@@ -58,38 +60,25 @@ def update_lock(
     lock_name: str = UPDATE_LOCK,
 ) -> Iterator[bool]:
     """Acquire an exclusive flock on `telemetry_dir / lock_name` opened in `'a+'` mode (never `'w'`)."""
+    fh = None
     try:
         telemetry_dir.mkdir(parents=True, exist_ok=True)
         lock_path = telemetry_dir / lock_name
         canon = os.path.realpath(lock_path)
-    except OSError as exc:
-        if not non_blocking:
-            warn(f"update lock skipped: {type(exc).__name__}: {exc}")
-        yield False
-        return
-
-    held = _held_lock_set()
-    if canon in held:
-        yield True
-        return
-
-    try:
+        held = _held_lock_set()
+        if canon in held:
+            yield True
+            return
         fh = open(lock_path, "a+", encoding="utf-8")
-    except OSError as exc:
-        if not non_blocking:
-            warn(f"update lock skipped: {type(exc).__name__}: {exc}")
-        yield False
-        return
-
-    flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if non_blocking else 0)
-    try:
-        fcntl.flock(fh.fileno(), flags)
+        flock(fh.fileno(), LOCK_EX | (LOCK_NB if non_blocking else 0))
     except BlockingIOError:
-        fh.close()
+        if fh is not None:
+            fh.close()
         yield False
         return
     except OSError as exc:
-        fh.close()
+        if fh is not None:
+            fh.close()
         if not non_blocking:
             warn(f"update lock skipped: {type(exc).__name__}: {exc}")
         yield False
@@ -101,10 +90,11 @@ def update_lock(
     finally:
         held.discard(canon)
         try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            flock(fh.fileno(), LOCK_UN)
         except OSError:
             pass
         fh.close()
+
 
 _VERSION_RE = re.compile(r"v?(\d+)\.(\d+)\.(\d+)")
 _TAG_REF_RE = re.compile(r"refs/tags/(v\d+\.\d+\.\d+)(?:\^\{\})?")
@@ -127,13 +117,9 @@ def latest_tag(ls_remote_output: str) -> Optional[str]:
     for line in ls_remote_output.splitlines():
         _, _, ref = line.partition("\t")
         match = _TAG_REF_RE.fullmatch(ref.strip())
-        if match:
-            parsed = parse_version(match[1])
-            if parsed is not None:
-                versions.add(parsed)
-    if not versions:
-        return None
-    return ".".join(str(part) for part in max(versions))
+        if match and (parsed := parse_version(match[1])) is not None:
+            versions.add(parsed)
+    return ".".join(str(part) for part in max(versions)) if versions else None
 
 
 def evaluate_update(
@@ -184,6 +170,13 @@ def _text_field(record: Dict[str, Any], key: str) -> Optional[str]:
     return value if isinstance(value, str) else None
 
 
+def _safe_read_obj(path: Path) -> Dict[str, Any]:
+    try:
+        return read_json_object_or_quarantine(path) or {}
+    except OSError:
+        return {}
+
+
 def run_git(args: list) -> subprocess.CompletedProcess:
     """Run git without ever waiting on a person: no credential, GCM or ssh passphrase prompt, 10 s cap."""
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
@@ -200,18 +193,10 @@ def hooks_registered() -> bool:
         return False
 
 
-def _resolve_run_git(explicit: Optional[RunGit]) -> RunGit:
-    return explicit if explicit is not None else run_git
-
-
-def _resolve_hooks_registered(explicit: Optional[Callable[[], bool]]) -> Callable[[], bool]:
-    return explicit if explicit is not None else hooks_registered
-
-
-def _ls_remote_latest(plugin_root: Path, run_git: RunGit, previous: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+def _ls_remote_latest(plugin_root: Path, git_fn: RunGit, previous: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     """(latest, remote_error); a failed call keeps `previous` and names the failure."""
     try:
-        proc = run_git(["git", "-C", str(plugin_root), "ls-remote", "--tags", "origin"])
+        proc = git_fn(["git", "-C", str(plugin_root), "ls-remote", "--tags", "origin"])
     except (OSError, subprocess.SubprocessError) as exc:
         return previous, type(exc).__name__
     if proc.returncode != 0:
@@ -229,15 +214,12 @@ def refresh_update_state(
     hooks_registered: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
     """Recompute and write telemetry/update.json; the remote is asked at most once per 24 hours."""
-    effective_run_git = _resolve_run_git(run_git)
-    effective_hooks_registered = _resolve_hooks_registered(hooks_registered)
+    effective_run_git = run_git if run_git is not None else globals()["run_git"]
+    effective_hooks_registered = hooks_registered if hooks_registered is not None else globals()["hooks_registered"]
     telemetry_dir = plugin_root / "telemetry"
     update_path = telemetry_dir / UPDATE_RECORD
     with update_lock(telemetry_dir, non_blocking=False):
-        try:
-            previous = read_json_object_or_quarantine(update_path) or {}
-        except OSError:
-            previous = {}
+        previous = _safe_read_obj(update_path)
 
     did_remote = False
     fetched_latest: Optional[str] = None
@@ -248,18 +230,11 @@ def refresh_update_state(
         if (plugin_root / ".git").exists():
             fetched_latest, fetched_error = _ls_remote_latest(plugin_root, effective_run_git, prev_latest)
         else:
-            fetched_latest = prev_latest
-            fetched_error = NO_GIT_CHECKOUT
+            fetched_latest, fetched_error = prev_latest, NO_GIT_CHECKOUT
 
     with update_lock(telemetry_dir, non_blocking=False):
-        try:
-            current_prev = read_json_object_or_quarantine(update_path) or {}
-        except OSError:
-            current_prev = {}
-        try:
-            install = read_json_object_or_quarantine(telemetry_dir / INSTALL_RECORD) or {}
-        except OSError:
-            install = {}
+        current_prev = _safe_read_obj(update_path)
+        install = _safe_read_obj(telemetry_dir / INSTALL_RECORD)
         installed = _text_field(install, "version")
         if did_remote:
             checked_at: Optional[str] = _iso(now)
@@ -306,7 +281,7 @@ def record_install(plugin_root: Path, now: datetime) -> Dict[str, Any]:
             warn(f"install record save skipped: {type(exc).__name__}: {exc}")
         state = refresh_update_state(plugin_root, now, remote=False)
         if not wrote_install:
-            ever_installed = local_ver is not None or _resolve_hooks_registered(None)()
+            ever_installed = local_ver is not None or hooks_registered()
             state = {
                 **state,
                 "installed": local_ver,
@@ -316,6 +291,7 @@ def record_install(plugin_root: Path, now: datetime) -> Dict[str, Any]:
 
 
 def remove_install_record(plugin_root: Path) -> None:
+    """Remove `telemetry/install.json` under the update lock on uninstall."""
     telemetry_dir = plugin_root / "telemetry"
     with update_lock(telemetry_dir, non_blocking=False):
         try:
@@ -325,6 +301,7 @@ def remove_install_record(plugin_root: Path) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI entrypoint for `--force` and `--plugin-root` update check."""
     parser = argparse.ArgumentParser(description="Check for a newer Context-Guard release tag.")
     parser.add_argument("--force", action="store_true", help="Ignore the 24-hour cache")
     parser.add_argument("--plugin-root", type=Path, default=resolve_plugin_root(), help=argparse.SUPPRESS)
@@ -344,11 +321,7 @@ def main(argv: list[str] | None = None) -> int:
     with update_lock(telemetry_dir, non_blocking=True, lock_name=UPDATE_REFRESH_LOCK) as acquired:
         if not acquired:
             return 0
-        state = refresh_update_state(
-            args.plugin_root,
-            datetime.now(timezone.utc),
-            force=args.force,
-        )
+        state = refresh_update_state(args.plugin_root, datetime.now(timezone.utc), force=args.force)
     print(json.dumps(state, indent=2))
     return 0
 

@@ -6,7 +6,7 @@ import math
 
 import pytest
 
-from bin.tariffs import compute_turn_tariff_cost_usd
+from services.tariffs import compute_turn_tariff_cost_usd
 from evidence.metrics import (
     EXTERNAL_NOISE_REASONS,
     compute_arm_summary,

@@ -469,8 +469,8 @@ def test_shadow_mode_invalidates_on_file_edit_compaction_and_rewind_and_hashes_p
     assert len(hashed) == 32 and hashed == telemetry.pseudonymize_shadow_path(canon)
     assert "secret_customer_file" not in hashed
 
-    assert telemetry.record_shadow_read("sess-1", canon, 1, 50, 2, 1, "sha-a", min_tier=2, shadow_path=shadow_path, now_ts=1_000.0)
-    assert telemetry.load_shadow_ledger(shadow_path, now_ts=1_000.0)["sessions"]["sess-1"]["paths"][hashed]["reads"] == []
+    assert not telemetry.record_shadow_read("sess-1", canon, 1, 50, 2, 1, "sha-a", min_tier=2, shadow_path=shadow_path, now_ts=1_000.0)
+    assert hashed not in telemetry.load_shadow_ledger(shadow_path, now_ts=1_000.0)["sessions"].get("sess-1", {}).get("paths", {})
     assert telemetry.record_shadow_read("sess-1", canon, 1, 50, 3, 2, "sha-a", min_tier=2, shadow_path=shadow_path, now_ts=1_001.0)
     assert telemetry.record_shadow_read("sess-1", canon, 51, 90, 6, 3, "sha-a", min_tier=2, shadow_path=shadow_path, now_ts=1_002.0)
 

@@ -18,6 +18,7 @@ import urllib.request
 import pytest
 
 from bin import cg_export
+from services import export_service
 from evidence.ledger import append_durable_events
 from hooks.outcomes import record_direct_outcome
 from spool.receipts import append_receipt, build_receipt
@@ -51,9 +52,9 @@ def _try_symlink(target: Path, link_path: Path) -> bool:
 
 def test_otel_export_builds_valid_otlp_spans_and_logs_with_deterministic_ids(tmp_path: Path) -> None:
     empty_receipts = tmp_path / "empty_spool" / "receipts.jsonl"
-    empty_bundle = cg_export.build_otel_export_bundle(receipts_path=empty_receipts)
+    empty_bundle = export_service.build_otel_export_bundle(receipts_path=empty_receipts)
     assert empty_bundle == {
-        "schema_version": cg_export.OTEL_EXPORT_SCHEMA_VERSION,
+        "schema_version": export_service.OTEL_EXPORT_SCHEMA_VERSION,
         "ok": True,
         "exported_events": 0,
         "privacy_scrubbed": True,
@@ -124,8 +125,8 @@ def test_otel_export_builds_valid_otlp_spans_and_logs_with_deterministic_ids(tmp
     for row in (sliced, created, failed):
         assert append_receipt(row, receipts_path) is True
 
-    bundle_a = cg_export.build_otel_export_bundle(receipts_path=receipts_path)
-    bundle_b = cg_export.build_otel_export_bundle(receipts_path=receipts_path)
+    bundle_a = export_service.build_otel_export_bundle(receipts_path=receipts_path)
+    bundle_b = export_service.build_otel_export_bundle(receipts_path=receipts_path)
     assert bundle_a == bundle_b
     assert bundle_a["schema_version"] == 1
     assert bundle_a["ok"] is True
@@ -134,7 +135,7 @@ def test_otel_export_builds_valid_otlp_spans_and_logs_with_deterministic_ids(tmp
 
     manifest_version = str(json.loads((ROOT / "plugin.json").read_text(encoding="utf-8"))["version"])
     res_attrs = _attr_map(bundle_a["resourceSpans"][0]["resource"]["attributes"])
-    assert set(res_attrs) == set(cg_export.ALLOWED_OTEL_RESOURCE_ATTRIBUTES)
+    assert set(res_attrs) == set(export_service.ALLOWED_OTEL_RESOURCE_ATTRIBUTES)
     assert res_attrs == {
         "service.name": "context-guard",
         "service.version": manifest_version,
@@ -172,7 +173,7 @@ def test_otel_export_builds_valid_otlp_spans_and_logs_with_deterministic_ids(tmp
         sp_attrs = _attr_map(sp["attributes"])
         lg_attrs = _attr_map(lg["attributes"])
         assert sp_attrs == lg_attrs
-        assert set(sp_attrs).issubset(cg_export.ALLOWED_OTEL_EVENT_ATTRIBUTES)
+        assert set(sp_attrs).issubset(export_service.ALLOWED_OTEL_EVENT_ATTRIBUTES)
         assert sp_attrs["context_guard.session_hash"] == expected_sess_hash
         assert sp["traceId"] == lg["traceId"]
         assert sp["spanId"] == lg["spanId"]
@@ -253,7 +254,7 @@ def test_otel_export_deduplicates_events_and_supports_window_and_outcomes(tmp_pa
     raw_outcomes["policy_packs"] = ["/Users/alice/private_policy_pack"]
     outcomes_path.write_text(json.dumps(raw_outcomes), encoding="utf-8")
 
-    full_bundle = cg_export.build_otel_export_bundle(
+    full_bundle = export_service.build_otel_export_bundle(
         receipts_path=receipts_path,
         ledger_path=ledger_path,
         outcomes_path=outcomes_path,
@@ -268,7 +269,7 @@ def test_otel_export_deduplicates_events_and_supports_window_and_outcomes(tmp_pa
         "suspected_regrets": 1,
     }
 
-    windowed_bundle = cg_export.build_otel_export_bundle(
+    windowed_bundle = export_service.build_otel_export_bundle(
         receipts_path=receipts_path,
         ledger_path=ledger_path,
         outcomes_path=outcomes_path,
@@ -285,7 +286,7 @@ def test_otel_export_deduplicates_events_and_supports_window_and_outcomes(tmp_pa
     summary_log = log_records[-1]
     assert summary_log["body"] == {"stringValue": "context_guard.outcomes_summary"}
     summary_attrs = _attr_map(summary_log["attributes"])
-    assert set(summary_attrs) == set(cg_export.ALLOWED_OTEL_OUTCOMES_ATTRIBUTES)
+    assert set(summary_attrs) == set(export_service.ALLOWED_OTEL_OUTCOMES_ATTRIBUTES)
     assert summary_attrs["context_guard.outcomes.interventions"] == 3
     assert summary_attrs["context_guard.outcomes.confirmed_regrets"] == 1
     assert summary_attrs["context_guard.outcomes.suspected_regrets"] == 1
@@ -357,13 +358,13 @@ def test_otel_export_never_leaks_prompts_paths_or_raw_session_ids(tmp_path: Path
         fh.write(json.dumps(hostile_row) + "\n")
     ledger_path.write_text(json.dumps({"schema_version": 1, "events": [hostile_row]}), encoding="utf-8")
 
-    bundle = cg_export.build_otel_export_bundle(receipts_path=receipts_path, ledger_path=ledger_path)
+    bundle = export_service.build_otel_export_bundle(receipts_path=receipts_path, ledger_path=ledger_path)
     assert bundle["ok"] is True
     assert bundle["privacy_scrubbed"] is True
     assert bundle["exported_events"] == 2
 
     out_ndjson = tmp_path / "export.ndjson"
-    assert cg_export.export_otel_to_file(bundle, out_ndjson, ndjson=True)["ok"] is True
+    assert export_service.export_otel_to_file(bundle, out_ndjson, ndjson=True)["ok"] is True
     combined_payload = json.dumps(bundle) + "\n" + out_ndjson.read_text(encoding="utf-8")
 
     forbidden_substrings = (
@@ -394,7 +395,7 @@ def test_otel_export_never_leaks_prompts_paths_or_raw_session_ids(tmp_path: Path
     spans = bundle["resourceSpans"][0]["scopeSpans"][0]["spans"]
     for sp in spans:
         attrs = _attr_map(sp["attributes"])
-        assert set(attrs).issubset(cg_export.ALLOWED_OTEL_EVENT_ATTRIBUTES)
+        assert set(attrs).issubset(export_service.ALLOWED_OTEL_EVENT_ATTRIBUTES)
         assert re.match(r"^sha256:[0-9a-f]{16}$", str(attrs["context_guard.session_hash"]))
         assert re.match(r"^ws_[0-9a-f]{16}$", str(attrs["context_guard.workspace_id"]))
 
@@ -451,15 +452,15 @@ def test_otel_export_atomic_file_output_ndjson_and_unsafe_link_rejection(
 
     dir_target = tmp_path / "existing_dir"
     dir_target.mkdir()
-    bundle = cg_export.build_otel_export_bundle(receipts_path=receipts_path)
-    dir_res = cg_export.export_otel_to_file(bundle, dir_target)
+    bundle = export_service.build_otel_export_bundle(receipts_path=receipts_path)
+    dir_res = export_service.export_otel_to_file(bundle, dir_target)
     assert dir_res["ok"] is False and dir_res["error"] == "unsafe_path"
 
     victim = tmp_path / "victim.txt"
     victim.write_text("KEEP_SAFE", encoding="utf-8")
     sym_out = tmp_path / "sym_out.json"
     if _try_symlink(victim, sym_out):
-        sym_res = cg_export.export_otel_to_file(bundle, sym_out)
+        sym_res = export_service.export_otel_to_file(bundle, sym_out)
         assert sym_res["ok"] is False and sym_res["error"] == "unsafe_path"
         assert victim.read_text(encoding="utf-8") == "KEEP_SAFE"
         rc_sym_out = cg_export.main(["--otel", "--receipts-path", str(receipts_path), "--output", str(sym_out)])
@@ -470,12 +471,12 @@ def test_otel_export_atomic_file_output_ndjson_and_unsafe_link_rejection(
     real_sub.mkdir()
     sym_parent = tmp_path / "sym_parent"
     if _try_symlink(real_sub, sym_parent):
-        parent_res = cg_export.export_otel_to_file(bundle, sym_parent / "nested.json")
+        parent_res = export_service.export_otel_to_file(bundle, sym_parent / "nested.json")
         assert parent_res["ok"] is False and parent_res["error"] == "unsafe_path"
 
     sym_receipts = tmp_path / "sym_receipts.jsonl"
     if _try_symlink(receipts_path, sym_receipts):
-        bad_bundle = cg_export.build_otel_export_bundle(receipts_path=sym_receipts)
+        bad_bundle = export_service.build_otel_export_bundle(receipts_path=sym_receipts)
         assert bad_bundle["ok"] is False and bad_bundle["error"] == "unsafe_path"
         rc_sym_in = cg_export.main(["--otel", "--receipts-path", str(sym_receipts)])
         assert rc_sym_in == 1
@@ -503,7 +504,7 @@ def test_otel_export_http_post_scheme_validation_and_transport_handling(
         ),
         receipts_path,
     )
-    bundle = cg_export.build_otel_export_bundle(receipts_path=receipts_path)
+    bundle = export_service.build_otel_export_bundle(receipts_path=receipts_path)
 
     called_urls: list[str] = []
 
@@ -522,7 +523,7 @@ def test_otel_export_http_post_scheme_validation_and_transport_handling(
         return _FakeResponse(200)
 
     for bad_url in ("file:///etc/passwd", "ftp://collector.example.com/v1/traces", "javascript:alert(1)", "http://"):
-        res = cg_export.post_otel_http(bundle, bad_url, transport_fn=_never_called)
+        res = export_service.post_otel_http(bundle, bad_url, transport_fn=_never_called)
         assert res["ok"] is False
         assert res["error"] == "invalid_endpoint_scheme"
     assert called_urls == []
@@ -540,8 +541,8 @@ def test_otel_export_http_post_scheme_validation_and_transport_handling(
         captured_calls.append((req.full_url, req.get_method(), hdrs.get("content-type", ""), timeout, json.loads(raw_body)))
         return _FakeResponse(202)
 
-    low_to = cg_export.post_otel_http(bundle, "https://collector.example.com/v1/traces", timeout_seconds=0.05, transport_fn=_ok_transport)
-    high_to = cg_export.post_otel_http(bundle, "http://127.0.0.1:4318/v1/traces", timeout_seconds=120.0, transport_fn=_ok_transport)
+    low_to = export_service.post_otel_http(bundle, "https://collector.example.com/v1/traces", timeout_seconds=0.05, transport_fn=_ok_transport)
+    high_to = export_service.post_otel_http(bundle, "http://127.0.0.1:4318/v1/traces", timeout_seconds=120.0, transport_fn=_ok_transport)
     assert low_to["ok"] is True and low_to["status_code"] == 202 and low_to["timeout_seconds"] == 0.5
     assert high_to["ok"] is True and high_to["timeout_seconds"] == 30.0
     assert len(captured_calls) == 2
@@ -552,7 +553,7 @@ def test_otel_export_http_post_scheme_validation_and_transport_handling(
     def _err_url(req: urllib.request.Request, timeout: float = 5.0) -> _FakeResponse:
         raise urllib.error.URLError("TLS cert missing at /Users/alice/.certs/client.pem")
 
-    err_res = cg_export.post_otel_http(bundle, "https://collector.example.com/v1/traces", transport_fn=_err_url)
+    err_res = export_service.post_otel_http(bundle, "https://collector.example.com/v1/traces", transport_fn=_err_url)
     assert err_res["ok"] is False
     assert err_res["error"] == "otel_post_failed"
     assert "/Users/alice" not in str(err_res.get("detail", ""))
@@ -561,7 +562,7 @@ def test_otel_export_http_post_scheme_validation_and_transport_handling(
     def _err_http(req: urllib.request.Request, timeout: float = 5.0) -> _FakeResponse:
         raise urllib.error.HTTPError(req.full_url, 503, "collector unavailable /Users/alice/cfg", hdrs=Message(), fp=io.BytesIO(b""))
 
-    http_err_res = cg_export.post_otel_http(bundle, "https://collector.example.com/v1/traces", transport_fn=_err_http)
+    http_err_res = export_service.post_otel_http(bundle, "https://collector.example.com/v1/traces", transport_fn=_err_http)
     assert http_err_res["ok"] is False and http_err_res["status_code"] == 503
     assert "/Users/alice" not in str(http_err_res.get("detail", ""))
 
@@ -600,16 +601,17 @@ def test_hot_path_modules_have_zero_otel_or_network_imports() -> None:
                         violations.append(f"{rel}:{node.lineno} imports {mod_name}")
     assert violations == [], f"Hot-path modules must remain free of OTel and network imports: {violations}"
 
-    exporter_tree = ast.parse((ROOT / "bin" / "cg_export.py").read_text(encoding="utf-8"), filename="bin/cg_export.py")
-    sdk_imports = [
-        alias.name
-        for node in ast.walk(exporter_tree)
-        if isinstance(node, ast.Import)
-        for alias in node.names
-        if "opentelemetry" in alias.name
-    ] + [
-        node.module or ""
-        for node in ast.walk(exporter_tree)
-        if isinstance(node, ast.ImportFrom) and "opentelemetry" in (node.module or "")
-    ]
-    assert sdk_imports == []
+    for exp_rel in ("bin/cg_export.py", "services/export_service.py"):
+        exporter_tree = ast.parse((ROOT / exp_rel).read_text(encoding="utf-8"), filename=exp_rel)
+        sdk_imports = [
+            alias.name
+            for node in ast.walk(exporter_tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+            if "opentelemetry" in alias.name
+        ] + [
+            node.module or ""
+            for node in ast.walk(exporter_tree)
+            if isinstance(node, ast.ImportFrom) and "opentelemetry" in (node.module or "")
+        ]
+        assert sdk_imports == []

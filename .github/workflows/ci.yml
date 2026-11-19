@@ -41,19 +41,19 @@ jobs:
         run: python -m pip install --upgrade pip pytest mypy ruff
 
       - name: Run mypy type check (Python ${{ matrix.python-version }})
-        run: python -m mypy --python-version ${{ matrix.python-version }} spool evidence hooks bin policies integrations tests
+        run: python -m mypy --python-version ${{ matrix.python-version }} core policies spool integrations hooks services evidence bin tests
 
       - name: Run mypy type check (darwin, Python ${{ matrix.python-version }})
-        run: python -m mypy --python-version ${{ matrix.python-version }} --platform darwin spool evidence hooks bin policies integrations
+        run: python -m mypy --python-version ${{ matrix.python-version }} --platform darwin core policies spool integrations hooks services evidence bin
 
       - name: Run mypy type check (linux, Python ${{ matrix.python-version }})
-        run: python -m mypy --python-version ${{ matrix.python-version }} --platform linux spool evidence hooks bin policies integrations
+        run: python -m mypy --python-version ${{ matrix.python-version }} --platform linux core policies spool integrations hooks services evidence bin
 
       - name: Run mypy type check (win32, Python ${{ matrix.python-version }})
-        run: python -m mypy --python-version ${{ matrix.python-version }} --platform win32 spool evidence hooks bin policies integrations
+        run: python -m mypy --python-version ${{ matrix.python-version }} --platform win32 core policies spool integrations hooks services evidence bin
 
       - name: Run ruff lint check
-        run: python -m ruff check spool evidence hooks bin policies integrations tests
+        run: python -m ruff check core policies spool integrations hooks services evidence bin tests
 
       - name: Run Node syntax check on VS Code extension
         run: python -c "import glob, shutil, subprocess; nb = shutil.which('node') or 'node'; fs = sorted(glob.glob('vscode-extension/*.js')); assert fs; [subprocess.run([nb, '--check', f], check=True) for f in fs]"
@@ -83,7 +83,7 @@ jobs:
         run: python bin/cg.py eval --conformance --json
 
       - name: Run release hygiene check
-        run: python -c "from bin.replay_benchmark import check_release_hygiene; issues = check_release_hygiene(); assert not issues, issues"
+        run: python -c "from services.replay_benchmark import check_release_hygiene; issues = check_release_hygiene(); assert not issues, issues"
 
       - name: Run full test suite
         run: python -m pytest -q tests/

@@ -298,7 +298,7 @@ def test_shadow_mode_records_only_confirmed_claude_batch_reads(
         state_dir=str(sd),
         event_name="PostToolUse",
     )
-    assert telemetry.load_shadow_ledger(sp)["sessions"]["s1"]["paths"][canon_ph]["reads"] == []
+    assert not sp.exists()
     assert stats_file.read_bytes() == s_before and not outcomes_file.exists()
 
     # PostToolUseFailure does NOT add reads
@@ -315,7 +315,7 @@ def test_shadow_mode_records_only_confirmed_claude_batch_reads(
         state_dir=str(sd),
         event_name="PostToolUseFailure",
     )
-    assert telemetry.load_shadow_ledger(sp)["sessions"]["s1"]["paths"][canon_ph]["reads"] == []
+    assert not sp.exists()
     assert stats_file.read_bytes() == s_before and not outcomes_file.exists()
 
     # PostToolBatch with mismatched or redacted text does NOT add reads
@@ -336,7 +336,7 @@ def test_shadow_mode_records_only_confirmed_claude_batch_reads(
         state_dir=str(sd),
         event_name="PostToolBatch",
     )
-    assert telemetry.load_shadow_ledger(sp)["sessions"]["s1"]["paths"][canon_ph]["reads"] == []
+    assert not sp.exists()
     assert stats_file.read_bytes() == s_before and not outcomes_file.exists()
 
     s_before = _pre("id-redacted")
@@ -356,7 +356,7 @@ def test_shadow_mode_records_only_confirmed_claude_batch_reads(
         state_dir=str(sd),
         event_name="PostToolBatch",
     )
-    assert telemetry.load_shadow_ledger(sp)["sessions"]["s1"]["paths"][canon_ph]["reads"] == []
+    assert not sp.exists()
     assert stats_file.read_bytes() == s_before and not outcomes_file.exists()
 
     # PostToolBatch with matching content fingerprint records [1, 80, step, 2] and leaves stats/outcomes untouched

@@ -9,9 +9,9 @@ from pathlib import Path
 
 import pytest
 
-from bin.cg_status import render_doctor_report, run_doctor
-from bin.install_harnesses import install_ide_extension
-from bin.token_usage import (
+from services.installer_service import install_ide_extension
+from services.status_service import render_doctor_report, run_doctor
+from services.token_usage import (
     USAGE_SCHEMA_VERSION,
     empty_usage_state,
     fold_jsonl_file,
@@ -20,7 +20,7 @@ from bin.token_usage import (
     parse_utc_day,
     restore_usage_state,
 )
-from bin.usage_report import (
+from services.usage_report import (
     active_claude_plugin_skill_files,
     find_duplicate_skills,
     savings_share,
@@ -114,13 +114,13 @@ def test_day_parser_and_antigravity_model_pin_precedence(
         encoding="utf-8",
     )
     # Without pin: record 1 sets cursor["model"] = "gemini-2.5-pro", inherited by record 2
-    monkeypatch.setattr("bin.token_usage.pinned_model", lambda _h: None)
+    monkeypatch.setattr("services.token_usage.pinned_model", lambda _h: None)
     state_unpinned = empty_usage_state()
     fold_jsonl_file(state_unpinned, "antigravity", transcript, budget=10000)
     assert state_unpinned["totals"]["antigravity|gemini-2.5-pro"]["events"] == 2
 
     # With pin: pinned_model("antigravity") overrides record_model and cursor["model"]
-    monkeypatch.setattr("bin.token_usage.pinned_model", lambda _h: "claude-opus-4-6")
+    monkeypatch.setattr("services.token_usage.pinned_model", lambda _h: "claude-opus-4-6")
     state_pinned = empty_usage_state()
     fold_jsonl_file(state_pinned, "antigravity", transcript, budget=10000)
     assert state_pinned["totals"]["antigravity|claude-opus-4-6"]["events"] == 2

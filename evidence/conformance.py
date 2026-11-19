@@ -3,16 +3,23 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timezone
-import json, os, re, tempfile
+import json, os, tempfile
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, Sequence
 
-from bin.install_harnesses import check_status, install_all, uninstall_all
-from bin.migration_guard import RollbackJournal, StagedPackTransaction
-from bin.replay_benchmark import run_deterministic_benchmark, run_deterministic_replay
-from bin.token_usage import USAGE_SCHEMA_VERSION, migrate_usage_state, restore_usage_state
-from evidence.ledger import EVENT_LEDGER_SCHEMA_VERSION, derive_outcomes_from_ledger, ingest_context_receipts, run_cursor_cli_conformance
+from core.platform_io import utc_now_iso_z
+from core.scrub import scrub_home_paths
+from services.installer_service import check_status, install_all, uninstall_all
+from services.migration_guard import RollbackJournal, StagedPackTransaction
+from services.replay_benchmark import run_deterministic_benchmark, run_deterministic_replay
+from services.token_usage import USAGE_SCHEMA_VERSION, migrate_usage_state, restore_usage_state
+from evidence.ledger import (
+    EVENT_LEDGER_SCHEMA_VERSION,
+    derive_outcomes_from_ledger,
+    ingest_context_receipts,
+    run_cursor_cli_conformance,
+    run_governor_release_gates,
+)
 from evidence.runner import run_offline_evidence_replay
 from hooks import config as hooks_config, outcomes, state_store
 from hooks.harness_adapter import (
@@ -37,12 +44,10 @@ from spool.store import SPOOL_SCHEMA_VERSION, inspect_spool_entry, spool_tool_ou
 
 __all__ = [
     "build_capability_limitation_matrix", "build_deprecation_policy", "render_conformance_markdown",
-    "render_platform_matrix_markdown", "run_adapter_conformance_suite", "run_baseline_policy_pack_conformance",
-    "run_migration_and_rollback_conformance", "run_platform_conformance_suite",
+    "render_platform_matrix_markdown", "replay_governor_decisions", "run_adapter_conformance_suite",
+    "run_baseline_policy_pack_conformance", "run_migration_and_rollback_conformance", "run_platform_conformance_suite",
 ]
 
-_POSIX_HOME_RE = re.compile(r"(?<![A-Za-z0-9_])/(?:Users|home)/[A-Za-z0-9._-]+")
-_WIN_HOME_RE = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z]:(?:[/\\]|\\\\)Users(?:[/\\]|\\\\)[A-Za-z0-9._-]+", re.I)
 _ISO_ENV_KEYS = (
     "CONTEXT_GUARD_HOME", "CONTEXT_GUARD_CONFIG_PATH", "CONTEXT_GUARD_STATE_DIR", "CONTEXT_GUARD_SPOOL_DIR",
     "CONTEXT_GUARD_WORKSPACE_ROOT", "HOME", "USERPROFILE", "XDG_CONFIG_HOME", "APPDATA", "LOCALAPPDATA", "PATH",
@@ -55,12 +60,8 @@ _GATE_ORDER: tuple[str, ...] = (
 )
 
 
-def _utc_now_iso_z() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 def _scrub_paths(text: str) -> str:
-    return _WIN_HOME_RE.sub("~", _POSIX_HOME_RE.sub("~", text))
+    return scrub_home_paths(text).replace("[redacted-path]", "~")
 
 
 @contextmanager
@@ -217,9 +218,26 @@ def build_capability_limitation_matrix(*, include_live_effectiveness: bool = Fal
         v_map = v if isinstance((v := ev.get("gate_verdict")), Mapping) else {}
         c_map = c if isinstance((c := v_map.get("checks")), Mapping) else {}
         be_map = b if isinstance((b := bench.get("backend_evaluation")), Mapping) else {}
-        eff["deterministic_replay"] = {"ok": bool(rep.get("ok")), "read_ledger_schema": int(rep.get("read_ledger_schema", 0) or 0), "outcomes_schema": int(rep.get("outcomes_schema", 0) or 0), "modes_checked": [str(m.get("mode")) for m in (rep.get("modes") or []) if isinstance(m, Mapping)]}
-        eff["latency_benchmark"] = {"ok": bool(bench.get("ok")), "in_process_latency_ms": dict(bench.get("in_process_latency_ms") or {}), "subprocess_latency_ms": dict(bench.get("subprocess_latency_ms") or {}), "savings_pct": float(bench.get("savings_pct", 0.0) or 0.0), "backend_decision": str(be_map.get("decision") or "")}
-        eff["offline_evidence_replay"] = {"ok": bool(v_map.get("ok")), "tier": str(ev.get("tier") or ""), "statistical_proof": bool(ev.get("statistical_proof")), "arms": list(ev.get("arms") or []), "hardening_gate_ok": bool(c_map.get("hardening_gate_ok"))}
+        eff["deterministic_replay"] = {
+            "ok": bool(rep.get("ok")),
+            "read_ledger_schema": int(rep.get("read_ledger_schema", 0) or 0),
+            "outcomes_schema": int(rep.get("outcomes_schema", 0) or 0),
+            "modes_checked": [str(m.get("mode")) for m in (rep.get("modes") or []) if isinstance(m, Mapping)],
+        }
+        eff["latency_benchmark"] = {
+            "ok": bool(bench.get("ok")),
+            "in_process_latency_ms": dict(bench.get("in_process_latency_ms") or {}),
+            "subprocess_latency_ms": dict(bench.get("subprocess_latency_ms") or {}),
+            "savings_pct": float(bench.get("savings_pct", 0.0) or 0.0),
+            "backend_decision": str(be_map.get("decision") or ""),
+        }
+        eff["offline_evidence_replay"] = {
+            "ok": bool(v_map.get("ok")),
+            "tier": str(ev.get("tier") or ""),
+            "statistical_proof": bool(ev.get("statistical_proof")),
+            "arms": list(ev.get("arms") or []),
+            "hardening_gate_ok": bool(c_map.get("hardening_gate_ok")),
+        }
     return {
         "schema_version": PLATFORM_MATRIX_SCHEMA_VERSION, "policy_api_version": POLICY_API_VERSION,
         "adapter_contract_version": ADAPTER_CONTRACT_VERSION, "core_schema_versions": dict(CORE_SCHEMA_VERSIONS),
@@ -247,7 +265,11 @@ def run_adapter_conformance_suite() -> dict[str, dict[str, Any]]:
         "normalize_mutation": ag_mut.canonical_tool == "write_file" and ag_mut.mutated_paths == (exp_b,),
         "normalize_shell": ag_sh.canonical_tool == "run_command" and ag_sh.canonical_args.get("CommandLine") == "pytest -q",
         "normalize_mcp": "mcp_call" in infer_tool_scopes(ag_mcp), "line_bounds": bounds_ok,
-        "format_verdicts": format_pre_tool_output({"decision": "deny", "reason": "r"}, ag_sh) == {"decision": "deny", "reason": "r"} and format_pre_tool_output({"decision": "allow", "overwrite": {"StartLine": 5}}, ag_rd) == {"decision": "allow", "overwrite": {"StartLine": 5}},
+        "format_verdicts": (
+            format_pre_tool_output({"decision": "deny", "reason": "r"}, ag_sh) == {"decision": "deny", "reason": "r"}
+            and format_pre_tool_output({"decision": "allow", "overwrite": {"StartLine": 5}}, ag_rd)
+            == {"decision": "allow", "overwrite": {"StartLine": 5}}
+        ),
         "rewrite_permission_gate": can_rewrite_shell_command(ag_sh) is True,
         "runtime_capabilities": ag_rc.native_fail_closed_supported == ag_st.has_native_fail_closed_hook and ag_rc.content_verified_reads_supported == ag_st.supports_content_verified_reads,
     }
@@ -267,9 +289,18 @@ def run_adapter_conformance_suite() -> dict[str, dict[str, Any]]:
         "normalize_mutation": cl_ed.canonical_tool == "edit_file" and cl_ed.mutated_paths == (exp_b,) and cl_wr.canonical_tool == "write_file" and cl_wr.mutated_paths == (exp_c,),
         "normalize_shell": cl_sh_auto.canonical_tool == "run_command" and cl_sh_auto.canonical_args == {"CommandLine": "git status"},
         "normalize_mcp": "mcp_call" in infer_tool_scopes(cl_mcp), "line_bounds": bounds_ok,
-        "format_verdicts": format_pre_tool_output({"decision": "allow"}, cl_rd) == {} and cl_deny.get("permissionDecision") == "deny" and cl_ow.get("updatedInput", {}).get("offset") == 15 and cl_ow.get("updatedInput", {}).get("limit") == 10,
+        "format_verdicts": (
+            format_pre_tool_output({"decision": "allow"}, cl_rd) == {}
+            and cl_deny.get("permissionDecision") == "deny"
+            and cl_ow.get("updatedInput", {}).get("offset") == 15
+            and cl_ow.get("updatedInput", {}).get("limit") == 10
+        ),
         "rewrite_permission_gate": can_rewrite_shell_command(cl_sh_auto) is True and can_rewrite_shell_command(cl_sh_ask) is False,
-        "runtime_capabilities": cl_old.native_fail_closed_supported is False and cl_new.native_fail_closed_supported is True and cl_new.content_verified_reads_supported == cl_st.supports_content_verified_reads,
+        "runtime_capabilities": (
+            cl_old.native_fail_closed_supported is False
+            and cl_new.native_fail_closed_supported is True
+            and cl_new.content_verified_reads_supported == cl_st.supports_content_verified_reads
+        ),
     }
     cu_cli = run_cursor_cli_conformance()
     cu_rd = normalize_pre_tool_payload({"tool_name": "Read", "tool_input": {"path": "src/a.py", "StartLine": 2, "EndLine": 8}, "cwd": ws}, cli_harness="cursor")
@@ -332,7 +363,11 @@ _SEC_PACK_SRC = (
     "        p.write_text((p.read_text(encoding='utf-8') if p.is_file() else '') + f'post:{post_ctx.canonical_tool}:{post_ctx.succeeded}\\n', encoding='utf-8')\n"
     "def on_session_transition(event, state, settings): state.setdefault('transitions', []).append(event)\n"
     "def inspect_config(settings): return ['empty_guard_tag'] if settings.get('guard_tag') == '' else []\n"
-    "PACK_MANIFEST = PolicyPackManifest(pack_id='baseline_sec', api_version=1, kind='security', covered_domains=ALL_SECURITY_SCOPES, evaluate=evaluate, on_pre_decision=on_pre_decision, on_tool_completed=on_tool_completed, on_session_transition=on_session_transition, inspect_config=inspect_config)\n"
+    "PACK_MANIFEST = PolicyPackManifest(\n"
+    "    pack_id='baseline_sec', api_version=1, kind='security', covered_domains=ALL_SECURITY_SCOPES,\n"
+    "    evaluate=evaluate, on_pre_decision=on_pre_decision, on_tool_completed=on_tool_completed,\n"
+    "    on_session_transition=on_session_transition, inspect_config=inspect_config,\n"
+    ")\n"
 )
 _OPT_PACK_SRC = (
     "from __future__ import annotations\nfrom policies.api import PolicyDecision, PolicyPackManifest\n"
@@ -497,7 +532,13 @@ def _run_migrations_in_dir(root: Path) -> dict[str, Any]:
         quarantine_exists = (bad_state_dir / ".context_guard_state.json.corrupt").is_file()
 
         out_v3_path, out_bad_path = root / "outcomes_v3.json", root / "outcomes_bad.json"
-        out_v3_path.write_text(json.dumps({"schema_version": 3, "by_key": {"claude|sonnet|outline": {"total": 5, "applied": 5, "targeted_followup": 2, "full_bypass": 1, "shell_bypass": 0}}}), encoding="utf-8")
+        out_v3_path.write_text(
+            json.dumps({
+                "schema_version": 3,
+                "by_key": {"claude|sonnet|outline": {"total": 5, "applied": 5, "targeted_followup": 2, "full_bypass": 1, "shell_bypass": 0}},
+            }),
+            encoding="utf-8",
+        )
         out_bad_path.write_text("{bad-outcomes", encoding="utf-8")
         out_v4 = outcomes.load_outcomes(out_v3_path)
         out_row = (out_v4.get("by_key") or {}).get("claude|sonnet|outline") or {}
@@ -515,17 +556,22 @@ def _run_migrations_in_dir(root: Path) -> dict[str, Any]:
             session_id="mig-sess", call_id="mig-call-1", harness="claude", tool_name="Bash",
             workspace_root=ws_dir, isolation="workspace", spool_dir=spool_dir, receipts_path=rcpt_path,
         )
-        assert sp_created is not None
-        (spool_dir / f"{sp_created[0].spool_id}.txt").unlink()
-        sp_missing = inspect_spool_entry(sp_created[0].spool_id, spool_dir=spool_dir)
-        spool_ok = (
-            sp_missing.get("current_state") == "corrupt" and sp_missing.get("corrupt_reason") == "unexpectedly_missing"
-            and inspect_spool_entry("sp_000000000001", spool_dir=bad_spool_dir).get("found") is False
-            and inspect_spool_entry("sp_000000000001", spool_dir=v1_spool_dir).get("found") is False
-        )
+        if sp_created is None:
+            spool_ok = False
+        else:
+            (spool_dir / f"{sp_created[0].spool_id}.txt").unlink()
+            sp_missing = inspect_spool_entry(sp_created[0].spool_id, spool_dir=spool_dir)
+            spool_ok = (
+                sp_missing.get("current_state") == "corrupt" and sp_missing.get("corrupt_reason") == "unexpectedly_missing"
+                and inspect_spool_entry("sp_000000000001", spool_dir=bad_spool_dir).get("found") is False
+                and inspect_spool_entry("sp_000000000001", spool_dir=v1_spool_dir).get("found") is False
+            )
 
         usage_v1_path, usage_bad_path = root / "usage_v1.json", root / "usage_bad.json"
-        usage_v1_path.write_text(json.dumps({"schema_version": 1, "totals": {"claude|sonnet": {"input": 120, "output": 30, "cache_read": 60, "cache_write": 15}, "antigravity|old": {"input": 50}}}), encoding="utf-8")
+        usage_v1_path.write_text(
+            json.dumps({"schema_version": 1, "totals": {"claude|sonnet": {"input": 120, "output": 30, "cache_read": 60, "cache_write": 15}, "antigravity|old": {"input": 50}}}),
+            encoding="utf-8",
+        )
         usage_bad_path.write_text("[1, 2, 3]", encoding="utf-8")
         u_state = restore_usage_state(usage_v1_path)
         u_mig = migrate_usage_state(u_state, roots={})
@@ -566,9 +612,16 @@ def _run_migrations_in_dir(root: Path) -> dict[str, Any]:
         cx_hooks.write_text("{}", encoding="utf-8")
         cx_toml.write_text("", encoding="utf-8")
         inst_md.write_text("# User Notes\n", encoding="utf-8")
-        install_all(claude_settings_path=cl_cfg, cursor_hooks_path=cu_cfg, codex_hooks_path=cx_hooks, codex_config_path=cx_toml, shim_bin_dir=shims_dir, instruction_files=(inst_md,), claude_version=(2, 1, 295), cursor_mcp_path=cu_mcp)
+        install_all(
+            claude_settings_path=cl_cfg, cursor_hooks_path=cu_cfg, codex_hooks_path=cx_hooks,
+            codex_config_path=cx_toml, shim_bin_dir=shims_dir, instruction_files=(inst_md,),
+            claude_version=(2, 1, 295), cursor_mcp_path=cu_mcp,
+        )
         st_on = check_status(claude_settings_path=cl_cfg, cursor_hooks_path=cu_cfg, codex_hooks_path=cx_hooks, shim_bin_dir=shims_dir, cursor_mcp_path=cu_mcp)
-        uninstall_all(claude_settings_path=cl_cfg, cursor_hooks_path=cu_cfg, codex_hooks_path=cx_hooks, codex_config_path=cx_toml, shim_bin_dir=shims_dir, instruction_files=(inst_md,), cursor_mcp_path=cu_mcp)
+        uninstall_all(
+            claude_settings_path=cl_cfg, cursor_hooks_path=cu_cfg, codex_hooks_path=cx_hooks,
+            codex_config_path=cx_toml, shim_bin_dir=shims_dir, instruction_files=(inst_md,), cursor_mcp_path=cu_mcp,
+        )
         st_off = check_status(claude_settings_path=cl_cfg, cursor_hooks_path=cu_cfg, codex_hooks_path=cx_hooks, shim_bin_dir=shims_dir, cursor_mcp_path=cu_mcp)
         shim_ok = os.name == "nt" or (bool(st_on.get("cg_shim")) and not bool(st_off.get("cg_shim")))
         installer_ok = (
@@ -618,10 +671,18 @@ def _run_suite_in_dir(root: Path) -> ConformanceContractV1:
         and all(bool((eff.get(k) or {}).get("ok")) for k in ("deterministic_replay", "latency_benchmark", "offline_evidence_replay"))
     )
     gates: dict[str, bool] = {
-        "policy_api_v1_frozen": bool(POLICY_API_VERSION == 1 and dep["policy_api_version"] == 1 and dep["policy_api_v2_mandated"] is False and dep["external_sdk_shipped"] is False and dep["min_deprecation_minor_releases"] >= 2 and dep["additive_fields_non_breaking"] is True),
+        "policy_api_v1_frozen": bool(
+            POLICY_API_VERSION == 1 and dep["policy_api_version"] == 1
+            and dep["policy_api_v2_mandated"] is False and dep["external_sdk_shipped"] is False
+            and dep["min_deprecation_minor_releases"] >= 2 and dep["additive_fields_non_breaking"] is True
+        ),
         "core_schema_versions_synced": bool(mig.get("core_schema_versions_synced") and len(CORE_SCHEMA_VERSIONS) == 17),
         "capability_matrix_complete_and_honest": bool(matrix_ok),
-        "adapter_conformance_4_harnesses": bool(set(adapters) == set(SUPPORTED_HARNESS_IDS) and all(bool(adapters[h].get("ok")) for h in SUPPORTED_HARNESS_IDS) and adapters["cursor"].get("cache_attribution_status") == "excluded_missing_telemetry"),
+        "adapter_conformance_4_harnesses": bool(
+            set(adapters) == set(SUPPORTED_HARNESS_IDS)
+            and all(bool(adapters[h].get("ok")) for h in SUPPORTED_HARNESS_IDS)
+            and adapters["cursor"].get("cache_attribution_status") == "excluded_missing_telemetry"
+        ),
         "baseline_security_pack_conformance": bool(packs.get("security_pack_ok")),
         "baseline_optimization_pack_reconciliation": bool(packs.get("optimization_reconciliation_ok")),
         "tamper_and_unknown_major_fail_closed": bool(packs.get("tamper_and_unknown_major_ok")),
@@ -632,7 +693,7 @@ def _run_suite_in_dir(root: Path) -> ConformanceContractV1:
     passed = sum(1 for k in _GATE_ORDER if gates.get(k))
     failed = sorted([str(k) for k, v in gates.items() if not v], key=lambda x: str(x))
     return {
-        "schema_version": CONFORMANCE_SCHEMA_VERSION, "ok": passed == len(_GATE_ORDER), "checked_at": _utc_now_iso_z(),
+        "schema_version": CONFORMANCE_SCHEMA_VERSION, "ok": passed == len(_GATE_ORDER), "checked_at": utc_now_iso_z(),
         "policy_api_version": POLICY_API_VERSION, "adapter_contract_version": ADAPTER_CONTRACT_VERSION,
         "core_schema_versions": dict(CORE_SCHEMA_VERSIONS), "harnesses_checked": list(SUPPORTED_HARNESS_IDS),
         "adapter_conformance": adapters, "baseline_policy_pack_conformance": packs,
@@ -647,15 +708,29 @@ def run_platform_conformance_suite(work_dir: Path | None = None) -> ConformanceC
     return res
 
 
+def replay_governor_decisions(scenarios: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
+    """Deterministically verify all 8 Governor release gates (and optional custom scenarios) in isolation."""
+    return run_governor_release_gates(scenarios)
+
+
 def render_platform_matrix_markdown(matrix: Mapping[str, Any]) -> str:
     """Format a PlatformMatrixContractV1 dictionary as a clean, path-scrubbed Markdown report."""
-    dep, eff = (d if isinstance((d := matrix.get("deprecation_policy")), Mapping) else {}), (e if isinstance((e := matrix.get("effectiveness_summary")), Mapping) else {})
-    harnesses, schemas = (h if isinstance((h := matrix.get("harnesses")), Mapping) else {}), (s if isinstance((s := matrix.get("core_schema_versions")), Mapping) else {})
+    dep = d if isinstance((d := matrix.get("deprecation_policy")), Mapping) else {}
+    eff = e if isinstance((e := matrix.get("effectiveness_summary")), Mapping) else {}
+    harnesses = h if isinstance((h := matrix.get("harnesses")), Mapping) else {}
+    schemas = s if isinstance((s := matrix.get("core_schema_versions")), Mapping) else {}
     lines = [
         "# Context-Guard Platform Capability & Limitation Matrix", "",
-        f"- Policy API Version: `{matrix.get('policy_api_version', POLICY_API_VERSION)}` (frozen; v2 mandated: `{bool(dep.get('policy_api_v2_mandated'))}`, external SDK: `{bool(dep.get('external_sdk_shipped'))}`)",
+        (
+            f"- Policy API Version: `{matrix.get('policy_api_version', POLICY_API_VERSION)}` "
+            f"(frozen; v2 mandated: `{bool(dep.get('policy_api_v2_mandated'))}`, "
+            f"external SDK: `{bool(dep.get('external_sdk_shipped'))}`)"
+        ),
         f"- Adapter Contract: `{matrix.get('adapter_contract_version', ADAPTER_CONTRACT_VERSION)}` | Core Schemas Registered: `{len(schemas)}`",
-        f"- Deprecation Notice Floor: `>= {int(dep.get('min_deprecation_minor_releases', MIN_DEPRECATION_MINOR_RELEASES))} minor releases` | Unknown Major Pack: `{dep.get('unknown_major_policy_pack_behavior', '')}`",
+        (
+            f"- Deprecation Notice Floor: `>= {int(dep.get('min_deprecation_minor_releases', MIN_DEPRECATION_MINOR_RELEASES))} "
+            f"minor releases` | Unknown Major Pack: `{dep.get('unknown_major_policy_pack_behavior', '')}`"
+        ),
         "", "## 4-Harness Capability Matrix", "",
         "| Harness | Replace Output | Native Fail-Closed | Block `apply_patch` | Content-Verified Reads | Cache Telemetry | Turn Correlation |",
         "|---|---|---|---|---|---|---|",
@@ -689,7 +764,9 @@ def render_conformance_markdown(report: Mapping[str, Any]) -> str:
     failed = [str(x) for x in (report.get("failed_gates") or ())]
     lines = [
         "# Context-Guard Platform Conformance Report", "",
-        f"- Verdict: `{'PASS' if report.get('ok') else 'FAIL'}` (`{int(report.get('gates_passed', 0) or 0)}/{int(report.get('gates_total', 10) or 10)}` gates) | Checked: `{report.get('checked_at', '')}`",
+        f"- Verdict: `{'PASS' if report.get('ok') else 'FAIL'}` "
+        f"(`{int(report.get('gates_passed', 0) or 0)}/{int(report.get('gates_total', 10) or 10)}` gates) | "
+        f"Checked: `{report.get('checked_at', '')}`",
         f"- Policy API Version: `{report.get('policy_api_version', POLICY_API_VERSION)}` | Adapter Contract: `{report.get('adapter_contract_version', ADAPTER_CONTRACT_VERSION)}`",
         f"- Failed Gates: `{', '.join(failed) if failed else 'none'}`",
         "", "## Conformance Gates (10)", "", "| Gate | Status |", "|---|---|",

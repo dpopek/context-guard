@@ -13,7 +13,9 @@ _PLUGIN_ROOT = str(Path(__file__).resolve().parent.parent)
 if _PLUGIN_ROOT not in sys.path:
     sys.path.insert(0, _PLUGIN_ROOT)
 
-from hooks.config import inspect_native_security_drift, load_runtime_config
+from core.platform_io import warn
+from hooks.config import load_runtime_config
+from hooks.drift_probe import inspect_native_security_drift
 from hooks.json_outliners import ANTIGRAVITY_FULL_TRANSCRIPT_NAME
 from hooks.outcomes import close_outcome_windows, ledger_path_for
 from hooks.policy_engine import notify_session_transition
@@ -22,7 +24,6 @@ from hooks.state_store import (
     emit_json_and_sanitize_stdio,
     locked_state,
     resolve_state_dir,
-    warn,
 )
 from hooks.telemetry import DEFAULT_SHADOW_PATH, invalidate_shadow_ledger, shadow_path_for
 
@@ -191,27 +192,23 @@ def handle_pre_invocation(
     is_subagent = False
     steps_since_cp = 0
     bytes_since_cp = 0
+    is_rewind = False
+    is_compact = False
+    needs_drift_probe = False
+    last_cp_step = 0
+    transition_snapshot: dict[str, Any] | None = None
     drift_notice: str | None = None
+    lock1_ok = False
     try:
         with locked_state(state_dir_path) as txn:
             state = txn.state
             mutated = False
             max_seen_inv = int(state.get("max_inv_steps") or state.get("max_step_idx") or 0)
-            runtime_cfg: dict[str, Any] | None = None
             is_rewind = initial_steps < max_seen_inv or (
                 initial_steps == 0 and bool(state.get("files"))
             )
-            if is_rewind:
-                if prune_state_on_rewind(state, initial_steps, inclusive=True):
-                    mutated = True
-                if (sp or DEFAULT_SHADOW_PATH).is_file():
-                    invalidate_shadow_ledger(session_id=sess_id, max_step=initial_steps, inclusive_rewind=True, shadow_path=sp)
-                close_outcome_windows(sess_id, rewind_step=initial_steps, ledger_path=op)
-                runtime_cfg = load_runtime_config()
-                before_rewind = copy.deepcopy(state)
-                notify_session_transition("rewind", state, runtime_cfg)
-                if state != before_rewind:
-                    mutated = True
+            if is_rewind and prune_state_on_rewind(state, initial_steps, inclusive=True):
+                mutated = True
             # The prune leaves the invocation high-water mark alone: it counts invocations,
             # not tool steps, and only this hook moves it (down on a rewind, up otherwise).
             prev_inv = int(state.get("max_inv_steps") or 0)
@@ -234,23 +231,10 @@ def handle_pre_invocation(
             prev_cp_step = int(state.get("last_checkpoint_step") or 0)
             if last_cp_step > prev_cp_step:
                 apply_compaction_boundary(state, checkpoint_step=last_cp_step)
-                if (sp or DEFAULT_SHADOW_PATH).is_file():
-                    invalidate_shadow_ledger(session_id=sess_id, checkpoint_step=last_cp_step, shadow_path=sp)
-                close_outcome_windows(sess_id, force_all=True, ledger_path=op)
-                if runtime_cfg is None:
-                    runtime_cfg = load_runtime_config()
-                notify_session_transition("compact", state, runtime_cfg)
+                is_compact = True
                 mutated = True
 
-            if not state.get("drift_warned"):
-                if runtime_cfg is None:
-                    runtime_cfg = load_runtime_config()
-                drift = inspect_native_security_drift(runtime_cfg, probe_claude=True)
-                if drift.get("security_active"):
-                    state["drift_warned"], mutated = True, True
-                    if "NATIVE_FAIL_CLOSED_DRIFT" in drift.get("drift_codes", ()):
-                        rem = drift.get("remediation") or "Re-run install_harnesses.py."
-                        drift_notice = f"CONTEXT-GUARD NATIVE_FAIL_CLOSED_DRIFT: {rem}"
+            needs_drift_probe = not bool(state.get("drift_warned"))
 
             is_hard_stop = (
                 steps_since_cp >= HARD_STEP_THRESHOLD or bytes_since_cp >= HARD_BYTES_THRESHOLD
@@ -275,10 +259,47 @@ def handle_pre_invocation(
                     state["last_compact_warn_step"] = max(1, initial_steps)
                     mutated = True
 
+            if is_rewind or is_compact:
+                transition_snapshot = copy.deepcopy(state)
             if mutated:
                 txn.dirty = True
+        lock1_ok = True
     except (OSError, ValueError, TypeError) as exc:
         warn(f"pre_invocation sensor skipped: {type(exc).__name__}: {exc}")
+
+    if lock1_ok:
+        runtime_cfg: dict[str, Any] | None = None
+        try:
+            if is_rewind:
+                if (sp or DEFAULT_SHADOW_PATH).is_file():
+                    invalidate_shadow_ledger(session_id=sess_id, max_step=initial_steps, inclusive_rewind=True, shadow_path=sp)
+                close_outcome_windows(sess_id, rewind_step=initial_steps, ledger_path=op)
+                runtime_cfg = load_runtime_config()
+                if transition_snapshot is not None:
+                    notify_session_transition("rewind", transition_snapshot, runtime_cfg)
+            if is_compact:
+                if (sp or DEFAULT_SHADOW_PATH).is_file():
+                    invalidate_shadow_ledger(session_id=sess_id, checkpoint_step=last_cp_step, shadow_path=sp)
+                close_outcome_windows(sess_id, force_all=True, ledger_path=op)
+                runtime_cfg = runtime_cfg if runtime_cfg is not None else load_runtime_config()
+                if transition_snapshot is not None:
+                    notify_session_transition("compact", transition_snapshot, runtime_cfg)
+            if needs_drift_probe:
+                runtime_cfg = runtime_cfg if runtime_cfg is not None else load_runtime_config()
+                drift = inspect_native_security_drift(runtime_cfg, probe_claude=True)
+                if drift.get("security_active"):
+                    if "NATIVE_FAIL_CLOSED_DRIFT" in drift.get("drift_codes", ()):
+                        rem = drift.get("remediation") or "Re-run install_harnesses.py."
+                        drift_notice = f"CONTEXT-GUARD NATIVE_FAIL_CLOSED_DRIFT: {rem}"
+                    try:
+                        with locked_state(state_dir_path) as txn2:
+                            if not txn2.state.get("drift_warned"):
+                                txn2.state["drift_warned"] = True
+                                txn2.dirty = True
+                    except (OSError, ValueError, TypeError) as exc:
+                        warn(f"pre_invocation drift_warned save skipped: {type(exc).__name__}: {exc}")
+        except (OSError, ValueError, TypeError) as exc:
+            warn(f"pre_invocation post-lock step skipped: {type(exc).__name__}: {exc}")
 
     steps: list[dict[str, Any]] = [{"ephemeralMessage": drift_notice}] if drift_notice else []
     if should_warn:

@@ -113,6 +113,9 @@ function buildTooltipMarkdown(MarkdownStringCls, version, stats, updateLine = ""
     const countStr = (ev[layer.key] || 0).toLocaleString();
     md.appendMarkdown(`| ${layer.codicon} ${layer.fullLabel} | **${countStr}** |\n`);
   }
+  if (ev.reliability_failures > 0) {
+    md.appendMarkdown(`| $(warning) Reliability Failures | **${ev.reliability_failures.toLocaleString()}** |\n`);
+  }
   md.appendMarkdown("\n");
 
   md.appendMarkdown(`| Harness | Saved | Reduction |\n|---|---:|---|\n`);
@@ -165,6 +168,10 @@ function renderSidebarHtml(version, stats, insights = null) {
       return `<tr><td>${layer.emoji} ${escapeHtml(layer.fullLabel)}</td><td class="num">${countStr}</td></tr>`;
     })
     .join("\n      ");
+  const sidebarReliabilityRow =
+    ev.reliability_failures > 0
+      ? `\n      <tr><td>⚠️ Reliability Failures</td><td class="num">${ev.reliability_failures.toLocaleString()}</td></tr>`
+      : "";
 
   let v4Cards = "";
   if (insights) {
@@ -248,7 +255,7 @@ ${WEBVIEW_CSP_META}
   <h3>By Protection Layer</h3>
   <table>
     <tbody>
-      ${layerRows}
+      ${layerRows}${sidebarReliabilityRow}
     </tbody>
   </table>
 </body>
@@ -280,6 +287,10 @@ function renderWebviewHtml(version, stats, insights = null) {
       return `<tr><td>${escapeHtml(layer.fullLabel)} (<code>${escapeHtml(layer.key)}</code>)</td><td>${countStr}</td></tr>`;
     })
     .join("\n      ");
+  const webviewReliabilityRow =
+    ev.reliability_failures > 0
+      ? `\n      <tr><td>Reliability Failures (<code>reliability_failures</code>)</td><td>${ev.reliability_failures.toLocaleString()}</td></tr>`
+      : "";
 
   let v4Cards = "";
   let preambleSection = "";
@@ -345,7 +356,7 @@ ${WEBVIEW_CSP_META}
   <table>
     <thead><tr><th>Mechanism</th><th>Count</th></tr></thead>
     <tbody>
-      ${mechanismRows}
+      ${mechanismRows}${webviewReliabilityRow}
     </tbody>
   </table>
   <h2>Savings by Harness</h2>
