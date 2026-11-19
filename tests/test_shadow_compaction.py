@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -269,7 +270,7 @@ def test_state_store_persistence_error_readonly_snapshot_and_contract_delegation
     try:
         snap = state_store.read_state_snapshot(ro_nolock)
         assert "/a.py" in snap["files"]
-        if os.geteuid() != 0:
+        if sys.platform != "win32" and os.geteuid() != 0:
             assert "read_state_snapshot unlocked fallback" in capsys.readouterr().err
     finally:
         ro_nolock.chmod(0o755)

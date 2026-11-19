@@ -234,7 +234,7 @@ def _apply_mutation_invalidation(payload: dict[str, Any], sdir: Path, shadow_pat
 
 def _batch_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance((raw_c := payload.get("tool_calls")), list): return []
-    inherited = {k: payload[k] for k in ("cwd", "session_id", "conversation_id", "conversationId", "workspace_roots") if k in payload}
+    inherited: dict[str, Any] = {k: payload[k] for k in ("cwd", "session_id", "conversation_id", "conversationId", "workspace_roots") if k in payload}
     return [{**inherited, **item} for item in raw_c if isinstance(item, dict)]
 
 def _run_post_hook_for_item(harness: str, item: dict[str, Any], cfg: dict[str, Any], sdir: Path, *, is_failure: bool) -> None:
