@@ -10,7 +10,9 @@ import sys
 from typing import Any, BinaryIO, Mapping, Sequence
 
 from core.platform_io import check_unsafe_link, read_plugin_version, write_json_atomic
-from spool.receipts import VALID_SPOOL_ISOLATIONS, read_spool_isolation_config
+from spool.receipts import (
+    VALID_SPOOL_ISOLATIONS, is_unresolved_workspace_template, read_spool_isolation_config, resolve_workspace_identity,
+)
 from spool.store import grep_spool, list_spools, resolve_spool_dir, slice_spool
 
 _SERVER_NAME = "context-guard-spool"
@@ -168,6 +170,16 @@ def serve_stdio(
     eff_dir = spool_dir if spool_dir is not None else resolve_spool_dir()
     version = read_plugin_version(plugin_root, default="0.0.0")
     static_ws = workspace_root if workspace_root is not None else os.environ.get("CONTEXT_GUARD_WORKSPACE_ROOT")
+    static_ws_str = str(static_ws).strip() if isinstance(static_ws, (str, Path)) else ""
+    has_pinned_ws = bool(static_ws_str) and not is_unresolved_workspace_template(static_ws_str)
+    pinned_canon_root: str | None = None
+    pinned_ws_err: str | None = None
+    if has_pinned_ws:
+        _p_id, p_root, p_err = resolve_workspace_identity(static_ws)
+        if p_err is None and p_root:
+            pinned_canon_root = p_root
+        else:
+            pinned_ws_err = p_err or "workspace_unresolved"
     eff_sess = session_id if session_id is not None else os.environ.get("CONTEXT_GUARD_SESSION_ID")
 
     client_supports_roots = False
@@ -206,14 +218,27 @@ def serve_stdio(
             return False
         if method == "tools/call":
             eff_iso, iso_err = _effective_isolation(isolation)
-            if iso_err is None and eff_iso == "workspace" and client_supports_roots and roots_dirty and not stream_eof:
+            if (
+                iso_err is None
+                and eff_iso == "workspace"
+                and client_supports_roots
+                and roots_dirty
+                and not stream_eof
+                and pinned_ws_err is None
+            ):
                 roots_seq += 1
                 pending_roots_req_id = f"cg-roots-{roots_seq}"
                 pending_queue.appendleft((framing, msg))
                 _write_frame(out_stream, framing, {"jsonrpc": "2.0", "id": pending_roots_req_id, "method": "roots/list"})
                 return True
-            call_ws_root: str | Path | None = None if client_supports_roots else static_ws
-            call_ws_roots: tuple[str, ...] | None = tuple(cached_roots) if client_supports_roots else None
+            if has_pinned_ws:
+                call_ws_root: str | Path | None = pinned_canon_root if pinned_canon_root is not None else static_ws
+                call_ws_roots: tuple[str, ...] | None = (
+                    tuple(cached_roots) if (client_supports_roots and pinned_canon_root is not None and cached_roots) else None
+                )
+            else:
+                call_ws_root = None if client_supports_roots else static_ws
+                call_ws_roots = tuple(cached_roots) if client_supports_roots else None
             _write_frame(out_stream, framing, _dispatch_tool_call(
                 req_id, params, eff_dir, workspace_root=call_ws_root, workspace_roots=call_ws_roots,
                 session_id=eff_sess, isolation=isolation, eff_iso=eff_iso, receipts_path=receipts_path,

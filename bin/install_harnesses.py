@@ -16,7 +16,7 @@ if str(_PACKAGE_ROOT) not in sys.path:
 from bin import update_check  # noqa: E402
 from core.platform_io import resolve_plugin_root  # noqa: E402
 from hooks.config import cached_raw_config_status  # noqa: E402
-from services.installer_service import CLAUDE_MATCHER, check_status, install_all, uninstall_all  # noqa: E402
+from services.installer_service import CLAUDE_MATCHER, check_status, has_install_errors, install_all, uninstall_all  # noqa: E402 -- sys.path configured above for standalone CLI execution
 from services.migration_guard import preflight_migration_check, resolve_effective_config_path  # noqa: E402
 
 __all__ = ["CLAUDE_MATCHER", "DEFAULT_PLUGIN_ROOT", "check_status", "install_all", "main", "uninstall_all"]
@@ -74,7 +74,7 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as exc:
                 print(f"error: {exc}", file=sys.stderr)
                 return 1
-        has_error = any(str(v).startswith("error") for v in res.values())
+        has_error = has_install_errors(res)
         if not args.dry_run and not has_error:
             update_check.record_install(_active_plugin_root(), datetime.now(timezone.utc))
         print(json.dumps(res, indent=2))
@@ -85,7 +85,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
-        has_error = any(str(v).startswith("error") for v in res.values())
+        has_error = has_install_errors(res)
         if not args.dry_run and not has_error:
             update_check.remove_install_record(_active_plugin_root())
         print(json.dumps(res, indent=2))

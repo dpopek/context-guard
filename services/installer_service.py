@@ -43,6 +43,15 @@ EXTENSION_ID = "advox.context-guard-statusbar"
 _SAFE_HOOK_PATH_RE = re.compile(r"[A-Za-z0-9_./:-]+")
 
 
+def has_install_errors(results: Mapping[str, str]) -> bool:
+    """Return True when any installation status value or comma-delimited segment reports an error."""
+    return any(
+        part.strip().startswith("error")
+        for val in results.values()
+        for part in str(val).split(",")
+    )
+
+
 def active_plugin_root(plugin_root: Path | None = None) -> Path:
     """Resolve explicit `plugin_root`, monkeypatched `DEFAULT_PLUGIN_ROOT`, or `resolve_plugin_root()`."""
     if plugin_root is not None:
@@ -490,12 +499,13 @@ def install_all(
         agy_ide_ext_status = install_ide_extension(plugin_root, antigravity_ide_extensions_dir, dry_run=dry_run, journal=j_arg) if antigravity_ide_extensions_dir is not None else _skip
         if j_arg is not None:
             eff_bin = shim_bin_dir or (DEFAULT_SHIM_BIN_DIR if use_defaults else None)
-            if eff_bin is not None:
+            if eff_bin is not None and (not eff_bin.exists() or eff_bin.is_dir()):
                 for name in ("cg-outline", SPOOL_SHIM_NAME, CG_SHIM_NAME, BUDGET_SHIM_NAME, EVAL_SHIM_NAME):
                     j_arg.record_file_backup(eff_bin / name)
             eff_inst = instruction_files if instruction_files is not None else (DEFAULT_INSTRUCTION_FILES if use_defaults else ())
             for inst_path in eff_inst:
-                j_arg.record_file_backup(inst_path)
+                if not inst_path.is_dir():
+                    j_arg.record_file_backup(inst_path)
         cursor_mcp_status = _sync_cursor_mcp(
             cursor_hooks_path, cursor_mcp_path, plugin_root,
             enabled=(opt_mode == "active" and mcp_mode == "active"), dry_run=dry_run, journal=j_arg,
@@ -506,14 +516,6 @@ def install_all(
             "antigravity_ide_extension": agy_ide_ext_status, "cursor_spool_mcp": cursor_mcp_status,
             **install_outline_pull(plugin_root, use_defaults, shim_bin_dir, instruction_files, dry_run),
         }
-        if txn is not None and not dry_run:
-            if any(str(v).startswith("error") for v in res.values()):
-                txn.rollback()
-                raise RuntimeError(f"harness installation error: {res}")
-            txn.commit()
-        elif not dry_run:
-            journal.commit()
-        return res
     except Exception:
         if not dry_run:
             if txn is not None:
@@ -521,6 +523,17 @@ def install_all(
             else:
                 journal.rollback()
         raise
+    if not dry_run:
+        if has_install_errors(res):
+            if txn is not None:
+                txn.rollback()
+                raise RuntimeError(f"harness installation error: {res}")
+            journal.rollback()
+        elif txn is not None:
+            txn.commit()
+        else:
+            journal.commit()
+    return res
 
 
 def uninstall_all(

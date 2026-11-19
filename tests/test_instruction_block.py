@@ -239,6 +239,7 @@ def test_install_all_reports_instruction_and_shim_errors_instead_of_raising(
 ) -> None:
     monkeypatch.setattr("services.instruction_block.IS_WINDOWS", False)
     configs = _configs(tmp_path)
+    before = [p.read_text(encoding="utf-8") for p in configs]
     bin_dir = tmp_path / "localbin"
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.defpath}")
     binary = tmp_path / "AGENTS.md"
@@ -247,9 +248,19 @@ def test_install_all_reports_instruction_and_shim_errors_instead_of_raising(
     res = install_all(PLUGIN_ROOT, *configs, shim_bin_dir=bin_dir, instruction_files=(binary, good))
     assert res["instruction_block"] == "error (UnicodeDecodeError), created"
     assert binary.read_bytes() == b"\xff\xfe not utf-8\n"
+    assert not good.exists()
+    assert not (bin_dir / "cg-outline").exists()
+    assert [p.read_text(encoding="utf-8") for p in configs] == before
+    # Reversed ordering (good, binary) also reports error after created and rolls back atomically.
+    res_rev = install_all(PLUGIN_ROOT, *configs, shim_bin_dir=bin_dir, instruction_files=(good, binary))
+    assert res_rev["instruction_block"] == "created, error (UnicodeDecodeError)"
+    assert not good.exists()
+    assert not (bin_dir / "cg-outline").exists()
+    assert [p.read_text(encoding="utf-8") for p in configs] == before
     out = uninstall_all(*configs, shim_bin_dir=bin_dir, instruction_files=(binary, good))
-    assert out["instruction_block"] == "error (UnicodeDecodeError), removed"
+    assert out["instruction_block"] == "error (UnicodeDecodeError), absent"
 
+    before_blocker = [p.read_text(encoding="utf-8") for p in configs]
     blocker = tmp_path / "not-a-dir"
     blocker.write_text("x", encoding="utf-8")
     res = install_all(PLUGIN_ROOT, *configs, shim_bin_dir=blocker, instruction_files=(good,))
@@ -259,6 +270,7 @@ def test_install_all_reports_instruction_and_shim_errors_instead_of_raising(
     assert res["cg_budget_shim"].startswith("error (")
     assert res["cg_eval_shim"].startswith("error (")
     assert res["instruction_block"] == "skipped (shim unavailable)"
+    assert [p.read_text(encoding="utf-8") for p in configs] == before_blocker
 
 
 def test_cg_spool_shim_executes_cli_and_respects_foreign_files(tmp_path: Path, monkeypatch) -> None:

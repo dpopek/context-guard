@@ -82,6 +82,7 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 | `policies/loader.py` | Policy | Verified pack loader (`file_hashes`, `tree_sha256`). |
 | `spool/receipts.py` | Spool | Workspace `samefile`, link checks, `receipts.jsonl`. |
 | `spool/store.py` | Spool | Write-once blobs, UTF-8/byte guard, fd-safe GC, inspect. |
+| `spool/gc.py` | Spool | Dedup blob verification, epoch/inode GC, orphan staging. |
 | `spool/classifier.py` | Spool | Command signatures, verbose overrides, follow-ups. |
 | `spool/mcp_server.py` | Spool | Dual-framed stdio MCP and `.cursor/mcp.json` sync. |
 | `integrations/atlassian_twg.py` | Integration | Opt-in CLI rewriter & JSON summarizer (`"atlassian_twg"`). |

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import errno
 import hashlib
@@ -22,11 +23,15 @@ from core.platform_io import (
 from policies.api import SpoolContractV1
 from policies.governor import is_optimizer_tripped, record_governor_signal
 from spool.classifier import (
-    SPOOL_ID_RE, build_spool_summary, classify_pre_tool_spool_followup, compute_command_signature,
-    entry_scope_error, grep_verified_lines, inspect_spool_entry_readonly, inspect_spool_health_readonly,
-    is_verbose_override_command, parse_spool_index, plan_gc_phase1, prepare_post_tool_spool_candidate,
-    project_spool_in_memory, prune_evicted_tombstones, read_blob_bytes, resolve_spool_scope,
-    slice_verified_lines, split_lines,
+    GcEvictionPolicy, SPOOL_ID_RE, build_spool_summary, classify_pre_tool_spool_followup,
+    compute_command_signature, entry_scope_error, grep_verified_lines, inspect_spool_entry_readonly,
+    inspect_spool_health_readonly, is_verbose_override_command, parse_spool_index, plan_gc_evictions,
+    prepare_post_tool_spool_candidate, project_spool_in_memory, read_blob_bytes,
+    read_spool_index_readonly, resolve_spool_scope, slice_verified_lines, split_lines,
+)
+from spool.gc import (
+    DedupQuery, GcPostLockOptions, find_dedup_candidate, is_dedup_entry_match, matches_stat_identity,
+    probe_blob_identity, run_gc_post_lock, safe_unlink, verify_existing_blob_for_dedup,
 )
 from spool.receipts import (
     DEFAULT_MAX_SPOOL_ENTRY_BYTES, append_receipt, build_receipt, compute_scoped_spool_id,
@@ -42,7 +47,6 @@ SPOOL_MAX_ENTRIES, SPOOL_TOTAL_BYTES_CAP = 64, 32 * 1024 * 1024
 SPOOL_HEAD_LINES, SPOOL_TAIL_LINES, SPOOL_SUMMARY_MAX_BYTES = 25, 15, 3_072
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_BLOB_NAME_RE = re.compile(r"^(sp_[0-9a-f]{12})\.txt$")
 _O_FLAGS = getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
 
 
@@ -50,13 +54,6 @@ def _ts_iso(now_ts: float | None) -> str | None:
     if now_ts is None:
         return None
     return datetime.fromtimestamp(float(now_ts), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _safe_unlink(path: Path) -> None:
-    try:
-        path.unlink(missing_ok=True)
-    except OSError:
-        pass
 
 
 @contextmanager
@@ -78,7 +75,7 @@ def _open_index_unlocked(eff_dir: Path) -> dict[str, Any]:
     idx_path = eff_dir / "spool_index.json"
     raw_bytes, err = read_blob_bytes(idx_path)
     if err == "spool_not_found":
-        return {"schema_version": SPOOL_SCHEMA_VERSION, "entries": {}, "tombstones": {}}
+        return {"schema_version": SPOOL_SCHEMA_VERSION, "id_epoch": 0, "entries": {}, "tombstones": {}}
     if err == "unsafe_path" and check_unsafe_link(idx_path):
         raise OSError("unsafe_path: spool_index.json")
     try:
@@ -92,7 +89,7 @@ def _open_index_unlocked(eff_dir: Path) -> dict[str, Any]:
         warn(f"corrupt spool_index.json ({err or 'invalid schema'}) quarantined to {q_path.name}")
     except OSError as q_exc:
         warn(f"corrupt spool_index.json ({err or 'invalid schema'}) reset: {q_exc}")
-    return {"schema_version": SPOOL_SCHEMA_VERSION, "entries": {}, "tombstones": {}}
+    return {"schema_version": SPOOL_SCHEMA_VERSION, "id_epoch": 0, "entries": {}, "tombstones": {}}
 
 
 def _save_index(eff_dir: Path, index: dict[str, Any]) -> None:
@@ -143,89 +140,34 @@ def _project_mem(raw_text: str | bytes, scope_key: str, max_bytes: int) -> tuple
     )
 
 
-def _unlink_blob(path: Path, cutoff: float | None = None) -> tuple[int | None, bool]:
-    try:
-        if check_unsafe_link(path):
-            return None, False
-        if not path.exists():
-            return None, True
-        if not path.is_file() or (cutoff is not None and path.stat().st_mtime >= cutoff):
-            return None, False
-        sz = path.stat().st_size
-        path.unlink()
-        return sz, True
-    except FileNotFoundError:
-        return None, True
-    except (PermissionError, OSError):
-        return None, False
+def _plan_gc_evictions_unlocked(
+    eff_dir: Path, index: dict[str, Any], now_ts: float, *,
+    limits: tuple[float, int, int] = (SPOOL_TTL_SECONDS, SPOOL_MAX_ENTRIES, SPOOL_TOTAL_BYTES_CAP),
+    protect: str | None = None,
+) -> tuple[list[tuple[str, int, tuple[int, int, int] | None]], set[str], bool]:
+    max_age, max_entries, max_bytes = limits
 
-
-def _prune_evicted_tombstones(tombstones: dict[str, dict[str, Any]], now_ts: float) -> bool:
-    return prune_evicted_tombstones(
-        tombstones, now_ts, max_age=SPOOL_TOMBSTONE_MAX_AGE_SECONDS, max_tombstones=SPOOL_MAX_TOMBSTONES,
-    )
-
-
-def _gc_phase1_unlocked(
-    eff_dir: Path, index: dict[str, Any], *, max_age: float, max_entries: int,
-    max_bytes: int, now_ts: float, protect: str | None = None,
-) -> tuple[list[tuple[str, int]], set[str], bool]:
     def _probe(sid: str) -> str | None:
         blob = eff_dir / f"{sid}.txt"
-        if check_unsafe_link(blob):
-            return "unsafe_path"
-        return None if blob.is_file() else "unexpectedly_missing"
+        return "unsafe_path" if check_unsafe_link(blob) else (None if blob.is_file() else "unexpectedly_missing")
 
-    return plan_gc_phase1(
-        index, max_age=max_age, max_entries=max_entries, max_bytes=max_bytes, now_ts=now_ts,
-        protect=protect, probe_blob_corrupt=_probe, tombstone_max_age=SPOOL_TOMBSTONE_MAX_AGE_SECONDS,
+    return plan_gc_evictions(index, GcEvictionPolicy(
+        max_age=max_age, max_entries=max_entries, max_bytes=max_bytes, now_ts=now_ts,
+        probe_blob_corrupt=_probe, protect=protect, tombstone_max_age=SPOOL_TOMBSTONE_MAX_AGE_SECONDS,
         max_tombstones=SPOOL_MAX_TOMBSTONES, max_corrupt_entries=SPOOL_MAX_CORRUPT_ENTRIES,
-    )
+        probe_blob_identity=lambda sid: probe_blob_identity(eff_dir / f"{sid}.txt"),
+    ))
 
 
 def _run_gc_post_lock(
-    eff_dir: Path, evicting_targets: Sequence[tuple[str, int]], known_sids: set[str],
-    *, cutoff: float, now_ts: float,
+    eff_dir: Path, evicting_targets: Sequence[tuple[str, int, tuple[int, int, int] | None]],
+    known_sids: set[str], *, cutoff: float, now_ts: float,
 ) -> tuple[int, int, dict[str, Any] | None]:
-    rc, rb, completed = 0, 0, []
-    for sid, fallback_sz in evicting_targets:
-        u_sz, done = _unlink_blob(eff_dir / f"{sid}.txt")
-        if done:
-            completed.append(sid)
-            rc += 1
-            rb += u_sz if u_sz is not None else fallback_sz
-    try:
-        items = list(eff_dir.iterdir())
-    except OSError:
-        items = []
-    orphan_candidates: list[tuple[Path, str]] = []
-    for item in items:
-        if not (m := _BLOB_NAME_RE.fullmatch(item.name)) or (osid := m.group(1)) in known_sids:
-            continue
-        try:
-            if check_unsafe_link(item) or not item.is_file() or item.stat().st_mtime >= cutoff:
-                continue
-        except OSError:
-            continue
-        orphan_candidates.append((item, osid))
-    if not completed and not orphan_candidates:
-        return rc, rb, None
-    with _spool_lock(eff_dir):
-        index = _open_index_unlocked(eff_dir)
-        tombstones = index.setdefault("tombstones", {})
-        live_sids = set(index["entries"]) | set(tombstones)
-        for item, osid in orphan_candidates:
-            if osid not in live_sids and (u_sz := _unlink_blob(item, cutoff=cutoff)[0]) is not None:
-                rc += 1
-                rb += u_sz
-        dirty = False
-        for sid in completed:
-            if isinstance((tomb := tombstones.get(sid)), dict) and tomb.get("state") == "evicting":
-                tomb["state"] = "evicted"
-                dirty = True
-        if _prune_evicted_tombstones(tombstones, now_ts) or dirty:
-            _save_index(eff_dir, index)
-        return rc, rb, (index if completed else None)
+    return run_gc_post_lock(eff_dir, evicting_targets, known_sids, GcPostLockOptions(
+        cutoff=cutoff, now_ts=now_ts, tombstone_max_age=SPOOL_TOMBSTONE_MAX_AGE_SECONDS,
+        max_tombstones=SPOOL_MAX_TOMBSTONES, spool_lock=_spool_lock,
+        open_index=_open_index_unlocked, save_index=_save_index,
+    ))
 
 
 def _write_temp_spool(eff_dir: Path, raw_bytes: bytes) -> Path:
@@ -235,7 +177,7 @@ def _write_temp_spool(eff_dir: Path, raw_bytes: bytes) -> Path:
         fh = os.fdopen(fd, "wb")
     except BaseException:
         os.close(fd)
-        _safe_unlink(tmp_path)
+        safe_unlink(tmp_path)
         raise
     try:
         with fh:
@@ -244,8 +186,117 @@ def _write_temp_spool(eff_dir: Path, raw_bytes: bytes) -> Path:
             os.chmod(str(tmp_path), 0o600)
         return tmp_path
     except BaseException:
-        _safe_unlink(tmp_path)
+        safe_unlink(tmp_path)
         raise
+
+
+@dataclass(frozen=True)
+class _DedupProbe:
+    cand_sid: str | None = None
+    verified_id: tuple[int, int, int, int] | None = None
+    fail_reason: str | None = None
+    obs_id: tuple[int, int, int, int] | None = None
+
+
+def _probe_dedup_candidate(eff_dir: Path, base_sid: str, query: DedupQuery) -> _DedupProbe:
+    ro_idx, _ro_err = read_spool_index_readonly(eff_dir / "spool_index.json")
+    cand_sid = find_dedup_candidate(ro_idx["entries"], base_sid, query) if ro_idx is not None else None
+    if cand_sid is None:
+        return _DedupProbe()
+    verified_id, fail_reason, obs_id = verify_existing_blob_for_dedup(
+        eff_dir / f"{cand_sid}.txt", exp_bytes=query.exp_bytes, exp_sha=query.sha_hex,
+    )
+    return _DedupProbe(cand_sid=cand_sid, verified_id=verified_id, fail_reason=fail_reason, obs_id=obs_id)
+
+
+def _try_reuse_dedup_unlocked(
+    eff_dir: Path, entries: dict[str, Any], probe: _DedupProbe, query: DedupQuery, ts: float,
+) -> tuple[str, Path] | None:
+    if probe.cand_sid is None or probe.verified_id is None:
+        return None
+    cand_ent = entries.get(probe.cand_sid)
+    cand_blob = eff_dir / f"{probe.cand_sid}.txt"
+    if not (isinstance(cand_ent, dict) and is_dedup_entry_match(cand_ent, query) and matches_stat_identity(cand_blob, probe.verified_id)):
+        return None
+    cand_ent["last_accessed_at"] = ts
+    if query.canon_root and not str(cand_ent.get("canon_root") or "").strip():
+        cand_ent["canon_root"] = query.canon_root
+    return probe.cand_sid, cand_blob
+
+
+def _mark_corrupt_dedup_unlocked(
+    eff_dir: Path, entries: dict[str, Any], probe: _DedupProbe, query: DedupQuery, ts: float,
+) -> None:
+    if probe.cand_sid is None or probe.fail_reason not in ("integrity_mismatch", "format_error", "unexpectedly_missing", "unsafe_path"):
+        return
+    bad_ent = entries.get(probe.cand_sid)
+    if not (isinstance(bad_ent, dict) and is_dedup_entry_match(bad_ent, query)):
+        return
+    cand_blob = eff_dir / f"{probe.cand_sid}.txt"
+    still_bad = (
+        (probe.fail_reason == "unexpectedly_missing" and not cand_blob.exists())
+        or (probe.fail_reason == "unsafe_path" and check_unsafe_link(cand_blob))
+        or (probe.obs_id is not None and matches_stat_identity(cand_blob, probe.obs_id))
+    )
+    if still_bad:
+        bad_ent["state"], bad_ent["corrupt_reason"], bad_ent["corrupted_at"] = "corrupt", probe.fail_reason, ts
+
+
+def _write_and_register_blob_unlocked(
+    eff_dir: Path, index: dict[str, Any], tmp_path: Path | None, row_template: dict[str, Any], scope_key: str,
+) -> tuple[str, Path]:
+    entries, tombstones = index["entries"], index.setdefault("tombstones", {})
+    id_epoch = max(0, int(index.get("id_epoch") or 0))
+    gen, sha_hex, base_sid = 0, str(row_template["content_sha256"]), str(row_template["spool_id"])
+    sid = base_sid if id_epoch == 0 else compute_scoped_spool_id(f"{scope_key}:e{id_epoch}:g0", sha_hex)
+    while sid in entries or sid in tombstones or os.path.lexists(str(eff_dir / f"{sid}.txt")):
+        gen += 1
+        prefix = f"{scope_key}:gen:{gen}" if id_epoch == 0 else f"{scope_key}:e{id_epoch}:g{gen}"
+        sid = compute_scoped_spool_id(prefix, sha_hex)
+    blob_path = eff_dir / f"{sid}.txt"
+    if check_unsafe_link(blob_path):
+        raise OSError(f"unsafe_path: {sid}")
+    if tmp_path is None:
+        raise OSError(f"missing temp spool: {sid}")
+    os.replace(str(tmp_path), str(blob_path))
+    try:
+        b_ident = probe_blob_identity(blob_path)
+        ent_row = {**row_template, "spool_id": sid, "filename": f"{sid}.txt"}
+        if b_ident is not None:
+            ent_row["blob_dev"], ent_row["blob_ino"], ent_row["blob_mtime_ns"] = b_ident
+        entries[sid] = ent_row
+    except BaseException:
+        safe_unlink(blob_path)
+        raise
+    return sid, blob_path
+
+
+def _commit_spool_once_locked(
+    eff_dir: Path, probe: _DedupProbe, query: DedupQuery, tmp_path: Path | None, row_and_scope: tuple[dict[str, Any], str],
+) -> tuple[str, Path, bool, list[tuple[str, int, tuple[int, int, int] | None]], set[str]] | None:
+    row_template, scope_key = row_and_scope
+    ts = float(row_template["last_accessed_at"])
+    with _spool_lock(eff_dir):
+        index = _open_index_unlocked(eff_dir)
+        entries = index["entries"]
+        reused = _try_reuse_dedup_unlocked(eff_dir, entries, probe, query, ts)
+        if probe.verified_id is not None and reused is None:
+            return None
+        reused_blob = reused is not None
+        if reused is not None:
+            sid, blob_path = reused
+        else:
+            _mark_corrupt_dedup_unlocked(eff_dir, entries, probe, query, ts)
+            sid, blob_path = _write_and_register_blob_unlocked(eff_dir, index, tmp_path, row_template, scope_key)
+        try:
+            evicting_targets, known_sids, _d = _plan_gc_evictions_unlocked(eff_dir, index, ts, protect=sid)
+            _save_index(eff_dir, index)
+        except BaseException:
+            if not reused_blob:
+                safe_unlink(blob_path)
+            raise
+    return sid, blob_path, reused_blob, evicting_targets, known_sids
+
 
 def _spool_tool_output_with_receipt(
     raw_text: str | bytes, *, session_id: str, call_id: str, harness: str, tool_name: str, cmd_sig: str = "",
@@ -255,7 +306,7 @@ def _spool_tool_output_with_receipt(
     max_spool_entry_bytes: int | None = None, turn_correlation: str = "unobserved",
     hook_duration_ms: float | None = None, event_id: str | None = None,
 ) -> tuple[SpoolContractV1, str, str | None] | None:
-    _m, scope_key, ws_id, canon_root, _s, eff_max, scope_err = _resolve_write_cfg(
+    mode, scope_key, ws_id, canon_root, eff_sess, eff_max, scope_err = _resolve_write_cfg(
         isolation=isolation, workspace_root=workspace_root, workspace_roots=workspace_roots,
         session_id=session_id, max_spool_entry_bytes=max_spool_entry_bytes,
     )
@@ -264,8 +315,7 @@ def _spool_tool_output_with_receipt(
     base_sid, lines, raw_bytes, sha_hex, summary, saved = proj
     eff_dir, ts = spool_dir or resolve_spool_dir(), float(now_ts) if now_ts is not None else time.time()
     tmp_path: Path | None = None
-    blob_path = eff_dir / f"{base_sid}.txt"
-    replaced_blob, manifest_committed, reused_blob = False, False, False
+    committed: tuple[str, Path, bool, list[tuple[str, int, tuple[int, int, int] | None]], set[str]] | None = None
     try:
         if check_unsafe_link(eff_dir) or check_unsafe_link(eff_dir / "spool_index.json") or check_unsafe_link(eff_dir / "spool_index.lock"):
             warn(f"refusing symlink spool target: {base_sid}")
@@ -273,51 +323,36 @@ def _spool_tool_output_with_receipt(
         eff_dir.mkdir(parents=True, exist_ok=True)
         if os.name != "nt":
             os.chmod(str(eff_dir), 0o700)
-        tmp_path, sid = _write_temp_spool(eff_dir, raw_bytes), base_sid
-        with _spool_lock(eff_dir):
-            index = _open_index_unlocked(eff_dir)
-            entries, tombstones = index["entries"], index.setdefault("tombstones", {})
-            base_ent = entries.get(base_sid)
-            if (
-                isinstance(base_ent, dict) and base_ent.get("state", "available") == "available"
-                and base_ent.get("content_sha256") == sha_hex and base_ent.get("total_bytes") == len(raw_bytes)
-                and not check_unsafe_link(blob_path) and blob_path.is_file()
-            ):
-                reused_blob, base_ent["last_accessed_at"] = True, ts
-                if canon_root and not str(base_ent.get("canon_root") or "").strip():
-                    base_ent["canon_root"] = canon_root
-            else:
-                gen = 0
-                while sid in entries or sid in tombstones or os.path.lexists(str(eff_dir / f"{sid}.txt")):
-                    gen += 1
-                    sid = compute_scoped_spool_id(f"{scope_key}:gen:{gen}", sha_hex)
-                blob_path = eff_dir / f"{sid}.txt"
-                if check_unsafe_link(blob_path):
-                    raise OSError(f"unsafe_path: {sid}")
-                os.replace(str(tmp_path), str(blob_path))
-                replaced_blob = True
-                entries[sid] = {
-                    "spool_id": sid, "filename": f"{sid}.txt", "workspace_id": ws_id, "canon_root": canon_root,
-                    "session_id": str(session_id or ""), "call_id": str(call_id or ""), "harness": str(harness or ""),
-                    "tool_name": str(tool_name or ""), "cmd_sig": str(cmd_sig or ""), "total_lines": len(lines),
-                    "total_bytes": len(raw_bytes), "summary_bytes": len(summary.encode("utf-8")), "saved_bytes": saved,
-                    "content_sha256": sha_hex, "created_at": ts, "last_accessed_at": ts, "state": "available",
-                }
-            evicting_targets, known_sids, _d = _gc_phase1_unlocked(
-                eff_dir, index, max_age=SPOOL_TTL_SECONDS, max_entries=SPOOL_MAX_ENTRIES,
-                max_bytes=SPOOL_TOTAL_BYTES_CAP, now_ts=ts, protect=sid,
-            )
-            _save_index(eff_dir, index)
-            manifest_committed = True
+        query = DedupQuery(mode=mode, ws_id=ws_id, eff_sess=eff_sess, canon_root=canon_root, sha_hex=sha_hex, exp_bytes=len(raw_bytes))
+        probe = _probe_dedup_candidate(eff_dir, base_sid, query)
+        row_template: dict[str, Any] = {
+            "spool_id": base_sid, "filename": f"{base_sid}.txt", "workspace_id": ws_id, "canon_root": canon_root,
+            "session_id": str(session_id or ""), "call_id": str(call_id or ""), "harness": str(harness or ""),
+            "tool_name": str(tool_name or ""), "cmd_sig": str(cmd_sig or ""), "total_lines": len(lines),
+            "total_bytes": len(raw_bytes), "summary_bytes": len(summary.encode("utf-8")), "saved_bytes": saved,
+            "content_sha256": sha_hex, "created_at": ts, "last_accessed_at": ts, "state": "available",
+        }
+        for _attempt in range(2):
+            if probe.verified_id is None and tmp_path is None:
+                tmp_path = _write_temp_spool(eff_dir, raw_bytes)
+            committed = _commit_spool_once_locked(eff_dir, probe, query, tmp_path, (row_template, scope_key))
+            if committed is None:
+                probe = _DedupProbe()
+                continue
+            tmp_path = tmp_path if committed[2] else None
+            break
     except (OSError, ValueError) as exc:
         if tmp_path is not None:
-            _safe_unlink(tmp_path)
-        if replaced_blob and not manifest_committed:
-            _safe_unlink(blob_path)
+            safe_unlink(tmp_path)
         warn(f"spool_tool_output skipped ({type(exc).__name__}): {exc}")
         return None
+    if committed is None:
+        if tmp_path is not None:
+            safe_unlink(tmp_path)
+        return None
+    sid, blob_path, reused_blob, evicting_targets, known_sids = committed
     if reused_blob and tmp_path is not None:
-        _safe_unlink(tmp_path)
+        safe_unlink(tmp_path)
     if sid != base_sid and (rebuilt := build_spool_summary(
         sid, lines, len(raw_bytes), sha_hex, head_lines=SPOOL_HEAD_LINES, tail_lines=SPOOL_TAIL_LINES,
         max_bytes=SPOOL_SUMMARY_MAX_BYTES, min_saved_bytes=SPOOL_MIN_SAVED_BYTES,
@@ -700,7 +735,7 @@ def list_spools(
     with _spool_lock(eff_dir):
         entries = sorted(
             (
-                {k: v for k, v in e.items() if k != "canon_root"}
+                {k: v for k, v in e.items() if k not in ("canon_root", "blob_dev", "blob_ino", "blob_mtime_ns")}
                 for e in _open_index_unlocked(eff_dir)["entries"].values()
                 if e.get("state", "available") == "available"
                 and entry_scope_error(e, mode, ws_id, eff_sess, caller_canon_root=canon_root) is None
@@ -722,8 +757,8 @@ def gc_spools(
     eff_now = float(now_ts) if now_ts is not None else time.time()
     with _spool_lock(eff_dir):
         index = _open_index_unlocked(eff_dir)
-        evicting_targets, known_sids, dirty = _gc_phase1_unlocked(
-            eff_dir, index, max_age=max_age_seconds, max_entries=max_entries, max_bytes=max_total_bytes, now_ts=eff_now,
+        evicting_targets, known_sids, dirty = _plan_gc_evictions_unlocked(
+            eff_dir, index, eff_now, limits=(max_age_seconds, max_entries, max_total_bytes),
         )
         if dirty:
             _save_index(eff_dir, index)
