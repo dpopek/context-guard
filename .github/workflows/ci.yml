@@ -87,3 +87,51 @@ jobs:
 
       - name: Run full test suite
         run: python -m pytest -q tests/
+
+  agent-ratchet:
+    name: Agent-Ratchet Governance Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (full history)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install uv and Python 3.13
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          python-version: "3.13"
+
+      - name: Run agent-ratchet against trusted base
+        env:
+          BASE_BRANCH: ${{ github.base_ref || 'main' }}
+        run: |
+          set -eu
+          BASE_REF="origin/$BASE_BRANCH"
+          git rev-parse --verify "$BASE_REF" >/dev/null || exit 1
+          present=$(git ls-tree "$BASE_REF" -- guard.lock scripts/guard) || exit 1
+          if [ -z "$present" ]; then
+            shim=scripts/guard
+          elif [ "$(printf '%s\n' "$present" | wc -l)" -eq 2 ]; then
+            git show "$BASE_REF:scripts/guard" > "$RUNNER_TEMP/guard"
+            shim="$RUNNER_TEMP/guard"
+          else
+            echo "broken install: $BASE_REF has only one of guard.lock, scripts/guard" >&2
+            exit 1
+          fi
+          sh "$shim" --lock-from "$BASE_REF" scan --commit-range "$BASE_REF..HEAD"
+          sh "$shim" --lock-from "$BASE_REF" baseline-integrity --require-base-ref --enforce-policy-isolation --commit-range "$BASE_REF..HEAD"
+          sh "$shim" --lock-from "$BASE_REF" scan core policies spool integrations hooks services evidence bin tests
+
+      - name: Smoke-test updated guard.lock or scripts/guard
+        env:
+          BASE_BRANCH: ${{ github.base_ref || 'main' }}
+        run: |
+          set -eu
+          BASE_REF="origin/$BASE_BRANCH"
+          if ! git diff --quiet "$BASE_REF...HEAD" -- guard.lock scripts/guard; then
+            sh scripts/guard version --sha
+            sh scripts/guard scan --commit-range "$BASE_REF..HEAD"
+          fi
