@@ -171,6 +171,15 @@ def matches_stat_identity(blob_path: Path, expected: tuple[int, int, int, int]) 
     return (int(st.st_dev), int(st.st_ino), int(st.st_size), int(st.st_mtime_ns)) == expected
 
 
+def _blob_identity_matches(l_st: os.stat_result, expected_identity: tuple[int, int, int]) -> bool:
+    exp_dev, exp_ino, exp_mtime_ns = expected_identity
+    if int(l_st.st_mtime_ns) != exp_mtime_ns:
+        return False
+    if (exp_dev, exp_ino) != (0, 0) and (int(l_st.st_dev), int(l_st.st_ino)) != (0, 0):
+        return (int(l_st.st_dev), int(l_st.st_ino)) == (exp_dev, exp_ino)
+    return True
+
+
 def unlink_blob_matching_identity(
     path: Path,
     *,
@@ -186,13 +195,8 @@ def unlink_blob_matching_identity(
             return None, False
         if cutoff is not None and l_st.st_mtime >= cutoff:
             return None, False
-        if expected_identity is not None:
-            exp_dev, exp_ino, exp_mtime_ns = expected_identity
-            if (exp_dev, exp_ino) != (0, 0) and (int(l_st.st_dev), int(l_st.st_ino)) != (0, 0):
-                if (int(l_st.st_dev), int(l_st.st_ino)) != (exp_dev, exp_ino):
-                    return None, False
-            elif int(l_st.st_mtime_ns) != exp_mtime_ns:
-                return None, False
+        if expected_identity is not None and not _blob_identity_matches(l_st, expected_identity):
+            return None, False
         sz = int(l_st.st_size)
         path.unlink()
         return sz, True

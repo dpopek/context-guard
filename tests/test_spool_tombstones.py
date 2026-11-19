@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 from typing import Any, Callable
 
 import pytest
@@ -625,9 +626,11 @@ def test_concurrent_gc_delayed_unlink_respects_blob_inode_identity(
         t1.start()
         assert entered.wait(timeout=5.0)
         # While t1 pauses between eviction capture and blob unlink, another actor replaces the blob with a new inode.
-        blob.unlink()
+        old_st = os.lstat(str(blob))
         fresh = spool_dir / ".replacement.tmp"
         fresh.write_bytes(b"fresh-generation-inode")
+        if os.lstat(str(fresh)).st_mtime_ns == old_st.st_mtime_ns:
+            os.utime(fresh, ns=(old_st.st_atime_ns, old_st.st_mtime_ns + 1_000_000))
         os.replace(str(fresh), str(blob))
         new_st = os.lstat(str(blob))
         new_ino = (int(new_st.st_dev), int(new_st.st_ino))
@@ -641,6 +644,10 @@ def test_concurrent_gc_delayed_unlink_respects_blob_inode_identity(
     assert results[0]["removed_count"] == 0 and results[0]["removed_bytes"] == 0
     # Zero-inode fallback also refuses mismatched mtime_ns and removes only when mtime_ns matches.
     assert spool_gc.unlink_blob_matching_identity(blob, expected_identity=(0, 0, int(new_st.st_mtime_ns) + 1)) == (None, False)
+    assert blob.is_file()
+    assert spool_gc.unlink_blob_matching_identity(
+        blob, expected_identity=(int(new_st.st_dev), int(new_st.st_ino), int(new_st.st_mtime_ns) + 1)
+    ) == (None, False)
     assert blob.is_file()
 
 
@@ -674,7 +681,7 @@ def test_gc_orphan_unlink_runs_outside_spool_lock_and_missing_evicting_counts_ze
         if self.parent == spool_dir and (self.name.startswith(".orphan.") or self == orphan):
             lock_free = True
             lp = spool_dir / "spool_index.lock"
-            if os.name != "nt" and lp.exists():
+            if sys.platform != "win32" and lp.exists():
                 import fcntl
 
                 with open(lp, "rb") as fh:

@@ -7,7 +7,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 
 ### Fixed
 - **Spool dedup integrity (`P1-01`):** Verify existing dedup blobs outside lock, quarantine corrupt blobs, and write fresh generations.
-- **Spool GC epoch & inode safety (`P1-02`):** Increment `id_epoch` on tombstone/corrupt pruning and match `(dev, ino)` before GC unlinks.
+- **Spool GC epoch & inode safety (`P1-02`):** Bump `id_epoch` on prune and verify `(dev, ino, mtime_ns)` before GC unlinks.
 - **Lock-free orphan GC (`P2-01`):** Stage expired orphans under lock via rename, unlink outside lock, and count `0 B` for missing blobs.
 - **MCP workspace pinning (`P1-03`):** Keep resolved `--workspace` authoritative over `roots/list` while allowing narrowing and templates.
 - **Atomic standard install rollback (`P1-08`):** Disarm `RollbackJournal.commit()` before cleanup and roll back standard installs on error.
