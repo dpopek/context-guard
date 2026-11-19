@@ -402,6 +402,9 @@ def test_scrub_redacts_paths_secrets_files_and_identifiers() -> None:
 
     assert "[redacted-path]" in scrub.scrub_home_paths(r"C:\Users\bob\cfg.json")
     assert "bob" not in scrub.scrub_home_paths(r"C:\Users\bob\cfg.json")
+    assert "[redacted-path]" in scrub.scrub_home_paths(r"\Users\bob\cfg.json")
+    assert "bob" not in scrub.scrub_home_paths(r"\Users\bob\cfg.json")
+    assert "bob" not in scrub.scrub_string(r"\Users\bob\file.txt")
 
     gcp_sample = "corp-" + "data-987654:ds.tbl"
     local_mail = "alice@" + "corp-internal.local"

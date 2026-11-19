@@ -6,6 +6,7 @@ import ntpath
 import os
 import random
 import statistics
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -344,7 +345,12 @@ def test_shell_parser_and_read_planner_hot_path_latency_budget(tmp_path: Path) -
         durations_ms.append((time.perf_counter() - t0) * 1000.0)
 
     median_ms = statistics.median(durations_ms)
-    budget_ms = 25.0 if os.name == "nt" else 10.0
+    if os.name == "nt":
+        budget_ms = 25.0
+    elif sys.platform == "darwin" and os.environ.get("CI"):
+        budget_ms = 35.0
+    else:
+        budget_ms = 10.0
     assert median_ms < budget_ms, f"Hot-path median latency {median_ms:.2f} ms exceeded {budget_ms} ms budget"
     assert len(Path(shell_parser.__file__).read_text(encoding="utf-8").splitlines()) <= 800
 

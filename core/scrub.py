@@ -53,14 +53,14 @@ _SENSITIVE_KEY_TOKENS: tuple[str, ...] = ("shadow", "private_policy", "policy_pa
 
 _POSIX_HOME_PREFIX_RE = re.compile(r"(?<![A-Za-z0-9_])/(?:Users|home)/[A-Za-z0-9._-]+")
 _WIN_HOME_PREFIX_RE = re.compile(
-    r"(?<![A-Za-z0-9_])[A-Za-z]:(?:[/\\]|\\\\)Users(?:[/\\]|\\\\)[A-Za-z0-9._-]+",
+    r"(?<![A-Za-z0-9_])(?:[A-Za-z]:)?(?:[/\\]|\\\\)Users(?:[/\\]|\\\\)[A-Za-z0-9._-]+",
     re.IGNORECASE,
 )
 _POSIX_HOME_FULL_RE = re.compile(
     r"(?<![A-Za-z0-9_])/(?:Users|home)/[A-Za-z0-9._-]+(?:[/\\][^\s\"',;)\]]*)?"
 )
 _WIN_HOME_FULL_RE = re.compile(
-    r"(?<![A-Za-z0-9_])[A-Za-z]:(?:[/\\]|\\\\)Users(?:[/\\]|\\\\)[A-Za-z0-9._-]+(?:(?:[/\\]|\\\\)[^\s\"',;)\]]*)?",
+    r"(?<![A-Za-z0-9_])(?:[A-Za-z]:)?(?:[/\\]|\\\\)Users(?:[/\\]|\\\\)[A-Za-z0-9._-]+(?:(?:[/\\]|\\\\)[^\s\"',;)\]]*)?",
     re.IGNORECASE,
 )
 _FILE_URI_RE = re.compile(r"file://[^\s\"',;)\]]+", re.IGNORECASE)

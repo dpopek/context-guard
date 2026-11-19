@@ -24,7 +24,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 - **Outcomes & shadow integrity (`hooks/`):** Fixed `step_idx=0` eviction, pipe keys, `trimmed_spans`, and bounded outline byte caps.
 - **Security & lock hygiene (`hooks/`, `spool/`, `evidence/`):** Moved probes off locks, enforced `_static_ceiling`, fixed GC race.
 - **Installer & CLI exit codes (`services/`, `bin/`):** Wrapped default installs in `RollbackJournal` and fixed non-zero CLI error exits.
-- **CI typing & Windows portability (`hooks/`, `tests/`):** Fixed Python 3.13 `mypy` dict unpacking and Windows `os.geteuid` guard.
+- **CI typing & Windows portability (`core/`, `hooks/`, `tests/`):** Fixed Py3.13 mypy, drive-less `\Users\` scrub, and macOS CI jitter.
 
 ## [5.0.0] - 2026-11-18
 
