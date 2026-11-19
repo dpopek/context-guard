@@ -50,3 +50,17 @@ elif command -v python3 >/dev/null 2>&1; then
 else
   python -m pytest -q tests/test_version_source.py tests/test_module_boundaries.py
 fi
+
+# 4. Run pinned agent-ratchet governance checks (fail-closed if uv/uvx or scripts/guard is missing).
+if [[ -f "$REPO_ROOT/guard.lock" ]] || git ls-files --cached --error-unmatch guard.lock >/dev/null 2>&1; then
+  if [[ ! -x "$REPO_ROOT/scripts/guard" ]]; then
+    echo "[context-guard pre-commit] ERROR: guard.lock is present but executable scripts/guard is missing; restore it with: git restore --source=HEAD -- scripts/guard" >&2
+    exit 1
+  fi
+  if ! command -v uv >/dev/null 2>&1 || ! command -v uvx >/dev/null 2>&1; then
+    echo "[context-guard pre-commit] ERROR: 'uv' / 'uvx' not found on PATH (required by scripts/guard). Install uv: curl -LsSf https://astral.sh/uv/install.sh | sh" >&2
+    exit 1
+  fi
+  "$REPO_ROOT/scripts/guard" scan --staged-only
+  "$REPO_ROOT/scripts/guard" baseline-integrity --enforce-policy-isolation
+fi

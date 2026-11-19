@@ -1,0 +1,137 @@
+#!/bin/sh
+# agent-ratchet consumer shim: runs the agent-ratchet release pinned by guard.lock.
+# Copy to scripts/guard; it must stay byte-identical to consumer/guard at the locked SHA.
+#   scripts/guard [--lock-from REF] <agent-ratchet args...>
+#   scripts/guard exec [--lock-from REF] -- <cmd...>
+# Without --lock-from the lock is read from the index (as committed next), so an unstaged
+# edit cannot change which guard judges the index; the work tree is used only when the
+# index has no guard.lock (bootstrap).
+set -eu
+LC_ALL=C
+export LC_ALL
+
+URL="git+https://github.com/dpopek/agent-ratchet"
+NL='
+'
+TAB=$(printf '\t')
+
+die() {
+    printf 'guard: %s\n' "$1" >&2
+    exit 3
+}
+
+mode=run
+if [ "${1-}" = "exec" ]; then
+    mode=exec
+    shift
+fi
+
+ref=""
+if [ "${1-}" = "--lock-from" ]; then
+    [ "$#" -ge 2 ] || die "--lock-from needs a git ref"
+    ref=$2
+    shift 2
+    case "$ref" in
+        "" | -*) die "invalid ref for --lock-from" ;;
+    esac
+fi
+
+if [ "$mode" = "exec" ]; then
+    [ "${1-}" = "--" ] || die "usage: guard exec [--lock-from REF] -- <cmd...>"
+    shift
+    [ "$#" -gt 0 ] || die "exec needs a command after --"
+fi
+
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git work tree"
+
+# Prints the raw lock bytes of the chosen source ("wt" worktree, "ref" git object, "index" blob).
+emit_lock() {
+    if [ "$src" = "ref" ]; then
+        git -C "$ROOT" cat-file blob "$ref:guard.lock"
+    elif [ "$src" = "index" ]; then
+        git -C "$ROOT" cat-file blob "$blob"
+    else
+        cat "$ROOT/guard.lock"
+    fi
+}
+
+src=wt
+if [ -n "$ref" ]; then
+    entry=$(git -C "$ROOT" ls-tree "$ref" -- guard.lock 2>/dev/null) || die "cannot resolve ref $ref"
+    if [ -n "$entry" ]; then
+        src=ref
+        [ "${entry%% *}" = "100644" ] || die "guard.lock in $ref is not a regular file"
+    else
+        printf 'guard: bootstrap, %s has no guard.lock\n' "$ref" >&2
+    fi
+else
+    entry=$(git -C "$ROOT" ls-files -s -- guard.lock) || die "cannot read the index"
+    if [ -n "$entry" ]; then
+        case "$entry" in
+            *"$NL"*) die "guard.lock in the index is unmerged or not a single file" ;;
+        esac
+        meta=${entry%%"$TAB"*}
+        [ "${entry#*"$TAB"}" = "guard.lock" ] || die "guard.lock in the index is not a regular file"
+        [ "${meta%% *}" = "100644" ] || die "guard.lock in the index is not a regular file"
+        rest=${meta#* }
+        blob=${rest%% *}
+        [ "${rest#* }" = "0" ] || die "guard.lock in the index is unmerged"
+        case "$blob" in
+            "" | *[!0-9a-f]*) die "cannot read guard.lock from the index" ;;
+        esac
+        src=index
+    fi
+fi
+
+if [ "$src" = "wt" ]; then
+    if [ -L "$ROOT/guard.lock" ]; then
+        die "guard.lock must be a regular file, not a symlink"
+    fi
+    [ -f "$ROOT/guard.lock" ] || die "guard.lock is missing or not a regular file"
+fi
+
+# Same grammar as agent_ratchet.lock_policy: 40 lowercase hex, an optional EXTRAS=none|php|magento
+# line, at most one trailing LF, nothing else. Bytes outside the grammar's alphabet (NUL, CR, blanks)
+# are rejected on the raw stream, before command substitution can drop or strip them.
+malformed() {
+    die "guard.lock is malformed (expected 40 lowercase hex characters and an optional EXTRAS=none|php|magento line)"
+}
+stray=$(emit_lock | tr -d '0-9a-zA-Z=\n' | wc -c | tr -d ' ')
+[ "$stray" = "0" ] || malformed
+size=$(emit_lock | wc -c | tr -d ' ')
+data=$(
+    emit_lock
+    printf x
+)
+data=${data%x}
+[ "${#data}" -eq "$size" ] || malformed
+data=${data%"$NL"}
+SHA=${data%%"$NL"*}
+EXTRA=none
+if [ "$SHA" != "$data" ]; then
+    case "${data#*"$NL"}" in
+        EXTRAS=none | EXTRAS=php | EXTRAS=magento) EXTRA=${data#*"$NL"EXTRAS=} ;;
+        *) malformed ;;
+    esac
+fi
+[ "${#SHA}" -eq 40 ] || malformed
+case "$SHA" in
+    *[!0-9a-f]*) malformed ;;
+esac
+
+SPEC="$URL@$SHA"
+if [ "$EXTRA" != "none" ]; then
+    SPEC="agent-ratchet[$EXTRA] @ $SPEC"
+fi
+
+if [ "$mode" = "exec" ]; then
+    tool=uv
+else
+    tool=uvx
+fi
+command -v "$tool" >/dev/null 2>&1 || die "$tool not found on PATH; install uv: curl -LsSf https://astral.sh/uv/install.sh | sh"
+
+if [ "$mode" = "exec" ]; then
+    exec uv run --no-config --no-project --with "$SPEC" -- "$@"
+fi
+exec uvx --no-config --from "$SPEC" agent-ratchet --expect-sha "$SHA" "$@"
