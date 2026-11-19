@@ -11,7 +11,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Mapping
 
-from core.platform_io import atomic_write_bytes, check_unsafe_link
+from core.platform_io import atomic_write_bytes, check_unsafe_link, warn
 from hooks.config import (
     LEGACY_SECURITY_CONFIG_KEYS,
     LEGACY_SECURITY_DOMAIN_MAP,
@@ -98,6 +98,24 @@ def _extract_manifest_hints(pack_py_text: str) -> tuple[str | None, str | None]:
     return env.get("PACK_ID"), None
 
 
+def _revert_journal_op(kind: str, target: Path, payload: Any, mode: int) -> None:
+    """Revert a single recorded rollback journal operation."""
+    if kind == "file":
+        if payload is None:
+            try:
+                target.unlink(missing_ok=True)
+            except NotADirectoryError:
+                return
+            return
+        _write_bytes_preserving_symlink(target, payload, mode=mode)
+        return
+    if kind in ("dir_swap", "dir_remove"):
+        _remove_path(target)
+        if payload is not None and (payload.exists() or payload.is_symlink()):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(payload), str(target))
+
+
 class RollbackJournal:
     """LIFO rollback journal for atomic file mutations, directory swaps, and staged removals."""
 
@@ -162,16 +180,7 @@ class RollbackJournal:
         first_err: Exception | None = None
         for kind, target, payload, mode in reversed(self._ops):
             try:
-                if kind == "file":
-                    if payload is None:
-                        target.unlink(missing_ok=True)
-                    else:
-                        _write_bytes_preserving_symlink(target, payload, mode=mode)
-                elif kind in ("dir_swap", "dir_remove"):
-                    _remove_path(target)
-                    if payload is not None and (payload.exists() or payload.is_symlink()):
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.move(str(payload), str(target))
+                _revert_journal_op(kind, target, payload, mode)
             except Exception as exc:
                 first_err = first_err or exc
         self._ops.clear()
@@ -180,12 +189,16 @@ class RollbackJournal:
             raise first_err
 
     def commit(self) -> None:
-        """Delete temporary directory backups and clear the journal on success."""
-        for kind, _t, payload, _m in self._ops:
-            if kind in ("dir_swap", "dir_remove") and payload is not None and (payload.exists() or payload.is_symlink()):
-                _remove_path(payload)
+        """Clear the journal before best-effort backup cleanup so cleanup errors never trigger rollback."""
+        ops = list(self._ops)
         self._ops.clear()
         self._seen.clear()
+        for kind, _t, payload, _m in ops:
+            if kind in ("dir_swap", "dir_remove") and payload is not None and (payload.exists() or payload.is_symlink()):
+                try:
+                    _remove_path(payload)
+                except OSError as exc:
+                    warn(f"rollback journal commit backup cleanup skipped ({payload}): {type(exc).__name__}: {exc}")
 
 
 def preflight_migration_check(
@@ -410,6 +423,6 @@ class StagedPackTransaction:
             self._cleanup_staging()
 
     def commit(self) -> None:
-        """Remove backup directory and commit the linked RollbackJournal."""
-        self._cleanup_staging()
+        """Commit the linked RollbackJournal before cleaning up any remaining staging directory."""
         self.journal.commit()
+        self._cleanup_staging()

@@ -287,17 +287,94 @@ def test_mcp_missing_workspace_or_literal_template_fails_closed_without_global_f
         assert replies[0]["result"]["isError"] is True
         assert json.loads(replies[0]["result"]["content"][0]["text"])["error"] == "workspace_unresolved"
 
-    # Client advertises capabilities.roots but sends EOF before answering roots/list -> no fallback to --workspace
-    eof_replies = _rpc_ndjson(
+    # Client advertises capabilities.roots with unresolved template/None and sends EOF -> fails closed as workspace_unresolved
+    for tmpl_ws in (None, "${workspaceFolder}"):
+        eof_replies = _rpc_ndjson(
+            [
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {"roots": {}}}},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "cg_spool_list", "arguments": {}}},
+            ],
+            spool_dir=spool_dir, workspace_root=tmpl_ws, isolation="workspace",
+        )
+        tool_rep = next(r for r in eof_replies if r.get("id") == 2)
+        assert tool_rep["result"]["isError"] is True
+        assert json.loads(tool_rep["result"]["content"][0]["text"])["error"] == "workspace_unresolved"
+
+    # Invalid concrete pinned --workspace cannot be overridden by client roots/list
+    bad_pinned = _rpc_ndjson(
         [
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {"roots": {}}}},
             {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "cg_spool_list", "arguments": {}}},
+            {"jsonrpc": "2.0", "id": "cg-roots-1", "result": {"roots": [{"uri": repo.as_uri()}]}},
         ],
-        spool_dir=spool_dir, workspace_root=repo, isolation="workspace",
+        spool_dir=spool_dir, workspace_root=tmp_path / "missing_pinned", isolation="workspace",
     )
-    tool_rep = next(r for r in eof_replies if r.get("id") == 2)
-    assert tool_rep["result"]["isError"] is True
-    assert json.loads(tool_rep["result"]["content"][0]["text"])["error"] == "workspace_unresolved"
+    bad_rep = next(r for r in bad_pinned if r.get("id") == 2)
+    assert bad_rep["result"]["isError"] is True
+    assert json.loads(bad_rep["result"]["content"][0]["text"])["error"] == "workspace_unresolved"
+
+
+def test_mcp_pinned_workspace_not_overridden_by_roots_list_and_template_delegates(tmp_path: Path) -> None:
+    """Operator-pinned --workspace cannot be overridden by client roots/list, may narrow, and templates delegate (P1-03)."""
+    repo_a, repo_b = tmp_path / "repo_pin_a", tmp_path / "repo_pin_b"
+    sub_repo = repo_a / "sub_repo"
+    (repo_a / ".git").mkdir(parents=True)
+    (sub_repo / ".git").mkdir(parents=True)
+    (repo_b / ".git").mkdir(parents=True)
+    spool_dir = tmp_path / "spool"
+
+    res_a = spool_tool_output(
+        _big_spool_text("PINA"), session_id="s-pa", call_id="c-pa", harness="cursor",
+        tool_name="MCP:p:a", workspace_root=repo_a, spool_dir=spool_dir, now_ts=1_700_000_050.0,
+    )
+    res_sub = spool_tool_output(
+        _big_spool_text("PINSUB"), session_id="s-ps", call_id="c-ps", harness="cursor",
+        tool_name="MCP:p:s", workspace_root=sub_repo, spool_dir=spool_dir, now_ts=1_700_000_051.0,
+    )
+    res_b = spool_tool_output(
+        _big_spool_text("PINB"), session_id="s-pb", call_id="c-pb", harness="cursor",
+        tool_name="MCP:p:b", workspace_root=repo_b, spool_dir=spool_dir, now_ts=1_700_000_052.0,
+    )
+    assert res_a is not None and res_sub is not None and res_b is not None
+    sid_a, sid_sub, sid_b = res_a[0].spool_id, res_sub[0].spool_id, res_b[0].spool_id
+
+    # Direct identity resolution rejects unrelated single root and permits child narrowing
+    assert resolve_workspace_identity(repo_a, workspace_roots=[repo_b.as_uri()]) == ("", "", "workspace_mismatch")
+    narrow_id, narrow_root, narrow_err = resolve_workspace_identity(repo_a, workspace_roots=[sub_repo.as_uri()])
+    assert narrow_err is None and same_workspace_dir(narrow_root, sub_repo) and narrow_id.startswith("ws_")
+
+    def _call_with_roots(pinned: str | Path, client_roots: list[str] | None, sid: str, *, method: str = "cg_spool_slice") -> dict[str, Any]:
+        msgs: list[dict[str, Any]] = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {"roots": {"listChanged": True}}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": method, "arguments": ({"spool_id": sid, "limit": 2} if method == "cg_spool_slice" else {})}},
+        ]
+        if client_roots is not None:
+            msgs.append({"jsonrpc": "2.0", "id": "cg-roots-1", "result": {"roots": [{"uri": Path(r).as_uri()} for r in client_roots]}})
+        replies = _rpc_ndjson(msgs, spool_dir=spool_dir, workspace_root=pinned, isolation="workspace")
+        return next(r for r in replies if r.get("id") == 2)
+
+    # Client returns unrelated repo_b while server is pinned to repo_a -> workspace_mismatch (never exposes repo_b!)
+    rep_list = _call_with_roots(repo_a, [str(repo_b)], sid_b, method="cg_spool_list")
+    assert rep_list["result"]["isError"] is True
+    assert json.loads(rep_list["result"]["content"][0]["text"])["error"] == "workspace_mismatch"
+    rep_slice_b = _call_with_roots(repo_a, [str(repo_b)], sid_b)
+    assert json.loads(rep_slice_b["result"]["content"][0]["text"])["error"] == "workspace_mismatch"
+
+    # Matching or superset roots keep pinned repo_a active and still block repo_b
+    assert _call_with_roots(repo_a, [str(repo_a)], sid_a)["result"]["isError"] is False
+    assert _call_with_roots(repo_a, [str(repo_a), str(repo_b)], sid_a)["result"]["isError"] is False
+    assert json.loads(_call_with_roots(repo_a, [str(repo_a), str(repo_b)], sid_b)["result"]["content"][0]["text"])["error"] == "workspace_mismatch"
+
+    # Nested child root narrows pinned repo_a to sub_repo
+    assert _call_with_roots(repo_a, [str(sub_repo)], sid_sub)["result"]["isError"] is False
+    assert json.loads(_call_with_roots(repo_a, [str(sub_repo)], sid_a)["result"]["content"][0]["text"])["error"] == "workspace_mismatch"
+
+    # EOF before roots/list reply retains pinned repo_a
+    assert _call_with_roots(repo_a, None, sid_a)["result"]["isError"] is False
+    assert json.loads(_call_with_roots(repo_a, None, sid_b)["result"]["content"][0]["text"])["error"] == "workspace_mismatch"
+
+    # Unresolved template delegates to client roots/list
+    assert _call_with_roots("${workspaceFolder}", [str(repo_a)], sid_a)["result"]["isError"] is False
 
 
 def test_session_and_global_isolation_modes_and_roots_list_changed_invalidation(

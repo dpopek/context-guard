@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import errno
 import hashlib
 import json
@@ -171,13 +172,29 @@ _INDEX_KEYS = (
     "spool_id", "filename", "workspace_id", "canon_root", "session_id", "call_id", "harness", "tool_name",
     "cmd_sig", "total_lines", "total_bytes", "summary_bytes", "saved_bytes", "content_sha256",
     "created_at", "last_accessed_at", "state", "corrupt_reason", "corrupted_at",
+    "blob_dev", "blob_ino", "blob_mtime_ns",
 )
+
+
+def _extract_blob_identity(record: Mapping[str, Any]) -> tuple[int, int, int] | None:
+    dev, ino, mtime_ns = record.get("blob_dev"), record.get("blob_ino"), record.get("blob_mtime_ns")
+    if (
+        isinstance(dev, int) and not isinstance(dev, bool)
+        and isinstance(ino, int) and not isinstance(ino, bool)
+        and isinstance(mtime_ns, int) and not isinstance(mtime_ns, bool)
+    ):
+        return (int(dev), int(ino), int(mtime_ns))
+    return None
 
 
 def parse_spool_index(data: Any) -> dict[str, Any] | None:
     """Validate and normalize raw decoded JSON into a schema-v2 spool index dict."""
     if not isinstance(data, dict) or isinstance((sv := data.get("schema_version")), bool) or sv not in (1, _SCHEMA_VERSION) or not isinstance(data.get("entries"), dict):
         return None
+    raw_epoch = data.get("id_epoch", 0)
+    if "id_epoch" in data and (isinstance(raw_epoch, bool) or not isinstance(raw_epoch, int) or raw_epoch < 0):
+        return None
+    id_epoch = int(raw_epoch) if "id_epoch" in data else 0
     raw_tombs = data.get("tombstones")
     if sv == _SCHEMA_VERSION and "tombstones" in data and not isinstance(raw_tombs, dict):
         return None
@@ -195,11 +212,12 @@ def parse_spool_index(data: Any) -> dict[str, Any] | None:
             "workspace_id": str(tv.get("workspace_id") or ""), "session_id": str(tv.get("session_id") or ""),
             "total_bytes": max(0, int(tv.get("total_bytes") or 0)),
             **({"canon_root": tv["canon_root"]} if isinstance(tv.get("canon_root"), str) and tv["canon_root"].strip() else {}),
+            **{k: int(tv[k]) for k in ("blob_dev", "blob_ino", "blob_mtime_ns") if isinstance(tv.get(k), int) and not isinstance(tv.get(k), bool)},
         }
         for sid, tv in (raw_tombs.items() if isinstance(raw_tombs, dict) else ())
         if isinstance(sid, str) and SPOOL_ID_RE.fullmatch(sid) and isinstance(tv, dict)
     }
-    return {"schema_version": _SCHEMA_VERSION, "entries": entries, "tombstones": tombstones}
+    return {"schema_version": _SCHEMA_VERSION, "id_epoch": id_epoch, "entries": entries, "tombstones": tombstones}
 
 
 def _ro_index_state(eff_dir: Path) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], bool]:
@@ -557,49 +575,77 @@ def prune_evicted_tombstones(
     return dirty
 
 
-def plan_gc_phase1(
-    index: dict[str, Any], *, max_age: float, max_entries: int, max_bytes: int, now_ts: float,
-    protect: str | None = None, probe_blob_corrupt: Callable[[str], str | None],
-    tombstone_max_age: float = 7 * 86_400.0, max_tombstones: int = 128, max_corrupt_entries: int = 64,
-) -> tuple[list[tuple[str, int]], set[str], bool]:
-    """Plan Phase-1 GC corrupt marks, TTL/LRU evictions, and bounded tombstones inside the spool lock."""
-    entries, tombstones, dirty = index["entries"], index.setdefault("tombstones", {}), False
+@dataclass(frozen=True)
+class GcEvictionPolicy:
+    """Parameters and blob probes for planning locked spool GC evictions."""
+
+    max_age: float
+    max_entries: int
+    max_bytes: int
+    now_ts: float
+    probe_blob_corrupt: Callable[[str], str | None]
+    protect: str | None = None
+    tombstone_max_age: float = 7 * 86_400.0
+    max_tombstones: int = 128
+    max_corrupt_entries: int = 64
+    probe_blob_identity: Callable[[str], tuple[int, int, int] | None] | None = None
+
+
+def plan_gc_evictions(
+    index: dict[str, Any],
+    policy: GcEvictionPolicy,
+) -> tuple[list[tuple[str, int, tuple[int, int, int] | None]], set[str], bool]:
+    """Plan corrupt marks, TTL/LRU evictions, and bounded tombstones inside the spool lock."""
+    entries, tombstones, dirty, pruned_any = index["entries"], index.setdefault("tombstones", {}), False, False
     for s, ent in entries.items():
-        if s != protect and ent.get("state", "available") == "available" and (cr := probe_blob_corrupt(s)) is not None:
-            ent["state"], ent["corrupt_reason"], ent["corrupted_at"], dirty = "corrupt", cr, now_ts, True
-    for old_c in [s for s, e in entries.items() if e.get("state") == "corrupt" and (now_ts - float(e.get("corrupted_at", e.get("created_at", 0.0)))) > tombstone_max_age]:
+        if s != policy.protect and ent.get("state", "available") == "available" and (cr := policy.probe_blob_corrupt(s)) is not None:
+            ent["state"], ent["corrupt_reason"], ent["corrupted_at"], dirty = "corrupt", cr, policy.now_ts, True
+    for old_c in [s for s, e in entries.items() if e.get("state") == "corrupt" and (policy.now_ts - float(e.get("corrupted_at", e.get("created_at", 0.0)))) > policy.tombstone_max_age]:
         del entries[old_c]
-        dirty = True
+        dirty, pruned_any = True, True
     corrupt_sids = sorted((s for s, e in entries.items() if e.get("state") == "corrupt"), key=lambda s: (float(entries[s].get("corrupted_at", entries[s].get("created_at", 0.0))), s))
-    for old_c in corrupt_sids[: max(0, len(corrupt_sids) - max_corrupt_entries)]:
+    for old_c in corrupt_sids[: max(0, len(corrupt_sids) - policy.max_corrupt_entries)]:
         del entries[old_c]
-        dirty = True
+        dirty, pruned_any = True, True
     avail_sids = [s for s, e in entries.items() if e.get("state", "available") == "available"]
-    evict_reasons = {s: "ttl_expired" for s in avail_sids if s != protect and (now_ts - float(entries[s].get("last_accessed_at", entries[s].get("created_at", 0.0)))) > max_age}
+    evict_reasons = {s: "ttl_expired" for s in avail_sids if s != policy.protect and (policy.now_ts - float(entries[s].get("last_accessed_at", entries[s].get("created_at", 0.0)))) > policy.max_age}
     rem_c = sum(1 for s in avail_sids if s not in evict_reasons)
     rem_b = sum(max(0, int(entries[s].get("total_bytes") or 0)) for s in avail_sids if s not in evict_reasons)
-    lru_order = sorted((s for s in avail_sids if s != protect and s not in evict_reasons), key=lambda s: (float(entries[s].get("last_accessed_at", 0.0)), float(entries[s].get("created_at", 0.0)), s))
+    lru_order = sorted((s for s in avail_sids if s != policy.protect and s not in evict_reasons), key=lambda s: (float(entries[s].get("last_accessed_at", 0.0)), float(entries[s].get("created_at", 0.0)), s))
     for sid in lru_order:
-        if rem_c <= max(0, max_entries) and rem_b <= max(0, max_bytes):
+        if rem_c <= max(0, policy.max_entries) and rem_b <= max(0, policy.max_bytes):
             break
-        evict_reasons[sid] = "max_entries_lru" if rem_c > max(0, max_entries) else "max_bytes_lru"
+        evict_reasons[sid] = "max_entries_lru" if rem_c > max(0, policy.max_entries) else "max_bytes_lru"
         rem_c, rem_b = rem_c - 1, rem_b - max(0, int(entries[sid].get("total_bytes") or 0))
     for sid, reason in evict_reasons.items():
         ent = entries.pop(sid)
+        ident = _extract_blob_identity(ent)
+        if ident is None and policy.probe_blob_identity is not None:
+            ident = policy.probe_blob_identity(sid)
         tomb: dict[str, Any] = {
             "spool_id": sid,
             "state": "evicting",
             "reason": reason,
-            "evicted_at": now_ts,
+            "evicted_at": policy.now_ts,
             "workspace_id": str(ent.get("workspace_id") or ""),
             "session_id": str(ent.get("session_id") or ""),
             "total_bytes": max(0, int(ent.get("total_bytes") or 0)),
         }
         if isinstance(ent.get("canon_root"), str) and ent["canon_root"].strip():
             tomb["canon_root"] = ent["canon_root"]
+        if ident is not None:
+            tomb["blob_dev"], tomb["blob_ino"], tomb["blob_mtime_ns"] = ident
         tombstones[sid], dirty = tomb, True
-    dirty = prune_evicted_tombstones(tombstones, now_ts, max_age=tombstone_max_age, max_tombstones=max_tombstones) or dirty
-    return [(sid, max(0, int(t.get("total_bytes") or 0))) for sid, t in tombstones.items() if t.get("state") == "evicting"], set(entries) | set(tombstones), dirty
+    if prune_evicted_tombstones(tombstones, policy.now_ts, max_age=policy.tombstone_max_age, max_tombstones=policy.max_tombstones):
+        dirty, pruned_any = True, True
+    if pruned_any:
+        index["id_epoch"] = max(0, int(index.get("id_epoch") or 0)) + 1
+    evicting_targets = [
+        (sid, max(0, int(t.get("total_bytes") or 0)), _extract_blob_identity(t))
+        for sid, t in tombstones.items()
+        if t.get("state") == "evicting"
+    ]
+    return evicting_targets, set(entries) | set(tombstones), dirty
 
 
 def read_spool_index_readonly(idx_path: Path) -> tuple[dict[str, Any] | None, str | None]:

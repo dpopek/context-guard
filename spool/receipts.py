@@ -141,6 +141,11 @@ def _is_under(child: str, parent: str) -> bool:
         return False
 
 
+def is_unresolved_workspace_template(raw: str | Path | None) -> bool:
+    """Return True when `raw` is a non-empty path/string containing an unexpanded `${...}` placeholder."""
+    return isinstance(raw, (str, Path)) and bool(_UNRESOLVED_TMPL_RE.search(str(raw).strip()))
+
+
 def resolve_workspace_identity(explicit_path: str | Path | None, *, workspace_roots: Sequence[str] | None = None) -> tuple[str, str, str | None]:
     """Canonicalize explicit path or workspace_roots to `(workspace_id, canon_root, error)`."""
     def _wid(r: str) -> str:
@@ -166,12 +171,22 @@ def resolve_workspace_identity(explicit_path: str | Path | None, *, workspace_ro
         if len(unique_roots) == 1:
             o_root = unique_roots[0]
             o_id = _wid(o_root)
-            return (exp_id, exp_root, None) if (exp_root and _is_under(exp_root, o_root)) else (o_id, o_root, None)
-        if exp_root and (
-            any(same_workspace_dir(exp_root, rr) for rr in unique_roots)
-            or len([rr for rr in unique_roots if _is_under(exp_root, rr)]) == 1
-        ):
-            return exp_id, exp_root, None
+            if not exp_root:
+                return o_id, o_root, None
+            if same_workspace_dir(exp_root, o_root) or _is_under(exp_root, o_root):
+                return exp_id, exp_root, None
+            if _is_under(o_root, exp_root):
+                return o_id, o_root, None
+            return "", "", "workspace_mismatch"
+        if exp_root:
+            if any(same_workspace_dir(exp_root, rr) for rr in unique_roots):
+                return exp_id, exp_root, None
+            parents = [rr for rr in unique_roots if _is_under(exp_root, rr)]
+            if len(parents) == 1:
+                return exp_id, exp_root, None
+            children = [rr for rr in unique_roots if _is_under(rr, exp_root)]
+            if len(children) == 1:
+                return _wid(children[0]), children[0], None
         return "", "", "workspace_ambiguous"
     return (exp_id, exp_root, None) if exp_root else ("", "", "workspace_unresolved")
 
