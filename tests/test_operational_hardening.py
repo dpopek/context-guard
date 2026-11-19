@@ -158,6 +158,10 @@ def test_hardening_harness_upgrade_invalidates_attestations_without_lowering_sec
     paths["cfg_path"].write_text(json.dumps(cfg_v2, indent=2), encoding="utf-8")
     config.clear_config_cache()
     policy_engine.clear_pack_cache()
+    loaded_v2 = config.load_runtime_config(paths["cfg_path"])
+    assert loaded_v2.get("governor", {}).get("harness_build_id") == "claude_cli_200"
+    assert loaded_v2.get("governor", {}).get("require_runtime_verified") is True
+    assert loaded_v2["optimizers"].get("dynamic_tool_mutation") == "active"
     ws = _make_workspace(tmp_path, "ws_upgrade")
     bad_res = pre_tool_use.evaluate_hook(
         {"tool_name": "Bash", "tool_input": {"command": "echo forbidden_upgrade_op"}, "session_id": "s_upg", "cwd": str(ws)},
@@ -175,6 +179,16 @@ def test_hardening_harness_upgrade_invalidates_attestations_without_lowering_sec
         "output_spool", state_dir=gov_dir, verification_passed=True, verification_evidence="replay:clean",
     )
     assert ok_reset["ok"] is True and ok_reset["breaker"]["tripped"] is False
+    post_res = post_tool_use.handle_post_tool_use(
+        "claude",
+        {
+            "hook_event_name": "PostToolUse", "tool_name": "Bash",
+            "tool_input": {"command": "pytest"}, "tool_response": {"stdout": _make_spool_text("post_upg")},
+            "session_id": "s_upg", "cwd": str(ws), "claude_version": "claude_cli_200",
+        },
+        state_dir=str(gov_dir),
+    )
+    assert post_res == {}
 
 
 def test_hardening_resumed_session_reconciles_evicting_tombstones_and_dedups_receipts(

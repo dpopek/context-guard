@@ -4,7 +4,7 @@ from __future__ import annotations
 import os, re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 from core.contracts import SpoolDecision
 from core.platform_io import safe_finite_int, warn
@@ -278,4 +278,9 @@ def format_post_tool_spool_response(harness: str, decision: SpoolDecision | None
         return {}
     if (decision.harness or harness) == "claude":
         return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": decision.updated_output}}
-    return {"updated_mcp_tool_output": decision.updated_output}
+    out = decision.updated_output
+    if isinstance(out, Mapping):
+        return {"updated_mcp_tool_output": dict(out)}
+    if isinstance(out, str):
+        return {"updated_mcp_tool_output": {"content": [{"type": "text", "text": out}]}}
+    return {}

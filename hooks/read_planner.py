@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy, hashlib, json, math, os, re, time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, NamedTuple
 
@@ -247,7 +248,8 @@ def plan_file_read_verdict(
     """Gather disk metadata/state snapshot and delegate planning to pure `decide_file_read`."""
     canon = os.path.realpath(raw_path)
     if not os.path.isfile(canon) or Path(canon).suffix.lower() in BINARY_MEDIA_EXTENSIONS: return PlannedFileRead(FileReadOutcome({"decision": "allow"}))
-    if (sha256 := file_io.compute_file_sha256(canon)) is None: return PlannedFileRead(FileReadOutcome({"decision": "allow"}))
+    sha256, target_stat = file_io.stat_and_compute_file_sha256(canon)
+    if sha256 is None: return PlannedFileRead(FileReadOutcome({"decision": "allow"}))
     special = json_outliners.classify_special_read_target(canon)
     cfg = config.load_runtime_config() if (can_trim is None or min_tier is None or special.is_twg_stdout) else {}
     eff_trim = can_trim if can_trim is not None else (cfg.get("optimizers") or {}).get("range_trim") != "off"
@@ -263,9 +265,10 @@ def plan_file_read_verdict(
     pu = pre_entry.get("unwrapped_path")
     unwrapped_exists = isinstance(pu, str) and os.path.isfile(pu)
     u_lines = (file_io.count_file_lines_streaming(pu) or 0) if unwrapped_exists and isinstance(pu, str) else 0
-    u_sha = (file_io.compute_file_sha256(pu) or "") if unwrapped_exists and isinstance(pu, str) else ""
+    u_sha_opt, u_stat = file_io.stat_and_compute_file_sha256(pu) if unwrapped_exists and isinstance(pu, str) else (None, None)
+    u_sha = u_sha_opt or ""
     planned_unwrap = os.path.realpath(str(prepared.pending_write.target_path)) if prepared is not None and prepared.pending_write is not None else None
-    return decide_file_read(
+    planned = decide_file_read(
         raw_path=raw_path, canon=canon, sha256=sha256, target_lines=file_io.count_file_lines_streaming(canon) or 0, state=state,
         start_line=start_line, end_line=end_line, byte_offset=byte_offset, step_idx=step_idx, allow_auto_outline=allow_auto_outline,
         path_arg_key=path_arg_key, auto_increment_step=auto_increment_step, harness=harness, read_tool=read_tool, can_trim=eff_trim,
@@ -273,6 +276,11 @@ def plan_file_read_verdict(
         prepared=prepared, twg_active=twg_act, unwrapped_exists=unwrapped_exists, unwrapped_lines=u_lines, unwrapped_sha256=u_sha,
         planned_unwrapped_path=planned_unwrap, now_ts=time.time(), slice_measurer=_measure_slice, slice_fingerprinter=_slice_norm_fingerprint,
         state_dir_path=state_dir_path, locked_state_fn=locked_state_fn, unwrap_writer=unwrap_writer)
+    if planned.meta is None:
+        return planned
+    pr = planned.meta.pending_read
+    eff_r_stat = u_stat if (planned.meta.pending_write is None and pr is not None and pr.is_redirect) else None
+    return planned._replace(meta=replace(planned.meta, target_stat=target_stat, redirect_stat=eff_r_stat))
 
 def _strip_dangling_redirect(dec: dict[str, Any], rec: dict[str, Any], path_arg_key: str) -> None:
     if isinstance((ow := dec.get("overwrite")), dict):
@@ -281,25 +289,68 @@ def _strip_dangling_redirect(dec: dict[str, Any], rec: dict[str, Any], path_arg_
         else: dec.pop("overwrite", None)
     rec["redirect_path"], rec["is_redirect"] = None, False
 
-def _detect_toctou_mismatch(state: dict[str, Any], canon: str, meta: PlannerMeta) -> str | None:
-    disk_sha = file_io.compute_file_sha256(canon)
-    if disk_sha is None or disk_sha != meta.sha256: return "target sha256 changed"
+def _verify_file_pre_lock(
+    path: str,
+    expected_sha: str,
+    expected_stat: tuple[int, int, int, int] | None,
+    *,
+    force_hash: bool,
+) -> tuple[bool, tuple[int, int, int, int] | None]:
+    if not force_hash and expected_stat is not None:
+        cur_stat = file_io.stat_file_identity(path)
+        return (cur_stat == expected_stat, cur_stat)
+    cur_sha, cur_stat = file_io.stat_and_compute_file_sha256(path)
+    return (cur_sha is not None and cur_sha == expected_sha, cur_stat)
+
+def _verify_pre_lock_targets(
+    canon: str,
+    meta: PlannerMeta,
+) -> tuple[str | None, tuple[int, int, int, int] | None, tuple[int, int, int, int] | None]:
+    pr = meta.pending_read
+    mutating = meta.is_outline or (pr is not None and (pr.is_trim or pr.is_redirect))
+    ok_target, t_stat = _verify_file_pre_lock(canon, meta.sha256, meta.target_stat, force_hash=mutating)
+    if not ok_target:
+        return ("target sha256 changed", None, None)
+    r_stat: tuple[int, int, int, int] | None = None
+    if meta.pending_write is None and pr is not None and pr.is_redirect and pr.redirect_path:
+        ok_redir, r_stat = _verify_file_pre_lock(
+            pr.redirect_path, pr.sha256 or meta.sha256, meta.redirect_stat, force_hash=True,
+        )
+        if not ok_redir:
+            return ("unwrapped redirect target changed", None, None)
+    return (None, t_stat, r_stat)
+
+def _detect_toctou_mismatch(
+    state: dict[str, Any],
+    canon: str,
+    meta: PlannerMeta,
+    verified_stats: tuple[tuple[int, int, int, int] | None, tuple[int, int, int, int] | None],
+) -> str | None:
+    t_stat, r_stat = verified_stats
+    if t_stat is None or file_io.stat_file_identity(canon) != t_stat:
+        return "target sha256 changed"
     _, _, chk_entry = _prepare_step_and_entry(copy.deepcopy(state), canon, meta.sha256, meta.step_idx, meta.auto_increment_step, persist=False)
-    if _snapshot_reads(chk_entry.get("reads") or []) != meta.expected_reads_snapshot: return "recorded reads changed"
-    if meta.is_outline and bool(chk_entry.get("outlined")): return "file already outlined"
+    if _snapshot_reads(chk_entry.get("reads") or []) != meta.expected_reads_snapshot:
+        return "recorded reads changed"
+    if meta.is_outline and bool(chk_entry.get("outlined")):
+        return "file already outlined"
     pr = meta.pending_read
     if meta.pending_write is None and pr is not None and pr.is_redirect and pr.redirect_path:
-        u_sha = file_io.compute_file_sha256(pr.redirect_path)
-        if u_sha is None or (pr.sha256 and u_sha != pr.sha256): return "unwrapped redirect target changed"
+        if r_stat is None or file_io.stat_file_identity(pr.redirect_path) != r_stat:
+            return "unwrapped redirect target changed"
     return None
 
 def commit_planned_file_read(planned: PlannedFileRead) -> FileReadOutcome:
     """Persist unwrap files, pending reads, and step watermarks for an approved `PlannedFileRead`."""
     if not planned.needs_commit or planned.state_dir_path is None or planned.meta is None: return planned.outcome
     meta, o = planned.meta, planned.outcome
+    pre_err, t_stat, r_stat = _verify_pre_lock_targets(planned.canon, meta)
+    if pre_err is not None:
+        warn(f"commit_planned_file_read aborted stale plan ({planned.canon}): {pre_err}")
+        return FileReadOutcome({"decision": "allow"}, effective_step_idx=o.effective_step_idx)
     try:
         with planned.locked_state_fn(planned.state_dir_path) as txn:
-            if (stale := _detect_toctou_mismatch(txn.state, planned.canon, meta)) is not None:
+            if (stale := _detect_toctou_mismatch(txn.state, planned.canon, meta, (t_stat, r_stat))) is not None:
                 warn(f"commit_planned_file_read aborted stale plan ({planned.canon}): {stale}")
                 return FileReadOutcome({"decision": "allow"}, effective_step_idx=o.effective_step_idx)
             eff_step, files_map, entry = _prepare_step_and_entry(txn.state, planned.canon, meta.sha256, meta.step_idx, meta.auto_increment_step, persist=True)

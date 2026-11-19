@@ -279,6 +279,8 @@ class PlannerMeta:
     clear_followups: bool = False
     peer_paths: tuple[str, ...] = ()
     expected_reads_snapshot: tuple[tuple[int, int, int, int], ...] = ()
+    target_stat: tuple[int, int, int, int] | None = None
+    redirect_stat: tuple[int, int, int, int] | None = None
 
 
 @dataclass(frozen=True)

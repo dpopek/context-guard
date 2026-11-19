@@ -24,10 +24,10 @@ from policies.api import SpoolContractV1
 from policies.governor import is_optimizer_tripped, record_governor_signal
 from spool.classifier import (
     GcEvictionPolicy, SPOOL_ID_RE, build_spool_summary, classify_pre_tool_spool_followup,
-    compute_command_signature, entry_scope_error, grep_verified_lines, inspect_spool_entry_readonly,
-    inspect_spool_health_readonly, is_verbose_override_command, parse_spool_index, plan_gc_evictions,
-    prepare_post_tool_spool_candidate, project_spool_in_memory, read_blob_bytes,
-    read_spool_index_readonly, resolve_spool_scope, slice_verified_lines, split_lines,
+    compute_command_signature, entry_scope_error, format_spooled_tool_output, grep_verified_lines,
+    inspect_spool_entry_readonly, inspect_spool_health_readonly, is_verbose_override_command,
+    parse_spool_index, plan_gc_evictions, prepare_post_tool_spool_candidate, project_spool_in_memory,
+    read_blob_bytes, read_spool_index_readonly, resolve_spool_scope, slice_verified_lines, split_lines,
 )
 from spool.gc import (
     DedupQuery, GcPostLockOptions, find_dedup_candidate, is_dedup_entry_match, matches_stat_identity,
@@ -442,12 +442,7 @@ def spool_post_tool_output(
     if spooled is None:
         return None, None
     contract, summary, receipt_id = spooled
-    if not claude_ok or shape in ("str", "bytes"):
-        updated_out: Any = summary
-    elif shape == "blocks":
-        updated_out = [{"type": "text", "text": summary}]
-    else:
-        updated_out = {**raw_resp, str(shape): summary} if isinstance(raw_resp, Mapping) else summary
+    updated_out = format_spooled_tool_output(harness, shape, raw_resp, summary)
     sum_bytes = len(summary.encode("utf-8"))
     meta: dict[str, Any] = {
         "contract": contract, "spool_id": contract.spool_id, "workspace_id": ws_id, "total_lines": contract.total_lines,
