@@ -19,6 +19,7 @@ from spool.receipts import (
     build_receipt,
     derive_spool_event_id,
     find_created_receipt,
+    load_receipt_rows,
     persist_spool_delivery_verification,
     read_spool_config,
     read_spool_isolation_config,
@@ -68,11 +69,19 @@ def test_context_receipt_v1_schema_contract() -> None:
         "failure_kind": "str | None",
         "reason": "str | None",
     }
+    expected_optional = {
+        "recovered_line_spans": "list[tuple[int, int]]",
+        "recovered_byte_spans": "list[tuple[int, int]]",
+        "recovered_context_bytes": "int",
+        "blob_sha256": "str",
+        "blob_bytes": "int",
+    }
     assert len(expected_annotations) == 29
     ann = ContextReceiptV1.__annotations__
-    assert set(ann.keys()) == set(expected_annotations.keys())
+    assert set(ann.keys()) == set(expected_annotations.keys()) | set(expected_optional.keys())
     assert ContextReceiptV1.__required_keys__ == frozenset(expected_annotations.keys())
-    for key, expected in expected_annotations.items():
+    assert ContextReceiptV1.__optional_keys__ == frozenset(expected_optional.keys())
+    for key, expected in {**expected_annotations, **expected_optional}.items():
         raw_val = ann[key]
         actual = raw_val if isinstance(raw_val, str) else getattr(raw_val, "__forward_arg__", repr(raw_val))
         assert actual == expected
@@ -168,8 +177,14 @@ def test_receipts_rotate_at_limit_and_public_json_scrubs_receipt_paths_and_works
     )
     assert append_receipt(extra, receipts_path=rcpt_path) is True
 
-    rows = [json.loads(line) for line in rcpt_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    raw_rows = [json.loads(line) for line in rcpt_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert raw_rows[0]["_meta"] == "receipts_rotation"
+    assert raw_rows[0]["schema_version"] == 1
+    assert raw_rows[0]["retained_rows"] == RECEIPTS_KEEP_ROWS
+    assert raw_rows[0]["dropped_rows"] > 0
+    rows = [r for r in raw_rows if r.get("_meta") != "receipts_rotation"]
     assert len(rows) == RECEIPTS_KEEP_ROWS
+    assert len(load_receipt_rows(rcpt_path)) == RECEIPTS_KEEP_ROWS
     assert rows[-1]["receipt_id"] == extra["receipt_id"]
     summary = summarize_receipts(rcpt_path)
     assert set(summary.keys()) == {

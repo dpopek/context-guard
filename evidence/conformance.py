@@ -20,6 +20,7 @@ from evidence.ledger import (
     run_cursor_cli_conformance,
     run_governor_release_gates,
 )
+from evidence.metrics import is_verified_live_campaign_artifact
 from evidence.runner import run_offline_evidence_replay
 from hooks import config as hooks_config, outcomes, state_store
 from hooks.harness_adapter import (
@@ -182,8 +183,13 @@ _HARNESS_SPECS: dict[str, dict[str, Any]] = {
 }
 
 
-def build_capability_limitation_matrix(*, include_live_effectiveness: bool = False) -> PlatformMatrixContractV1:
+def build_capability_limitation_matrix(
+    *, include_offline_benchmarks: bool | None = None, include_live_effectiveness: bool = False,
+    live_campaign_artifact: Mapping[str, Any] | None = None,
+) -> PlatformMatrixContractV1:
     """Build the authoritative 4-harness capability/limitation matrix and effectiveness summary."""
+    run_offline = include_offline_benchmarks if include_offline_benchmarks is not None else bool(include_live_effectiveness)
+    live_ok = is_verified_live_campaign_artifact(live_campaign_artifact)
     harnesses: dict[str, HarnessCapabilityMatrixRowV1] = {
         hid: {
             "harness_id": hid, "display_name": str((spec := _HARNESS_SPECS[hid])["display_name"]),
@@ -205,38 +211,33 @@ def build_capability_limitation_matrix(*, include_live_effectiveness: bool = Fal
         "offline_replay_statistical_proof": False, "offline_replay_scope": "deterministic_contract_integrity_and_latency_only",
         "outcomes_cost_impact_semantics": "observational_1_over_k_step_weighted_non_causal",
         "failed_attempts_excluded": False, "endogenous_ttl_cache_misses_excluded": False,
-        "cursor_cli_cache_policy": "excluded_missing_telemetry", "live_benchmarks_included": bool(include_live_effectiveness),
+        "cursor_cli_cache_policy": "excluded_missing_telemetry", "offline_benchmarks_included": bool(run_offline),
+        "live_benchmarks_included": live_ok, "live_campaign_status": "verified_live_campaign" if live_ok else "not_included",
         "methodological_limitations": [
-            "Offline deterministic replay has statistical_proof=false and does not simulate multi-turn live LLM trajectories.",
+            "Local deterministic replay and 1-iteration benchmark are offline checks (statistical_proof=false), not live effectiveness proof.",
             "Outcomes v4 Estimated Cost Impact uses observational 1/k step-weighted attribution and is never causal A/B proof.",
             "Failed attempts and endogenous TTL prompt-cache misses are never excluded from Cost per Passed Run.",
             "Cursor CLI cache attribution is reported as excluded_missing_telemetry rather than coerced to 0.",
         ],
     }
-    if include_live_effectiveness:
+    if run_offline:
         rep, bench, ev = run_deterministic_replay(), run_deterministic_benchmark(iterations=1), run_offline_evidence_replay()
         v_map = v if isinstance((v := ev.get("gate_verdict")), Mapping) else {}
         c_map = c if isinstance((c := v_map.get("checks")), Mapping) else {}
         be_map = b if isinstance((b := bench.get("backend_evaluation")), Mapping) else {}
         eff["deterministic_replay"] = {
-            "ok": bool(rep.get("ok")),
-            "read_ledger_schema": int(rep.get("read_ledger_schema", 0) or 0),
+            "ok": bool(rep.get("ok")), "read_ledger_schema": int(rep.get("read_ledger_schema", 0) or 0),
             "outcomes_schema": int(rep.get("outcomes_schema", 0) or 0),
             "modes_checked": [str(m.get("mode")) for m in (rep.get("modes") or []) if isinstance(m, Mapping)],
         }
         eff["latency_benchmark"] = {
-            "ok": bool(bench.get("ok")),
-            "in_process_latency_ms": dict(bench.get("in_process_latency_ms") or {}),
+            "ok": bool(bench.get("ok")), "in_process_latency_ms": dict(bench.get("in_process_latency_ms") or {}),
             "subprocess_latency_ms": dict(bench.get("subprocess_latency_ms") or {}),
-            "savings_pct": float(bench.get("savings_pct", 0.0) or 0.0),
-            "backend_decision": str(be_map.get("decision") or ""),
+            "savings_pct": float(bench.get("savings_pct", 0.0) or 0.0), "backend_decision": str(be_map.get("decision") or ""),
         }
         eff["offline_evidence_replay"] = {
-            "ok": bool(v_map.get("ok")),
-            "tier": str(ev.get("tier") or ""),
-            "statistical_proof": bool(ev.get("statistical_proof")),
-            "arms": list(ev.get("arms") or []),
-            "hardening_gate_ok": bool(c_map.get("hardening_gate_ok")),
+            "ok": bool(v_map.get("ok")), "tier": str(ev.get("tier") or ""), "statistical_proof": bool(ev.get("statistical_proof")),
+            "arms": list(ev.get("arms") or []), "hardening_gate_ok": bool(c_map.get("hardening_gate_ok")),
         }
     return {
         "schema_version": PLATFORM_MATRIX_SCHEMA_VERSION, "policy_api_version": POLICY_API_VERSION,
@@ -341,7 +342,10 @@ def run_adapter_conformance_suite() -> dict[str, dict[str, Any]]:
     return {
         "antigravity": {"ok": all(ag_checks.values()), "harness_id": "antigravity", "checks": ag_checks},
         "claude": {"ok": all(cl_checks.values()), "harness_id": "claude", "checks": cl_checks},
-        "cursor": {"ok": all(cu_checks.values()), "harness_id": "cursor", "cache_attribution_status": str(cu_cli.get("cache_attribution_status") or ""), "checks": cu_checks},
+        "cursor": {
+            "ok": all(cu_checks.values()), "harness_id": "cursor", "cache_attribution_status": str(cu_cli.get("cache_attribution_status") or ""),
+            "verification_scope": "adapter_contract_only", "adapter_conformance_passed": bool(cu_cli.get("ok")), "runtime_verified": False, "checks": cu_checks,
+        },
         "codex": {"ok": all(cx_checks.values()), "harness_id": "codex", "checks": cx_checks},
     }
 
@@ -655,7 +659,7 @@ def run_migration_and_rollback_conformance(work_dir: Path | None = None) -> dict
 
 
 def _run_suite_in_dir(root: Path) -> ConformanceContractV1:
-    matrix = build_capability_limitation_matrix(include_live_effectiveness=True)
+    matrix = build_capability_limitation_matrix(include_offline_benchmarks=True)
     dep, harnesses, eff = matrix["deprecation_policy"], matrix["harnesses"], matrix["effectiveness_summary"]
     adapters, packs, mig = run_adapter_conformance_suite(), run_baseline_policy_pack_conformance(work_dir=root / "packs"), run_migration_and_rollback_conformance(work_dir=root / "migrations")
     matrix_ok = set(harnesses) == set(SUPPORTED_HARNESS_IDS) and harnesses["cursor"]["cache_telemetry"] == "excluded_missing_telemetry" and all(
@@ -665,7 +669,8 @@ def _run_suite_in_dir(root: Path) -> ConformanceContractV1:
         and len(r["verified_guarantees"]) >= 3 and len(r["documented_limitations"]) >= 2 for h in SUPPORTED_HARNESS_IDS
     )
     eff_ok = bool(
-        eff.get("live_benchmarks_included") is True and eff.get("primary_release_metric") == "Cost per Passed Run"
+        eff.get("offline_benchmarks_included") is True and eff.get("live_benchmarks_included") is False
+        and eff.get("primary_release_metric") == "Cost per Passed Run"
         and eff.get("offline_replay_statistical_proof") is False and eff.get("failed_attempts_excluded") is False
         and eff.get("endogenous_ttl_cache_misses_excluded") is False and len(eff.get("methodological_limitations") or ()) >= 3
         and all(bool((eff.get(k) or {}).get("ok")) for k in ("deterministic_replay", "latency_benchmark", "offline_evidence_replay"))
@@ -682,6 +687,8 @@ def _run_suite_in_dir(root: Path) -> ConformanceContractV1:
             set(adapters) == set(SUPPORTED_HARNESS_IDS)
             and all(bool(adapters[h].get("ok")) for h in SUPPORTED_HARNESS_IDS)
             and adapters["cursor"].get("cache_attribution_status") == "excluded_missing_telemetry"
+            and adapters["cursor"].get("verification_scope") == "adapter_contract_only"
+            and adapters["cursor"].get("runtime_verified") is False
         ),
         "baseline_security_pack_conformance": bool(packs.get("security_pack_ok")),
         "baseline_optimization_pack_reconciliation": bool(packs.get("optimization_reconciliation_ok")),
@@ -751,7 +758,7 @@ def render_platform_matrix_markdown(matrix: Mapping[str, Any]) -> str:
             lines.append("")
     lines.extend([
         "## Effectiveness Contract & Methodological Limitations", "",
-        f"- Primary release metric: `{eff.get('primary_release_metric', 'Cost per Passed Run')}` | Offline statistical proof: `{bool(eff.get('offline_replay_statistical_proof'))}`",
+        f"- Primary release metric: `{eff.get('primary_release_metric', 'Cost per Passed Run')}` | Offline statistical proof: `{bool(eff.get('offline_replay_statistical_proof'))}` | Offline checks: `{bool(eff.get('offline_benchmarks_included'))}` | Live benchmarks: `{bool(eff.get('live_benchmarks_included'))}`",
         *(f"- {lim}" for lim in (eff.get("methodological_limitations") or ())),
     ])
     return _scrub_paths("\n".join(lines).rstrip() + "\n")

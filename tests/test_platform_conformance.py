@@ -19,6 +19,7 @@ from evidence.conformance import (
     run_platform_conformance_suite,
 )
 from evidence.ledger import EVENT_LEDGER_SCHEMA_VERSION
+from evidence.runner import evaluate_campaign_runs
 from hooks import outcomes, state_store
 import policies
 from policies import api as policies_api
@@ -117,7 +118,7 @@ def test_deprecation_policy_contract_invariants() -> None:
     assert "synthetic_rollback" not in second["rollback_paths"]
 
 
-def test_capability_limitation_matrix_covers_all_four_harnesses_honestly() -> None:
+def test_capability_limitation_matrix_covers_all_four_harnesses_honestly(tmp_path: Path) -> None:
     static_matrix = build_capability_limitation_matrix(include_live_effectiveness=False)
     assert static_matrix["schema_version"] == 1
     assert static_matrix["policy_api_version"] == 1
@@ -156,7 +157,9 @@ def test_capability_limitation_matrix_covers_all_four_harnesses_honestly() -> No
     )
 
     eff_static = static_matrix["effectiveness_summary"]
+    assert eff_static["offline_benchmarks_included"] is False
     assert eff_static["live_benchmarks_included"] is False
+    assert eff_static["live_campaign_status"] == "not_included"
     assert eff_static["primary_release_metric"] == "Cost per Passed Run"
     assert eff_static["offline_replay_statistical_proof"] is False
     assert eff_static["failed_attempts_excluded"] is False
@@ -164,10 +167,48 @@ def test_capability_limitation_matrix_covers_all_four_harnesses_honestly() -> No
 
     live_matrix = build_capability_limitation_matrix(include_live_effectiveness=True)
     eff_live = live_matrix["effectiveness_summary"]
-    assert eff_live["live_benchmarks_included"] is True
+    assert eff_live["offline_benchmarks_included"] is True
+    assert eff_live["live_benchmarks_included"] is False
+    assert eff_live["live_campaign_status"] == "not_included"
     assert eff_live["deterministic_replay"]["ok"] is True
     assert eff_live["latency_benchmark"]["ok"] is True
     assert eff_live["offline_evidence_replay"]["ok"] is True
+
+    offline_matrix = build_capability_limitation_matrix(include_offline_benchmarks=True)
+    assert offline_matrix["effectiveness_summary"]["offline_benchmarks_included"] is True
+    assert offline_matrix["effectiveness_summary"]["live_benchmarks_included"] is False
+
+    spoofed = build_capability_limitation_matrix(
+        include_offline_benchmarks=False,
+        live_campaign_artifact={"schema_version": 1, "tier": "offline_replay", "gate_verdict": {"ok": True}},
+    )
+    assert spoofed["effectiveness_summary"]["live_benchmarks_included"] is False
+
+    cg_ver = str(json.loads((Path(__file__).resolve().parent.parent / "plugin.json").read_text(encoding="utf-8"))["version"])
+    rel_runs: list[dict[str, Any]] = []
+    for idx in range(1, 13):
+        tid = f"task_{idx:02d}"
+        for arm in ("baseline", "context_guard", "context_guard_rtk"):
+            for rep in (0, 1):
+                ws = tmp_path / "live_ws" / arm / tid / f"r{rep}"
+                ws.mkdir(parents=True)
+                rel_runs.append({
+                    "run_id": f"{arm}_{tid}_r{rep}", "task_id": tid, "pass_criterion_id": f"c_{idx:02d}",
+                    "arm": arm, "repeat_idx": rep, "harness_id": "claude", "harness_build_id": "2.1.300",
+                    "model_id": "claude-sonnet-4-6", "context_guard_version": cg_ver, "workspace_id": f"ws_{arm}_{tid}_{rep}",
+                    "isolated_workspace": str(ws), "budget": {"max_turns": 20, "timeout_s": 300.0, "max_cost_usd": 2.0},
+                    "outcome_class": "passed", "passed": True, "turns": 3, "latency_ms": 800.0,
+                    "cost_usd": 0.08 if arm == "baseline" else 0.04, "fresh_input_tokens": 1000, "output_tokens": 200,
+                    "cache_read_tokens": 4000, "cache_write_tokens": 400, "ttl_cache_misses": 0, "reliability_failures": 0,
+                })
+    verified_rel = evaluate_campaign_runs(
+        rel_runs, campaign_id="verified_rel_01", tier="release_evaluation", harness_id="claude",
+        harness_build_id="2.1.300", model_id="claude-sonnet-4-6", bootstrap_iters=200,
+    )
+    verified_matrix = build_capability_limitation_matrix(include_offline_benchmarks=False, live_campaign_artifact=verified_rel)
+    assert verified_matrix["effectiveness_summary"]["offline_benchmarks_included"] is False
+    assert verified_matrix["effectiveness_summary"]["live_benchmarks_included"] is True
+    assert verified_matrix["effectiveness_summary"]["live_campaign_status"] == "verified_live_campaign"
 
 
 def test_adapter_conformance_suite_passes_all_harnesses() -> None:
@@ -191,6 +232,9 @@ def test_adapter_conformance_suite_passes_all_harnesses() -> None:
         assert required_checks.issubset(set(checks))
         assert all(bool(v) for v in checks.values())
     assert res["cursor"]["cache_attribution_status"] == "excluded_missing_telemetry"
+    assert res["cursor"]["verification_scope"] == "adapter_contract_only"
+    assert res["cursor"]["adapter_conformance_passed"] is True
+    assert res["cursor"]["runtime_verified"] is False
     assert res["cursor"]["checks"]["cursor_cli_conformance"] is True
 
 
@@ -284,6 +328,12 @@ def test_platform_conformance_suite_all_ten_gates_and_markdown(tmp_path: Path) -
     }
     assert set(report["gates"]) == expected_gates
     assert all(report["gates"][g] is True for g in expected_gates)
+
+    assert report["adapter_conformance"]["cursor"]["verification_scope"] == "adapter_contract_only"
+    assert report["adapter_conformance"]["cursor"]["runtime_verified"] is False
+    eff_report = report["platform_matrix"]["effectiveness_summary"]
+    assert eff_report["offline_benchmarks_included"] is True
+    assert eff_report["live_benchmarks_included"] is False
 
     md_conf = render_conformance_markdown(report)
     md_matrix = render_platform_matrix_markdown(report["platform_matrix"])

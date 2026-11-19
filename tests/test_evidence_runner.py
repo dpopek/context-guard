@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 from pathlib import Path
@@ -280,26 +281,28 @@ def test_execute_isolated_campaign_allocates_distinct_workspaces_per_run(tmp_pat
     assert report["paired_comparisons"][0]["unconditional"]["cost_per_passed_run_delta_usd"] == pytest.approx(-0.04)
 
 
-def test_evaluate_campaign_runs_cursor_gate_and_release_statistical_proof(tmp_path: Path) -> None:
+def _build_campaign_runs(
+    tmp_root: Path, tasks: int, arms: tuple[str, ...], repeats: int, *, harness_id: str = "claude"
+) -> list[dict[str, Any]]:
     runs: list[dict[str, Any]] = []
-    for idx in range(1, 5):
+    is_cu = harness_id == "cursor"
+    for idx, arm, rep in itertools.product(range(1, tasks + 1), arms, range(repeats)):
         tid = f"task_{idx:02d}"
-        for arm in ("baseline", "context_guard"):
-            ws_dir = tmp_path / "cu_ws" / arm / tid
-            ws_dir.mkdir(parents=True)
-            runs.append(
-                _clean_run_record(
-                    run_id=f"cu_{arm}_{tid}",
-                    task_id=tid,
-                    arm=arm,
-                    workspace_path=ws_dir,
-                    pass_criterion_id=f"criterion_{idx:02d}",
-                    harness_id="cursor",
-                    harness_build_id="1.2.3",
-                    cost_usd=0.05 if arm == "context_guard" else 0.09,
-                    cache_missing=True,
-                )
-            )
+        ws = tmp_root / f"{harness_id}_{arm}_{tid}_r{rep}"
+        ws.mkdir(parents=True, exist_ok=True)
+        runs.append(_clean_run_record(
+            run_id=f"{harness_id}_{arm}_{tid}_r{rep}", task_id=tid, arm=arm, workspace_path=ws,
+            pass_criterion_id=f"criterion_{idx:02d}", repeat_idx=rep, harness_id=harness_id,
+            harness_build_id="1.2.3" if is_cu else "2.1.300",
+            cost_usd=0.08 if arm == "baseline" else 0.04, cache_missing=is_cu,
+        ))
+    return runs
+
+
+def test_evaluate_campaign_runs_cursor_gate_and_release_statistical_proof(tmp_path: Path) -> None:
+    runs = _build_campaign_runs(
+        tmp_path / "cu_ws", 12, ("baseline", "context_guard", "context_guard_rtk"), 2, harness_id="cursor"
+    )
     rel_cursor = evaluate_campaign_runs(
         runs,
         campaign_id="cursor_rel_01",
@@ -312,9 +315,17 @@ def test_evaluate_campaign_runs_cursor_gate_and_release_statistical_proof(tmp_pa
     )
     assert rel_cursor["statistical_proof"] is True
     assert rel_cursor["gate_verdict"]["ok"] is True
+    assert rel_cursor["gate_verdict"]["plan_completeness"]["ok"] is True
+    assert rel_cursor["gate_verdict"]["plan_completeness"]["uncertainty_proof_ok"] is True
+    assert rel_cursor["gate_verdict"]["plan_completeness"]["observed_runs"] == 72
+    assert rel_cursor["uncertainty_bounds"]["uncertainty_proof_ok"] is True
     assert rel_cursor["gate_verdict"]["cursor_conformance"]["admitted"] is True
-    assert rel_cursor["paired_comparisons"][0]["comparisons_blocked"] is False
-    assert rel_cursor["paired_comparisons"][0]["cache_comparison_status"] == "excluded_missing_telemetry"
+    assert rel_cursor["gate_verdict"]["cursor_conformance"]["verification_scope"] == "adapter_contract_only"
+    assert len(rel_cursor["paired_comparisons"]) == 2
+    assert all(
+        c["comparisons_blocked"] is False and c["cache_comparison_status"] == "excluded_missing_telemetry"
+        for c in rel_cursor["paired_comparisons"]
+    )
 
 
 def test_cg_eval_cli_offline_pilot_plan_and_runs_file_exit_codes(
@@ -349,9 +360,8 @@ def test_cg_eval_cli_offline_pilot_plan_and_runs_file_exit_codes(
     assert cg_eval.main(["--pilot", "--runs-file", str(bad_json)]) == 2
     assert "failed to parse runs file" in capsys.readouterr().err
 
-    ws1, ws2 = tmp_path / "r_ws_1", tmp_path / "r_ws_2"
+    ws1 = tmp_path / "r_ws_1"
     ws1.mkdir()
-    ws2.mkdir()
     good_runs_path = tmp_path / "valid_runs.json"
     good_runs_path.write_text(
         json.dumps({
@@ -359,17 +369,33 @@ def test_cg_eval_cli_offline_pilot_plan_and_runs_file_exit_codes(
             "harness_id": "claude",
             "harness_build_id": "2.1.300",
             "model_id": "claude-sonnet-4-6",
-            "runs": [
-                _clean_run_record(run_id="r1", task_id="task_01", arm="baseline", workspace_path=ws1, cost_usd=0.08),
-                _clean_run_record(run_id="r2", task_id="task_01", arm="context_guard", workspace_path=ws2, cost_usd=0.04),
-            ],
+            "runs": _build_campaign_runs(tmp_path / "pilot_36", 6, ("baseline", "context_guard"), 3),
         }),
         encoding="utf-8",
     )
     assert cg.main(["eval", "--pilot", "--runs-file", str(good_runs_path), "--json"]) == 0
     evaluated = json.loads(capsys.readouterr().out)
     assert evaluated["gate_verdict"]["ok"] is True
+    assert evaluated["statistical_proof"] is False
     assert evaluated["arm_summaries"]["context_guard"]["cost_per_passed_run"] == pytest.approx(0.04)
+
+    custom_pilot_path = tmp_path / "custom_pilot.json"
+    custom_pilot_path.write_text(
+        json.dumps({
+            "campaign_id": "cli_custom_pilot",
+            "harness_id": "claude",
+            "harness_build_id": "2.1.300",
+            "model_id": "claude-sonnet-4-6",
+            "plan": {"arms": ["baseline", "context_guard"], "tasks": 2, "repeats": 2},
+            "runs": _build_campaign_runs(tmp_path / "pilot_8", 2, ("baseline", "context_guard"), 2),
+        }),
+        encoding="utf-8",
+    )
+    assert cg_eval.main(["--pilot", "--runs-file", str(custom_pilot_path), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["gate_verdict"]["ok"] is True
+    assert cg_eval.main(["--release", "--runs-file", str(custom_pilot_path), "--json"]) == 1
+    rel_rejected = json.loads(capsys.readouterr().out)
+    assert rel_rejected["gate_verdict"]["ok"] is False and rel_rejected["statistical_proof"] is False
 
     drift_runs_path = tmp_path / "drift_runs.json"
     drift_runs_path.write_text(
@@ -639,3 +665,66 @@ def test_unified_cg_cli_dispatches_explain_and_export_subcommands(
     otel_doc = json.loads(otel_file.read_text(encoding="utf-8"))
     assert otel_doc["ok"] is True and otel_doc["exported_events"] == 1 and otel_doc["privacy_scrubbed"] is True
     assert len(otel_doc["resourceSpans"]) == 1
+
+
+def test_evaluate_campaign_runs_rejects_incomplete_or_unbounded_campaigns(tmp_path: Path) -> None:
+    def _eval(runs: list[dict[str, Any]], tier: str, cid: str) -> EvidenceContractV1:
+        return evaluate_campaign_runs(
+            runs, campaign_id=cid, tier=tier, harness_id="claude",
+            harness_build_id="2.1.300", model_id="claude-sonnet-4-6", bootstrap_iters=200,
+        )
+
+    one_base = _eval(_build_campaign_runs(tmp_path / "c1", 1, ("baseline",), 1), "small_live_pilot", "one_base")
+    assert one_base["gate_verdict"]["ok"] is False and one_base["statistical_proof"] is False
+    assert one_base["arm_summaries"]["baseline"]["cost_per_passed_run"] == pytest.approx(0.08)
+    assert one_base["arm_summaries"]["context_guard"]["raw_runs"] == 0
+    assert one_base["gate_verdict"]["plan_completeness"]["missing_arms"] == ["context_guard"]
+
+    two_rel = _eval(_build_campaign_runs(tmp_path / "c2", 1, ("baseline", "context_guard"), 1), "release_evaluation", "two_rel")
+    assert two_rel["gate_verdict"]["ok"] is False and two_rel["statistical_proof"] is False
+    assert len(two_rel["paired_comparisons"]) == 1
+    assert two_rel["gate_verdict"]["plan_completeness"]["missing_arms"] == ["context_guard_rtk"]
+
+    eight_rel = _eval(_build_campaign_runs(tmp_path / "c8", 4, ("baseline", "context_guard"), 1), "release_evaluation", "eight_rel")
+    assert eight_rel["gate_verdict"]["ok"] is False and eight_rel["statistical_proof"] is False
+    assert eight_rel["gate_verdict"]["plan_completeness"]["observed_tasks"] == 4
+    assert eight_rel["gate_verdict"]["plan_completeness"]["missing_cells_count"] == 64
+
+    rel_arms = ("baseline", "context_guard", "context_guard_rtk")
+    full_dup = _build_campaign_runs(tmp_path / "c_dup", 12, rel_arms, 2)
+    ws_dup = tmp_path / "ws_dup_extra"
+    ws_dup.mkdir()
+    dup_replace = {**full_dup[0], "run_id": "dup_cell", "workspace_id": "ws_dup_extra", "isolated_workspace": str(ws_dup)}
+    dup_res = _eval([dup_replace if (r["arm"] == "baseline" and r["task_id"] == "task_01" and r["repeat_idx"] == 1) else r for r in full_dup], "release_evaluation", "dup_rel")
+    assert dup_res["gate_verdict"]["ok"] is False and dup_res["statistical_proof"] is False
+    assert len(dup_res["gate_verdict"]["plan_completeness"]["duplicate_cells"]) == 1
+    assert dup_res["gate_verdict"]["plan_completeness"]["missing_cells_count"] == 1
+
+    missing_cell_res = _eval(_build_campaign_runs(tmp_path / "c_miss", 12, rel_arms, 2)[:-1], "release_evaluation", "miss_cell")
+    assert missing_cell_res["gate_verdict"]["ok"] is False and missing_cell_res["statistical_proof"] is False
+    assert missing_cell_res["gate_verdict"]["plan_completeness"]["missing_cells_count"] == 1
+    assert len(missing_cell_res["paired_comparisons"]) == 2
+
+    zero_pass_runs = _build_campaign_runs(tmp_path / "c_unb0", 12, rel_arms, 2)
+    for r in zero_pass_runs:
+        if r["arm"] == "context_guard_rtk":
+            r["passed"], r["outcome_class"] = False, "failed_attempt"
+    zero_pass_res = _eval(zero_pass_runs, "release_evaluation", "zero_pass")
+    assert zero_pass_res["gate_verdict"]["ok"] is False and zero_pass_res["statistical_proof"] is False
+    assert zero_pass_res["arm_summaries"]["context_guard_rtk"]["cost_per_passed_run_ci_95"]["unbounded_high"] is True
+
+    part_fail_runs = _build_campaign_runs(tmp_path / "c_unbp", 12, rel_arms, 2)
+    for r in part_fail_runs:
+        if r["arm"] == "context_guard" and int(str(r["task_id"]).split("_")[1]) <= 11:
+            r["passed"], r["outcome_class"] = False, "failed_attempt"
+    part_fail_res = _eval(part_fail_runs, "release_evaluation", "part_fail")
+    assert part_fail_res["statistical_proof"] is False
+    assert part_fail_res["uncertainty_bounds"]["uncertainty_proof_ok"] is False
+    assert part_fail_res["arm_summaries"]["context_guard"]["cost_per_passed_run_ci_95"]["unbounded_high"] is True
+
+    rel_fail_runs = _build_campaign_runs(tmp_path / "c_relf", 12, rel_arms, 2)
+    rel_fail_runs[1]["reliability_failures"] = 1
+    rel_fail_res = _eval(rel_fail_runs, "release_evaluation", "rel_fail")
+    assert rel_fail_res["statistical_proof"] is False
+    assert rel_fail_res["uncertainty_bounds"]["uncertainty_proof_ok"] is False
+    assert rel_fail_res["arm_summaries"][rel_fail_runs[1]["arm"]]["reliability_failures"] == 1

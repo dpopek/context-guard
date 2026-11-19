@@ -26,6 +26,7 @@ from spool.receipts import (
     same_workspace_dir,
     summarize_receipts,
 )
+from spool.spans import grep_lines_with_spans
 
 SPOOL_ID_RE = re.compile(r"^sp_[0-9a-f]{12}$")
 _SCHEMA_VERSION = 2
@@ -171,7 +172,7 @@ def is_verbose_override_command(cmd_line: str) -> tuple[bool, str]:
 _INDEX_KEYS = (
     "spool_id", "filename", "workspace_id", "canon_root", "session_id", "call_id", "harness", "tool_name",
     "cmd_sig", "total_lines", "total_bytes", "summary_bytes", "saved_bytes", "content_sha256",
-    "created_at", "last_accessed_at", "state", "corrupt_reason", "corrupted_at",
+    "source_sha256", "source_bytes", "created_at", "last_accessed_at", "state", "corrupt_reason", "corrupted_at",
     "blob_dev", "blob_ino", "blob_mtime_ns",
 )
 
@@ -240,25 +241,25 @@ def _eval_followup(
     lim: int | None = None,
     default_lim: int | None = None,
 ) -> dict[str, Any] | None:
-    entries, tombstones, idx_valid = _ro_index_state(eff_dir)
+    entries, _tombstones, idx_valid = _ro_index_state(eff_dir)
     ent = entries.get(sid)
-    if ent is not None:
-        if ent.get("state") == "preparing" or entry_scope_error(ent, mode, ws_id, sess_id, caller_canon_root=canon_root) is not None:
+    total: int | None = None
+    if idx_valid:
+        if ent is None or ent.get("state") != "available" or entry_scope_error(ent, mode, ws_id, sess_id, caller_canon_root=canon_root) is not None:
             return None
-    elif (tomb := tombstones.get(sid)) is not None:
-        if entry_scope_error(tomb, mode, ws_id, sess_id, caller_canon_root=canon_root) is not None:
+        if isinstance(ent.get("total_lines"), int) and not isinstance(ent.get("total_lines"), bool) and ent["total_lines"] > 0:
+            total = int(ent["total_lines"])
+    else:
+        rb, r_err = read_blob_bytes(eff_dir / f"{sid}.txt")
+        if r_err is not None or rb is None:
+            return None
+        try:
+            total = len(split_lines(rb.decode("utf-8", errors="strict")))
+        except UnicodeDecodeError:
             return None
     req_lines = max(1, e_l - s_l + 1) if (e_l is not None and e_l >= s_l) else (max(1, lim) if (lim is not None and lim >= 1) else default_lim)
     full = kind == "direct_read" and req_lines is None
     if not full and kind != "grep" and req_lines is not None and req_lines > 200:
-        total: int | None = None
-        if ent and isinstance(ent.get("total_lines"), int) and not isinstance(ent.get("total_lines"), bool) and ent["total_lines"] > 0:
-            total = int(ent["total_lines"])
-        elif not idx_valid and (rb := read_blob_bytes(eff_dir / f"{sid}.txt")[0]) is not None:
-            try:
-                total = len(split_lines(rb.decode("utf-8")))
-            except UnicodeDecodeError:
-                return None
         full = total is not None and total > 0 and min(req_lines, max(0, total - max(1, s_l) + 1)) > max(200, 0.8 * total)
     return {
         "spool_id": sid,
@@ -373,15 +374,22 @@ def validate_and_normalize_spool_text(raw_text: Any, eff_max_bytes: int) -> tupl
     if eff_max_bytes < 1 or not isinstance(raw_text, (str, bytes)):
         return None
     if isinstance(raw_text, bytes):
-        if len(raw_text) > eff_max_bytes * 2:
+        if len(raw_text) > eff_max_bytes:
             return None
         try:
             raw_str = raw_text.decode("utf-8", errors="strict")
         except UnicodeDecodeError:
             return None
     else:
+        if len(raw_text) > eff_max_bytes:
+            return None
+        try:
+            if len(raw_text.encode("utf-8", errors="strict")) > eff_max_bytes:
+                return None
+        except UnicodeEncodeError:
+            return None
         raw_str = raw_text
-    if len(raw_str) > eff_max_bytes * 2 or "\x00" in raw_str:
+    if "\x00" in raw_str:
         return None
     norm = raw_str.replace("\r\n", "\n").replace("\r", "\n")
     try:
@@ -536,19 +544,8 @@ def grep_verified_lines(
     lines: list[str], rx: re.Pattern[str], max_matches: int, context_lines: int,
 ) -> tuple[list[dict[str, Any]], bool, tuple[int, int], tuple[int, int]]:
     """Run bounded regex search on lines and return `(matches, truncated, line_span, byte_span)`."""
-    eff_max, eff_ctx = max(1, min(200, int(max_matches))), max(0, min(10, int(context_lines)))
-    truncated, min_0, max_0 = False, len(lines), 0
-    matches: list[dict[str, Any]] = []
-    for idx, line_text in enumerate(lines):
-        if rx.search(line_text):
-            if (truncated := len(matches) >= eff_max):
-                break
-            b_start, a_end = max(0, idx - eff_ctx), min(len(lines), idx + 1 + eff_ctx)
-            min_0, max_0 = min(min_0, b_start), max(max_0, a_end)
-            matches.append({"line": idx + 1, "text": line_text, "before": lines[b_start:idx] if eff_ctx else [], "after": lines[idx + 1 : a_end] if eff_ctx else []})
-    lspan = (0, 0) if not matches else (min_0, max_0)
-    bspan = (0, 0) if not matches else (byte_offset_for_line(lines, min_0), byte_offset_for_line(lines, max_0 - 1) + len(lines[max_0 - 1].encode("utf-8")))
-    return matches, truncated, lspan, bspan
+    matches, truncated, metrics = grep_lines_with_spans(lines, rx, max_matches, context_lines)
+    return matches, truncated, metrics["line_span"], metrics["byte_span"]
 
 
 _SELF_MCP_LEAVES = frozenset({"cg_spool_slice", "cg_spool_grep", "cg_spool_list"})

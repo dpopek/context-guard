@@ -13,6 +13,10 @@ from core.platform_io import (
     LOCK_EX, LOCK_UN, coerce_float, coerce_int, flock, now_iso,
     read_json_object_or_quarantine, resolve_plugin_root, warn, write_json_atomic,
 )
+from spool.spans import (
+    can_reuse_outcome_window, mark_spool_followup_request_in_state, pop_spool_followup_in_state,
+    resolve_spool_window_in_state, should_close_outcome_window,
+)
 
 SCHEMA_VERSION, STEP_LEDGER_MAX_ENTRIES, ARCHIVED_STEP_KEYS_MAX = 4, 128, 512
 RECOVERY_KEYS = ("none", "targeted", "full", "pending_or_unknown")
@@ -339,7 +343,7 @@ def open_outcome_window(
             wk for wk, w in open_wins.items()
             if isinstance(w, dict)
             and (w.get("session_id"), w.get("target_path"), w.get("kind")) == (session_id, target_path, kind)
-            and (kind != "range_trim" or (int(w.get("step_idx", -1)) == int(step_idx) and (w.get("meta") or {}) == cm))
+            and can_reuse_outcome_window(w, kind, step_idx, cm)
         ), "")
         if not win_key:
             win_key = base_key
@@ -365,10 +369,7 @@ def close_outcome_windows(
     """Close expired, compacted, rewound, or ended windows into none/none/observed."""
     _reconcile_windows(
         session_id,
-        lambda _wp, _k, w: WindowAction("resolve", ("none", "none", "observed")) if (
-            force_all or (current_step is not None and current_step >= int(w.get("expires_step", 0)))
-            or (rewind_step is not None and int(w.get("step_idx", 0)) >= rewind_step)
-        ) else WindowAction("keep"),
+        lambda _wp, _k, w: WindowAction("resolve", ("none", "none", "observed")) if should_close_outcome_window(w, current_step, force_all, rewind_step) else WindowAction("keep"),
         ledger_path=ledger_path,
     )
 
@@ -387,17 +388,32 @@ def consume_outcome_windows(
         )
 
 
-def record_spool_followup(
-    session_id: str, spool_id: str, recovery: str, regret: str, step_idx: int, *,
-    evidence: str = "observed", ledger_path: Path | None = None,
-) -> bool:
-    """Resolve an open output_spool window by spool_id with observed recovery/regret."""
-    return bool(spool_id) and _reconcile_windows(
-        session_id,
-        lambda wp, k, _w: WindowAction("resolve", (recovery, regret, evidence))
-        if k == "output_spool" and wp == f"spool:{spool_id}" else WindowAction("keep"),
-        ledger_path=ledger_path, step_idx=step_idx,
+def _mutate_outcomes_if_exists(ledger_path: Path | None, fn: Callable[[dict[str, Any], str], bool]) -> bool:
+    return (ledger_path or DEFAULT_OUTCOMES_PATH).is_file() and record_direct_outcome("", "", "", ledger_path=ledger_path, count=0, _mut=fn)
+
+def record_spool_followup(session_id: str, spool_id: str, recovery: str, regret: str, step_idx: int, *, evidence: str = "observed", ledger_path: Path | None = None) -> bool:
+    """Resolve at most one open output_spool window by spool_id with observed recovery/regret."""
+    def _mut(st: dict[str, Any], _k: str) -> bool:
+        if (key := pop_spool_followup_in_state(st["open_windows"], session_id, spool_id, step_idx)) is None:
+            return False
+        _apply_row_outcome(st, key, "", False, 1, recovery, regret, evidence)
+        return True
+    return bool(spool_id) and _mutate_outcomes_if_exists(ledger_path, _mut)
+
+def record_spool_followup_request(session_id: str, spool_id: str, req: Mapping[str, Any], *, ledger_path: Path | None = None) -> bool:
+    """Record pending PreToolUse follow-up metadata on one open output_spool window without closing it."""
+    return bool(spool_id and isinstance(req, Mapping)) and _mutate_outcomes_if_exists(
+        ledger_path, lambda st, _k: mark_spool_followup_request_in_state(st["open_windows"], session_id, spool_id, req)
     )
+
+def resolve_spool_followup_result(session_id: str, call_id: str, succeeded: bool, *, spool_id: str = "", ledger_path: Path | None = None) -> bool:
+    """Resolve one pending output_spool follow-up on PostToolUse success, or clear pending state on failure."""
+    def _mut(st: dict[str, Any], _k: str) -> bool:
+        if (res := resolve_spool_window_in_state(st["open_windows"], session_id, call_id, succeeded, spool_id)) is None:
+            return False
+        if res[0]: _apply_row_outcome(st, res[0], "", False, 1, res[1], res[2], "observed")
+        return True
+    return bool(call_id or spool_id) and _mutate_outcomes_if_exists(ledger_path, _mut)
 
 
 def record_spool_command_repeat(

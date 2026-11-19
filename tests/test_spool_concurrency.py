@@ -23,6 +23,7 @@ from spool.receipts import (
     RECEIPTS_MAX_BYTES,
     append_receipt,
     build_receipt,
+    load_receipt_rows,
     summarize_spool_lifecycle,
 )
 from spool.store import (
@@ -497,16 +498,30 @@ def test_post_tool_use_turn_correlation_and_hook_duration_telemetry(
         state_dir=str(sd2),
     )
 
-    # 3b. transcript_derived via payload transcript_path
+    # 3b. Missing payload transcript_path must fall back to unobserved
     handle_post_tool_use(
         "claude",
         {
             "hook_event_name": "PostToolUse", "session_id": "s-tc", "tool_use_id": "c-tc-3b",
-            "transcript_path": str(tmp_path / "tr.jsonl"),
+            "transcript_path": str(tmp_path / "missing_tr.jsonl"),
             "tool_name": "Bash", "tool_input": {"command": "pytest"},
             "tool_response": _lines_text(220, prefix="tc3b"), "cwd": str(repo),
         },
         state_dir=str(tmp_path / "sd3b"),
+    )
+
+    # 3c. Existing regular JSONL transcript_path yields transcript_derived
+    tr_real = tmp_path / "tr_real.jsonl"
+    tr_real.write_text(json.dumps({"step_index": 7, "turn_id": "turn-7"}) + "\n", encoding="utf-8")
+    handle_post_tool_use(
+        "claude",
+        {
+            "hook_event_name": "PostToolUse", "session_id": "s-tc", "tool_use_id": "c-tc-3c",
+            "transcript_path": str(tr_real),
+            "tool_name": "Bash", "tool_input": {"command": "pytest"},
+            "tool_response": _lines_text(220, prefix="tc3c"), "cwd": str(repo),
+        },
+        state_dir=str(tmp_path / "sd3c"),
     )
 
     # 4. unobserved
@@ -524,12 +539,13 @@ def test_post_tool_use_turn_correlation_and_hook_duration_telemetry(
 
     rows = [json.loads(ln) for ln in (spool_dir / RECEIPTS_FILENAME).read_text(encoding="utf-8").splitlines() if ln.strip()]
     by_call = {r["call_id"]: r for r in rows}
-    assert by_call["c-tc-1"]["turn_correlation"] == "harness_native"
-    assert by_call["c-tc-2"]["turn_correlation"] == "harness_native"
-    assert by_call["c-tc-3"]["turn_correlation"] == "transcript_derived"
-    assert by_call["c-tc-3b"]["turn_correlation"] == "transcript_derived"
-    assert by_call["c-tc-4"]["turn_correlation"] == "unobserved"
-    for cid in ("c-tc-1", "c-tc-2", "c-tc-3", "c-tc-3b", "c-tc-4"):
+    assert by_call["c-tc-1"]["turn_correlation"] == "harness_native" and by_call["c-tc-1"]["turn_key"] == "s-tc:step:4"
+    assert by_call["c-tc-2"]["turn_correlation"] == "harness_native" and by_call["c-tc-2"]["turn_key"] == "s-tc:turn:turn-native-9"
+    assert by_call["c-tc-3"]["turn_correlation"] == "transcript_derived" and by_call["c-tc-3"]["turn_key"] == "s-tc:transcript_step:2"
+    assert by_call["c-tc-3b"]["turn_correlation"] == "unobserved" and by_call["c-tc-3b"]["turn_key"] == "s-tc:step:1"
+    assert by_call["c-tc-3c"]["turn_correlation"] == "transcript_derived" and by_call["c-tc-3c"]["turn_key"] == "s-tc:transcript:s7"
+    assert by_call["c-tc-4"]["turn_correlation"] == "unobserved" and by_call["c-tc-4"]["turn_key"] == "s-tc:step:1"
+    for cid in ("c-tc-1", "c-tc-2", "c-tc-3", "c-tc-3b", "c-tc-3c", "c-tc-4"):
         dur = by_call[cid]["hook_duration_ms"]
         assert isinstance(dur, (int, float)) and dur >= 0.0
 
@@ -622,8 +638,12 @@ def test_append_receipt_single_pass_rotation_and_dedup(
     assert append_receipt(fresh_row, receipts_path=rcpt_path) is True
     assert parse_calls == seed_count
     after = [orig_loads(ln) for ln in rcpt_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
-    assert len(after) == RECEIPTS_KEEP_ROWS
-    assert after[-1]["event_id"] == "ev-rot-new"
+    assert after[0]["_meta"] == "receipts_rotation"
+    assert after[0]["dropped_rows"] == 15 and after[0]["retained_rows"] == RECEIPTS_KEEP_ROWS
+    kept = [r for r in after if r.get("_meta") != "receipts_rotation"]
+    assert len(kept) == RECEIPTS_KEEP_ROWS
+    assert len(load_receipt_rows(rcpt_path)) == RECEIPTS_KEEP_ROWS
+    assert kept[-1]["event_id"] == "ev-rot-new"
 
 
 def test_slice_spool_warns_when_index_update_hits_oserror(

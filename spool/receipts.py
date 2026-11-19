@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import errno
 import hashlib
 import json
 import os
@@ -10,7 +11,7 @@ from pathlib import Path
 import re
 import stat
 import time
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence, cast
 import urllib.parse
 import uuid
 
@@ -23,6 +24,14 @@ from core.platform_io import (
     resolve_plugin_root,
 )
 from policies.api import ContextReceiptV1, RECEIPT_SCHEMA_VERSION, VALID_TURN_CORRELATIONS
+from spool.spans import (
+    extract_optional_receipt_fields,
+    filter_lifecycle_events,
+    interval_union_bytes,
+    is_strictly_after_ts,
+    parse_ts_seconds,
+    recovery_byte_spans,
+)
 
 VALID_SPOOL_ISOLATIONS: tuple[str, ...] = ("workspace", "session", "global")
 DEFAULT_MAX_SPOOL_ENTRY_BYTES = 4 * 1024 * 1024
@@ -218,15 +227,6 @@ def derive_spool_event_id(event_type: str, session_id: str, call_id: str, spool_
     return f"ev_{uuid.uuid4().hex[:16]}"
 
 
-def _parse_ts_seconds(timestamp: str | None) -> float | None:
-    if not isinstance(timestamp, str) or not timestamp.strip():
-        return None
-    try:
-        return datetime.fromisoformat(timestamp.strip().replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return None
-
-
 def build_receipt(
     *,
     event_type: str,
@@ -265,7 +265,7 @@ def build_receipt(
     if ts_ms is not None and not isinstance(ts_ms, bool):
         eff_ts_ms = int(ts_ms)
     elif timestamp:
-        parsed_ep = _parse_ts_seconds(eff_ts)
+        parsed_ep = parse_ts_seconds(eff_ts)
         eff_ts_ms = int(round(parsed_ep * 1000)) if parsed_ep is not None else int(now_sec * 1000)
     else:
         eff_ts_ms = int(now_sec * 1000)
@@ -321,6 +321,14 @@ def _receipts_lock(parent_dir: Path) -> Iterator[None]:
         finally:
             flock(fh.fileno(), LOCK_UN)
 
+def enrich_receipt(receipt: ContextReceiptV1, extras: Mapping[str, Any]) -> ContextReceiptV1:
+    """Return a copy of `receipt` enriched with validated additive optional fields."""
+    if not isinstance(extras, Mapping):
+        return receipt
+    opt = extract_optional_receipt_fields(extras)
+    return cast(ContextReceiptV1, {**dict(receipt), **opt}) if opt else receipt
+
+
 def _normalize_receipt_row(r: Mapping[str, Any]) -> ContextReceiptV1 | None:
     sv = r.get("schema_version")
     ls = r.get("line_span")
@@ -342,7 +350,7 @@ def _normalize_receipt_row(r: Mapping[str, Any]) -> ContextReceiptV1 | None:
     if isinstance(raw_ts_ms, int) and not isinstance(raw_ts_ms, bool):
         ts_ms = raw_ts_ms
     else:
-        parsed_ep = _parse_ts_seconds(ts)
+        parsed_ep = parse_ts_seconds(ts)
         ts_ms = int(round(parsed_ep * 1000)) if parsed_ep is not None else 0
     raw_dur = r.get("hook_duration_ms")
     dur = float(raw_dur) if isinstance(raw_dur, (int, float)) and not isinstance(raw_dur, bool) else None
@@ -358,7 +366,7 @@ def _normalize_receipt_row(r: Mapping[str, Any]) -> ContextReceiptV1 | None:
     rb = max(0, raw_rb) if isinstance(raw_rb, int) and not isinstance(raw_rb, bool) else 0
     raw_tc_id = r.get("tool_call_id")
     tc_id = raw_tc_id if isinstance(raw_tc_id, str) else call_id
-    return ContextReceiptV1(
+    base = ContextReceiptV1(
         schema_version=RECEIPT_SCHEMA_VERSION,
         receipt_id=str(r.get("receipt_id") or ""),
         event_id=str(r.get("event_id") or r.get("receipt_id") or ""),
@@ -389,6 +397,8 @@ def _normalize_receipt_row(r: Mapping[str, Any]) -> ContextReceiptV1 | None:
         failure_kind=fk,
         reason=r["reason"] if isinstance(r.get("reason"), str) else None,
     )
+    opt = extract_optional_receipt_fields(r)
+    return cast(ContextReceiptV1, {**dict(base), **opt}) if opt else base
 
 
 def normalize_receipt_row(row: Mapping[str, Any]) -> ContextReceiptV1 | None:
@@ -396,35 +406,85 @@ def normalize_receipt_row(row: Mapping[str, Any]) -> ContextReceiptV1 | None:
     return _normalize_receipt_row(row)
 
 
-def _parse_receipt_bytes(raw_bytes: bytes) -> list[ContextReceiptV1]:
+def _empty_receipt_source(status: str) -> dict[str, Any]:
+    return {
+        "source_status": status, "rows": [], "corrupt_lines": 0,
+        "rotated": False, "dropped_by_rotation": 0, "rotated_at": None, "retained_range": None,
+    }
+
+
+def _retained_range_for(rows: Sequence[ContextReceiptV1]) -> dict[str, Any] | None:
+    dated = [(r["ts_ms"], r["timestamp"]) for r in rows if r["timestamp"]]
+    if not dated:
+        return None
+    dated.sort()
+    return {"start_ts": dated[0][1], "end_ts": dated[-1][1], "retained_rows": len(rows)}
+
+
+def _parse_receipt_source_bytes(raw_bytes: bytes) -> dict[str, Any]:
     try:
         raw_text = raw_bytes.decode("utf-8")
     except UnicodeDecodeError:
-        return []
+        return _empty_receipt_source("utf8_error")
     rows: list[ContextReceiptV1] = []
+    corrupt_lines, rotated, dropped, rotated_at = 0, False, 0, None
     for line in raw_text.splitlines():
         if not line.strip():
             continue
         try:
             parsed = json.loads(line)
         except (ValueError, TypeError):
+            corrupt_lines += 1
             continue
-        if isinstance(parsed, dict) and (row := _normalize_receipt_row(parsed)) is not None:
+        if not isinstance(parsed, dict):
+            corrupt_lines += 1
+            continue
+        if parsed.get("_meta") == "receipts_rotation":
+            rotated = True
+            rd = parsed.get("dropped_rows")
+            if isinstance(rd, int) and not isinstance(rd, bool) and rd >= 0:
+                dropped = max(dropped, int(rd))
+            if isinstance((ra := parsed.get("rotated_at")), str) and ra.strip():
+                rotated_at = ra.strip()
+            continue
+        if (row := _normalize_receipt_row(parsed)) is not None:
             rows.append(row)
-    return rows
+        else:
+            corrupt_lines += 1
+    return {
+        "source_status": "ok", "rows": rows, "corrupt_lines": corrupt_lines,
+        "rotated": rotated, "dropped_by_rotation": dropped, "rotated_at": rotated_at,
+        "retained_range": _retained_range_for(rows),
+    }
 
 
-def _read_receipt_rows(eff_path: Path) -> list[ContextReceiptV1]:
-    if check_unsafe_link(eff_path.parent) or check_unsafe_link(eff_path) or not eff_path.is_file():
-        return []
+def _read_receipt_source(eff_path: Path) -> dict[str, Any]:
+    if check_unsafe_link(eff_path.parent) or check_unsafe_link(eff_path):
+        return _empty_receipt_source("unsafe_link")
+    try:
+        l_st = os.lstat(str(eff_path))
+    except FileNotFoundError:
+        return _empty_receipt_source("missing")
+    except OSError:
+        return _empty_receipt_source("io_error")
+    if not stat.S_ISREG(l_st.st_mode):
+        return _empty_receipt_source("not_regular_file")
     try:
         with os.fdopen(os.open(str(eff_path), os.O_RDONLY | _O_FLAGS), "rb") as fh:
             if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
-                return []
+                return _empty_receipt_source("not_regular_file")
             raw_bytes = fh.read()
-    except OSError:
-        return []
-    return _parse_receipt_bytes(raw_bytes)
+    except FileNotFoundError:
+        return _empty_receipt_source("missing")
+    except OSError as exc:
+        if exc.errno == errno.ELOOP or check_unsafe_link(eff_path):
+            return _empty_receipt_source("unsafe_link")
+        return _empty_receipt_source("io_error")
+    return _parse_receipt_source_bytes(raw_bytes)
+
+
+def _read_receipt_rows(eff_path: Path) -> list[ContextReceiptV1]:
+    return cast(list[ContextReceiptV1], _read_receipt_source(eff_path)["rows"])
 
 
 def append_receipt(receipt: Mapping[str, Any], receipts_path: Path | None = None) -> bool:
@@ -444,7 +504,7 @@ def append_receipt(receipt: Mapping[str, Any], receipts_path: Path | None = None
             if check_unsafe_link(eff):
                 return False
             existing_rows: list[ContextReceiptV1] = []
-            have_parsed = False
+            prev_dropped, have_parsed = 0, False
             try:
                 rfd = os.open(str(eff), os.O_RDONLY | _O_FLAGS)
             except FileNotFoundError:
@@ -456,8 +516,8 @@ def append_receipt(receipt: Mapping[str, Any], receipts_path: Path | None = None
                         return False
                     will_rotate = (st.st_size + len(line_bytes)) > RECEIPTS_MAX_BYTES
                     if eid or will_rotate:
-                        existing_rows = _parse_receipt_bytes(rfh.read())
-                        have_parsed = True
+                        src = _parse_receipt_source_bytes(rfh.read())
+                        existing_rows, prev_dropped, have_parsed = src["rows"], int(src["dropped_by_rotation"]), True
             else:
                 will_rotate = len(line_bytes) > RECEIPTS_MAX_BYTES
 
@@ -465,14 +525,19 @@ def append_receipt(receipt: Mapping[str, Any], receipts_path: Path | None = None
                 return True
 
             if will_rotate:
-                new_row = _normalize_receipt_row(receipt_dict)
-                if new_row is not None:
+                if (new_row := _normalize_receipt_row(receipt_dict)) is not None:
                     existing_rows.append(new_row)
-                rotated = "".join(
-                    json.dumps(dict(r), separators=(",", ":"), sort_keys=True) + "\n"
-                    for r in existing_rows[-RECEIPTS_KEEP_ROWS:]
-                ).encode("utf-8")
-                atomic_write_bytes(eff, rotated)
+                kept = existing_rows[-RECEIPTS_KEEP_ROWS:]
+                rot_meta = {
+                    "_meta": "receipts_rotation",
+                    "schema_version": RECEIPT_SCHEMA_VERSION,
+                    "rotated_at": datetime.fromtimestamp(time.time(), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                    "dropped_rows": prev_dropped + max(0, len(existing_rows) - len(kept)),
+                    "retained_rows": len(kept),
+                }
+                out_lines = [json.dumps(rot_meta, separators=(",", ":"), sort_keys=True)]
+                out_lines.extend(json.dumps(dict(r), separators=(",", ":"), sort_keys=True) for r in kept)
+                atomic_write_bytes(eff, ("\n".join(out_lines) + "\n").encode("utf-8"))
                 return True
 
             with os.fdopen(
@@ -531,22 +596,6 @@ def summarize_receipts(receipts_path: Path | None = None, *, window_seconds: flo
     return {**counts, "last_failure_ts": last_fail, "last_event_ts": last_ev}
 
 
-def _interval_union_bytes(spans: Sequence[tuple[int, int]]) -> int:
-    intervals = sorted((max(0, int(s)), max(0, int(e))) for s, e in spans if int(e) > max(0, int(s)))
-    if not intervals:
-        return 0
-    total = 0
-    cur_s, cur_e = intervals[0]
-    for s, e in intervals[1:]:
-        if s <= cur_e:
-            if e > cur_e:
-                cur_e = e
-        else:
-            total += cur_e - cur_s
-            cur_s, cur_e = s, e
-    return total + (cur_e - cur_s)
-
-
 def _summarize_events(
     events: Sequence[ContextReceiptV1],
     *,
@@ -564,19 +613,19 @@ def _summarize_events(
     rec_turns: int | None
     tc_status: str
     if rec_calls == 0:
-        if completeness == "complete":
-            tc_status, rec_turns = "observed", 0
-        else:
-            tc_status, rec_turns = "unobserved", None
+        tc_status, rec_turns = ("observed", 0) if completeness == "complete" else ("unobserved", None)
     elif len(obs_recoveries) == rec_calls:
-        tc_status = "observed"
-        rec_turns = len({r["turn_key"].strip() for r in recoveries})
+        tc_status, rec_turns = "observed", len({r["turn_key"].strip() for r in recoveries})
     elif not obs_recoveries:
         tc_status, rec_turns = "unobserved", None
     else:
         tc_status, rec_turns = "partial", None
 
-    total_rec_bytes = sum(max(0, int(r["byte_span"][1]) - int(r["byte_span"][0])) for r in recoveries)
+    total_rec_bytes = sum(max(0, int(e) - max(0, int(s))) for r in recoveries for s, e in recovery_byte_spans(r))
+    repeated_ctx = sum(
+        max(0, int(rcb)) for r in recoveries
+        if isinstance((rcb := r.get("recovered_context_bytes")), int) and not isinstance(rcb, bool)
+    )
     if unique_bytes > 0:
         amplification: float | None = round(total_rec_bytes / unique_bytes, 4)
     elif rec_calls == 0 and completeness == "complete":
@@ -585,29 +634,27 @@ def _summarize_events(
         amplification = None
 
     evidences = {r["delivery_evidence"] for r in events}
-    if "delivery_verified" in evidences:
-        del_ev = "delivery_verified"
-    elif "replacement_emitted" in evidences:
-        del_ev = "replacement_emitted"
-    else:
-        del_ev = "unverified"
-
-    rel_failures = sum(
-        1 for r in events if r["event_type"] == "spool_integrity_failure" or r["failure_kind"] == "reliability_failure"
-    )
+    del_ev = "delivery_verified" if "delivery_verified" in evidences else ("replacement_emitted" if "replacement_emitted" in evidences else "unverified")
+    rel_failures = sum(1 for r in events if r["event_type"] == "spool_integrity_failure" or r["failure_kind"] == "reliability_failure")
     return {
-        "completeness": completeness,
-        "recovery_calls": rec_calls,
-        "recovery_model_turns": rec_turns,
-        "turn_correlation_status": tc_status,
-        "unique_recovered_bytes": unique_bytes,
-        "total_recovered_bytes": total_rec_bytes,
-        "recovery_amplification": amplification,
-        "original_bytes": original_bytes,
-        "replacement_bytes": replacement_bytes,
-        "delivery_evidence": del_ev,
-        "reliability_failures": rel_failures,
+        "completeness": completeness, "recovery_calls": rec_calls, "recovery_model_turns": rec_turns,
+        "turn_correlation_status": tc_status, "unique_recovered_bytes": unique_bytes,
+        "total_recovered_bytes": total_rec_bytes, "repeated_context_bytes": repeated_ctx,
+        "recovery_amplification": amplification, "original_bytes": original_bytes,
+        "replacement_bytes": replacement_bytes, "delivery_evidence": del_ev, "reliability_failures": rel_failures,
     }
+
+
+def _spool_completeness(created: ContextReceiptV1 | None, src: Mapping[str, Any], eff_status: str) -> str:
+    if created is None:
+        return "incomplete"
+    if eff_status == "fallback_extra_rows":
+        return "complete"
+    if eff_status != "ok" or int(src["corrupt_lines"]) > 0:
+        return "incomplete"
+    if src["rotated"] and int(src["dropped_by_rotation"]) > 0:
+        return "complete" if is_strictly_after_ts(created, src["rotated_at"]) else "incomplete"
+    return "complete"
 
 
 def summarize_spool_lifecycle(
@@ -620,47 +667,38 @@ def summarize_spool_lifecycle(
 ) -> dict[str, Any]:
     """Compute deduplicated per-spool and aggregate lifecycle metrics from `receipts.jsonl`."""
     eff_now = float(now_ts) if now_ts is not None else time.time()
-    seen_ids: set[str] = set()
-    deduped: list[ContextReceiptV1] = []
-    by_sid_events: dict[str, list[ContextReceiptV1]] = {}
-    source_rows = (*_read_receipt_rows(receipts_path or receipts_path_for()), *(extra_rows or ()))
-    for row in source_rows:
-        if spool_id is not None and row["spool_id"] != spool_id:
-            continue
-        if window_seconds is not None:
-            ep = _parse_ts_seconds(row["timestamp"])
-            if ep is None and row["ts_ms"] > 0:
-                ep = float(row["ts_ms"]) / 1000.0
-            if ep is None or (eff_now - ep) > window_seconds:
-                continue
-        eid = row["event_id"]
-        if eid:
-            if eid in seen_ids:
-                continue
-            seen_ids.add(eid)
-        deduped.append(row)
-        by_sid_events.setdefault(row["spool_id"], []).append(row)
+    src = _read_receipt_source(receipts_path or receipts_path_for())
+    eff_status = str(src["source_status"])
+    corrupt_lines, rotated, dropped = int(src["corrupt_lines"]), bool(src["rotated"]), int(src["dropped_by_rotation"])
+    deduped, by_sid_events = filter_lifecycle_events((*src["rows"], *(extra_rows or ())), spool_id, window_seconds, eff_now)
+    missing_like = eff_status == "missing" or (eff_status == "ok" and not src["rows"] and corrupt_lines == 0 and not rotated)
+    if missing_like and extra_rows and deduped:
+        eff_status = "fallback_extra_rows"
+    diag = {
+        "source_status": eff_status, "corrupt_lines": corrupt_lines,
+        "rotated": rotated, "dropped_by_rotation": dropped, "retained_range": src["retained_range"],
+    }
+    if not by_sid_events:
+        empty_comp = "unavailable" if (eff_status != "ok" or (corrupt_lines == 0 and not rotated)) else "incomplete"
+        return {**_summarize_events([], completeness=empty_comp, unique_bytes=0, original_bytes=None, replacement_bytes=None), "by_spool": {}, **diag}
 
     by_spool: dict[str, dict[str, Any]] = {}
     for sid, ev_list in by_sid_events.items():
         created = next((r for r in reversed(ev_list) if r["event_type"] == "spool_created"), None)
-        comp = "complete" if created is not None else "incomplete"
+        comp = _spool_completeness(created, src, eff_status)
         orig_b = (created["original_bytes"] if created["original_bytes"] > 0 else max(0, created["byte_span"][1])) if created is not None else None
         repl_b = (created["replacement_bytes"] if created["replacement_bytes"] > 0 else None) if created is not None else None
-        uniq_b = _interval_union_bytes([r["byte_span"] for r in ev_list if r["event_type"] == "spool_recovery"])
-        by_spool[sid] = _summarize_events(
-            ev_list, completeness=comp, unique_bytes=uniq_b, original_bytes=orig_b, replacement_bytes=repl_b
-        )
+        uniq_b = interval_union_bytes([sp for r in ev_list if r["event_type"] == "spool_recovery" for sp in recovery_byte_spans(r)])
+        by_spool[sid] = _summarize_events(ev_list, completeness=comp, unique_bytes=uniq_b, original_bytes=orig_b, replacement_bytes=repl_b)
 
-    agg_comp = "complete" if all(m["completeness"] == "complete" for m in by_spool.values()) else "incomplete"
+    agg_ok = (eff_status in ("ok", "fallback_extra_rows")) and corrupt_lines == 0 and not (rotated and dropped > 0)
+    agg_comp = "complete" if (agg_ok and all(m["completeness"] == "complete" for m in by_spool.values())) else "incomplete"
     agg_uniq = sum(int(m["unique_recovered_bytes"]) for m in by_spool.values())
     agg_orig = sum(int(m["original_bytes"]) for m in by_spool.values() if m["original_bytes"] is not None) if agg_comp == "complete" else None
     known_repl = [int(m["replacement_bytes"]) for m in by_spool.values() if m["replacement_bytes"] is not None]
     agg_repl = sum(known_repl) if (agg_comp == "complete" and known_repl) else None
-    agg = _summarize_events(
-        deduped, completeness=agg_comp, unique_bytes=agg_uniq, original_bytes=agg_orig, replacement_bytes=agg_repl
-    )
-    return {**agg, "by_spool": by_spool}
+    agg = _summarize_events(deduped, completeness=agg_comp, unique_bytes=agg_uniq, original_bytes=agg_orig, replacement_bytes=agg_repl)
+    return {**agg, "by_spool": by_spool, **diag}
 
 def _extract_batch_response_text(resp: Any) -> str:
     if isinstance(resp, str):

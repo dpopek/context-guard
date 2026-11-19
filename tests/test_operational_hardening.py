@@ -370,9 +370,13 @@ def test_hardening_retention_boundaries_ttl_entries_bytes_tombstones_and_receipt
         delivery_evidence="unverified", spool_id_referenced=True, event_id=f"ev_{299:016x}", reason=pad,
     )
     assert spool_receipts.append_receipt(last_rcpt, receipts_path=rcpt_path) is True
-    kept_lines = [ln for ln in rcpt_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
-    assert len(kept_lines) == spool_receipts.RECEIPTS_KEEP_ROWS
-    kept_ids = [json.loads(ln)["event_id"] for ln in kept_lines]
+    kept_objs = [json.loads(ln) for ln in rcpt_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert kept_objs[0]["_meta"] == "receipts_rotation"
+    assert kept_objs[0]["dropped_rows"] == 44 and kept_objs[0]["retained_rows"] == spool_receipts.RECEIPTS_KEEP_ROWS
+    kept_rows = [obj for obj in kept_objs if obj.get("_meta") != "receipts_rotation"]
+    assert len(kept_rows) == spool_receipts.RECEIPTS_KEEP_ROWS
+    assert len(spool_receipts.load_receipt_rows(rcpt_path)) == spool_receipts.RECEIPTS_KEEP_ROWS
+    kept_ids = [obj["event_id"] for obj in kept_rows]
     assert f"ev_{299:016x}" in kept_ids and f"ev_{0:016x}" not in kept_ids
     assert _find_leaked_temps(rcpt_dir) == []
 
