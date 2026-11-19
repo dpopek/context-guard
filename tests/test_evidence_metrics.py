@@ -11,7 +11,9 @@ from evidence.metrics import (
     EXTERNAL_NOISE_REASONS,
     compute_arm_summary,
     compute_paired_comparison,
+    is_verified_live_campaign_artifact,
     plan_evaluation_matrix,
+    validate_campaign_plan_completeness,
     validate_run_record,
     wilson_interval_95,
 )
@@ -255,6 +257,7 @@ def test_plan_evaluation_matrix_pilot_and_release_budget_scaling() -> None:
     assert capped["total_runs"] == 180
     assert capped["budget_capped"] is True
     assert capped["within_budget"] is True
+    assert capped["statistical_proof"] is True
     assert capped["estimated_total_cost_usd"] == pytest.approx(36.0)
 
     over_budget = plan_evaluation_matrix(
@@ -268,7 +271,10 @@ def test_plan_evaluation_matrix_pilot_and_release_budget_scaling() -> None:
     assert over_budget["total_runs"] == 36
     assert over_budget["budget_capped"] is True
     assert over_budget["within_budget"] is False
+    assert over_budget["statistical_proof"] is False
     assert over_budget["estimated_total_cost_usd"] == pytest.approx(7.20)
+    assert plan_evaluation_matrix("release_evaluation", repeats=1)["statistical_proof"] is False
+    assert plan_evaluation_matrix("release_evaluation", task_count=8)["statistical_proof"] is False
 
 
 def test_cursor_missing_cache_telemetry_does_not_block_cost_and_quality_comparisons() -> None:
@@ -373,3 +379,64 @@ def test_plan_evaluation_matrix_offline_replay_and_invalid_inputs() -> None:
     ):
         with pytest.raises(ValueError):
             bad_call()
+
+
+def test_validate_campaign_plan_completeness_and_artifact_verification() -> None:
+    single_rep_runs = [
+        {"arm": arm, "task_id": f"task_{idx:02d}"}
+        for idx in (1, 2)
+        for arm in ("baseline", "context_guard")
+    ]
+    offline_ok = validate_campaign_plan_completeness(single_rep_runs, "offline_replay", {}, [])
+    assert offline_ok["ok"] is True
+    assert offline_ok["uncertainty_proof_ok"] is False
+    assert offline_ok["missing_cells_count"] == 0
+    assert offline_ok["duplicate_cells"] == []
+
+    dup_omitted = validate_campaign_plan_completeness(
+        [*single_rep_runs, {"arm": "baseline", "task_id": "task_01"}],
+        "offline_replay",
+        {},
+        [],
+    )
+    assert dup_omitted["ok"] is False
+    assert len(dup_omitted["duplicate_cells"]) == 1
+
+    pilot_plan = {"tier": "small_live_pilot", "arms": ["baseline", "context_guard"], "tasks": ["t1", "t2"], "repeats": 2}
+    pilot_runs = [
+        {"arm": arm, "task_id": tid, "repeat_idx": rep}
+        for tid in ("t1", "t2")
+        for arm in ("baseline", "context_guard")
+        for rep in (0, 1)
+    ]
+    assert validate_campaign_plan_completeness(pilot_runs, "small_live_pilot", {}, [], plan=pilot_plan)["ok"] is True
+    bad_rep = validate_campaign_plan_completeness([*pilot_runs[:-1], {"arm": "context_guard", "task_id": "t2", "repeat_idx": -1}], "small_live_pilot", {}, [], plan=pilot_plan)
+    assert bad_rep["ok"] is False and bad_rep["missing_cells_count"] == 1
+
+    # Undersized explicit plan cannot bypass release floor (12x3x2 = 72)
+    rel_under = validate_campaign_plan_completeness(pilot_runs, "release_evaluation", {}, [], plan={"arms": ["baseline", "context_guard"], "tasks": 2, "repeats": 2})
+    assert rel_under["ok"] is False
+    assert rel_under["min_tasks"] == 12 and rel_under["min_repeats"] == 2
+    assert rel_under["missing_arms"] == ["context_guard_rtk"]
+
+    rel_runs = [
+        _passed_run(f"task_{idx:02d}", repeat_idx=rep, cost_usd=0.08 if arm == "baseline" else 0.04) | {"arm": arm}
+        for idx in range(1, 13)
+        for arm in ("baseline", "context_guard", "context_guard_rtk")
+        for rep in (0, 1)
+    ]
+    by_arm = {arm: [r for r in rel_runs if r["arm"] == arm] for arm in ("baseline", "context_guard", "context_guard_rtk")}
+    sums = {arm: compute_arm_summary(arm, by_arm[arm], bootstrap_iters=200) for arm in by_arm}
+    cmps = [compute_paired_comparison("baseline", t, by_arm["baseline"], by_arm[t], bootstrap_iters=200) for t in ("context_guard", "context_guard_rtk")]
+    rel_ok = validate_campaign_plan_completeness(rel_runs, "release_evaluation", sums, cmps)
+    assert rel_ok["ok"] is True and rel_ok["uncertainty_proof_ok"] is True
+
+    bad_cluster_sums = {**sums, "context_guard": {**sums["context_guard"], "cost_per_passed_run_ci_95": {**sums["context_guard"]["cost_per_passed_run_ci_95"], "cluster_count": 8}}}
+    assert validate_campaign_plan_completeness(rel_runs, "release_evaluation", bad_cluster_sums, cmps)["uncertainty_proof_ok"] is False
+
+    bad_pair_cmps = [cmps[0], {**cmps[1], "paired_cost_on_shared_passes": {**cmps[1]["paired_cost_on_shared_passes"], "matched_pair_count": 20}}]
+    assert validate_campaign_plan_completeness(rel_runs, "release_evaluation", sums, bad_pair_cmps)["uncertainty_proof_ok"] is False
+
+    assert is_verified_live_campaign_artifact(None) is False
+    assert is_verified_live_campaign_artifact({"schema_version": 1, "tier": "offline_replay", "gate_verdict": {"ok": True}}) is False
+    assert is_verified_live_campaign_artifact({"schema_version": 1, "tier": "release_evaluation", "gate_verdict": {"ok": True}}) is False

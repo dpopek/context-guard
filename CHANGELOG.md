@@ -5,16 +5,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 
 ## [Unreleased]
 
+## [5.2.0] - 2026-11-19
+
+### Added
+- **Spool span & turn helpers (`spool/spans.py`):** Added grep span merging, raw source hashing, turn verification, and recovery helpers.
+- **Additive receipt metadata (`policies/api.py`, `spool/`):** Added optional span, context-byte, and blob digest `ContextReceiptV1` fields.
+
+### Changed
+- **Release docs sync (`README.md`, `vscode-extension/`):** Synced `v5.2.0` manifests, `spool/spans.py` inventory, and contract docs.
+
 ### Fixed
+- **Grep spans & raw digests (`spool/store.py`, `spool/classifier.py`):** Hash raw bytes pre-normalization and compute merged grep spans.
+- **Receipt completeness (`spool/receipts.py`, `evidence/ledger.py`):** Write rotation markers and mark missing/corrupt logs `incomplete`.
+- **Per-emission spool outcomes (`hooks/`):** Key `output_spool` windows by `call_id` and resolve recovery outcomes on `PostToolUse`.
+- **Campaign proof gating (`evidence/`):** Enforce `(arm, task_id, repeat_idx)` plan completeness and `uncertainty_proof_ok` checks.
+- **Conformance matrix (`evidence/conformance.py`, `bin/cg_eval.py`):** Separate offline checks and mark Cursor `adapter_contract_only`.
+- **OTLP correlation & export (`services/export_service.py`):** Link parent spans across turns and handle per-signal HTTP `partialSuccess`.
 - **Governor config & payloads (`hooks/`, `policies/`, `evidence/`):** Keep `governor`/`dynamic_tool_mutation`, payload & provider gates.
 - **Cursor MCP spool (`spool/`, `hooks/harness_adapter.py`):** Decode Cursor JSON payloads, skip errors/redacted, emit dict output.
 - **Lock-free read ledger (`hooks/file_io.py`, `hooks/read_planner.py`):** Check SHA-256 pre-lock and `(dev, ino, size, mtime_ns)` in lock.
 - **Boundary gate & roadmap (`tests/`, `ROADMAP.md`):** Enforce `bin/*.py <= 350` LOC ceiling and update moved `services/` references.
-- **Spool dedup integrity (`P1-01`):** Verify existing dedup blobs outside lock, quarantine corrupt blobs, and write fresh generations.
-- **Spool GC epoch & inode safety (`P1-02`):** Bump `id_epoch` on prune and verify `(dev, ino, mtime_ns)` before GC unlinks.
-- **Lock-free orphan GC (`P2-01`):** Stage expired orphans under lock via rename, unlink outside lock, and count `0 B` for missing blobs.
-- **MCP workspace pinning (`P1-03`):** Keep resolved `--workspace` authoritative over `roots/list` while allowing narrowing and templates.
-- **Atomic standard install rollback (`P1-08`):** Disarm `RollbackJournal.commit()` before cleanup and roll back standard installs on error.
+- **Spool dedup integrity (`spool/store.py`, `spool/gc.py`):** Verify dedup blobs off-lock, quarantine corrupt blobs, and write fresh IDs.
+- **Spool GC epoch & inode (`spool/gc.py`, `spool/store.py`):** Bump `id_epoch` on prune and check `(dev, ino, mtime_ns)` before unlinking.
+- **Lock-free orphan GC (`spool/gc.py`, `spool/store.py`):** Rename expired orphans under lock, unlink off-lock, and count `0 B` if missing.
+- **MCP workspace pinning (`spool/mcp_server.py`, `spool/receipts.py`):** Keep `--workspace` authoritative over `roots/list` with narrowing.
+- **Atomic standard install rollback (`services/`):** Disarm `RollbackJournal.commit()` before cleanup and roll back install errors.
 
 ## [5.1.0] - 2026-11-19
 

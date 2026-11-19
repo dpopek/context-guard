@@ -6,7 +6,7 @@ Live token savings telemetry, status bar indicator, SVG donut ring side panel, a
 
 ## Overview
 
-**Context-Guard (v5.1.0)** is a zero-prompt Policy API v1 reliability platform, Read Ledger v2 (`range_trim`), reversible output spooler, preamble/MCP budget advisor, Evidence Engine, Adaptive Governor, explainer, OTel exporter, and 4-harness conformance plugin for **Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex** (`Python 3.9+` stdlib).
+**Context-Guard (v5.2.0)** is a zero-prompt Policy API v1 reliability platform, Read Ledger v2 (`range_trim`), reversible output spooler, preamble/MCP budget advisor, Evidence Engine, Adaptive Governor, explainer, OTel exporter, and 4-harness conformance plugin for **Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex** (`Python 3.9+` stdlib).
 
 This extension reads `telemetry/stats.json`, `token_usage.json`, `outcomes.json` (Outcomes v4), and `update.json` from your installed checkout (auto-refreshing stale `token_usage.json` via `cg_status.py --usage`) to display savings and reliability insights.
 

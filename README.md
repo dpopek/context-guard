@@ -1,4 +1,4 @@
-# Context-Guard (v5.1.0)
+# Context-Guard (v5.2.0)
 
 Zero-prompt Policy API v1 reliability platform, Read Ledger v2 (`range_trim`), reversible output spooler, artifact unwrapper, budget advisor, Evidence Engine, Adaptive Governor, and off-hot-path OTel exporter for **Antigravity**, **Claude Code**, **Cursor IDE**, and **OpenAI Codex** (`macOS`, `Linux`, `Windows`).
 
@@ -57,13 +57,13 @@ Trims noisy test/grep boilerplate unless verbosity flags (`-v`/`--verbose`/`--tb
 
 ### 5. Reversible Output Spooling & Regret (`spool/`)
 - **Opt-In Spooling:** `"output_spool": "active"` validates UTF-8 and `max_spool_entry_bytes` (`4 MiB`), swapping `>= 12,288` B / `200`-line outputs for `<= 3,072` B summaries (`"shadow"` logs `shadow_spools`).
-- **Recovery & GC:** Stores `sp_<12hex>.txt` (`24h` TTL, `64` entries, `32 MB`) across `available`/`evicting`/`evicted`/`corrupt`; verifies locked fd SHA-256 and unlinks outside lock.
-- **Scoped Access:** `cg-spool` (`--workspace`/`--workspace-root`, `--session`) and MCP (`roots/list` + `--workspace-root`) enforce `os.path.samefile()` and emit `ContextReceiptV1`.
+- **Recovery & GC:** Stores `sp_<12hex>.txt` (raw `source_sha256` + `blob_sha256`, `24h`/`64`/`32 MB` GC) across `available`/`evicting`/`evicted`/`corrupt`; checks fd SHA-256 and unlinks off-lock.
+- **Scoped Access & Spans:** `cg-spool`/MCP (`--workspace-root`) enforce `os.path.samefile()`; `spool/spans.py` tracks grep spans, source digests, verified turns, and `complete`/`incomplete` `ContextReceiptV1`.
 
 ### 6. Evidence, Governor, Hardening & Conformance (`evidence/`, `services/`, `bin/`)
-- **Ledger & Governor:** Deduplicates `evidence_events.json`, derives Outcomes v4, enforces `_static_capability_ceiling`, gates Cursor CLI, and trips hysteresis breakers.
-- **Explain, OTel & Hardening:** `cg explain <event-id>` inspects lifecycles/evictions (`ExplainContractV1`); `cg export --otel` emits stdlib OTLP/JSON; `--hardening-check` runs 8 gates.
-- **Frozen Platform & Conformance:** Freezes `POLICY_API_VERSION = 1` + 17 `CORE_SCHEMA_VERSIONS`; `cg doctor --contracts` and `cg eval --conformance` / `--platform-matrix` verify 10 gates.
+- **Ledger, Outcomes & Governor:** Deduplicates `evidence_events.json`, resolves verified spool outcomes, enforces `plan_completeness` / `uncertainty_proof_ok` and `_static_capability_ceiling`, and trips breakers.
+- **Explain, OTel & Hardening:** `cg explain <event-id>` inspects `ExplainContractV1` lifecycles; `cg export --otel` emits parent-linked per-signal OTLP/HTTP (`partialSuccess`); `--hardening-check` runs 8 gates.
+- **Platform & Conformance:** Freezes `POLICY_API_VERSION = 1` + 17 `CORE_SCHEMA_VERSIONS`; `--contracts`, `--conformance` & `--platform-matrix` verify 10 gates (`offline_benchmarks_included`, `adapter_contract_only`).
 
 ## Architecture & Module Inventory
 
@@ -83,6 +83,7 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 | `spool/receipts.py` | Spool | Workspace `samefile`, link checks, `receipts.jsonl`. |
 | `spool/store.py` | Spool | Write-once blobs, UTF-8/byte guard, fd-safe GC, inspect. |
 | `spool/gc.py` | Spool | Dedup blob verification, epoch/inode GC, orphan staging. |
+| `spool/spans.py` | Spool | Grep span metrics, raw source digests, verified turn keys. |
 | `spool/classifier.py` | Spool | Command signatures, verbose overrides, follow-ups. |
 | `spool/mcp_server.py` | Spool | Dual-framed stdio MCP and `.cursor/mcp.json` sync. |
 | `integrations/atlassian_twg.py` | Integration | Opt-in CLI rewriter & JSON summarizer (`"atlassian_twg"`). |
@@ -150,9 +151,9 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 Clone anywhere (`~/.gemini/config/plugins/context-guard` for Antigravity; `CONTEXT_GUARD_HOME` overrides):
 
 ```bash
-CG_DIR=~/tools/context-guard  # or unpack dist/context-guard-v5.1.0.zip
+CG_DIR=~/tools/context-guard  # or unpack dist/context-guard-v5.2.0.zip
 git clone https://github.com/dpopek/context-guard.git "$CG_DIR"
-python3 "$CG_DIR/bin/install_harnesses.py" --install  # hooks + advox.context-guard-statusbar-5.1.0
+python3 "$CG_DIR/bin/install_harnesses.py" --install  # hooks + advox.context-guard-statusbar-5.2.0
 python3 "$CG_DIR/bin/install_harnesses.py" --status   # also: --dry-run, --pack-source <dir>, --uninstall
 ```
 
@@ -198,4 +199,4 @@ pytest tests/ -q
 
 ## Roadmap & License
 
-See [ROADMAP.md](ROADMAP.md) (Part III & IV) for frozen Policy API v1, 8-layer DAG, 4-harness matrix, migrations, rollback, and `v4.5.2`–`v5.1.0` details. [MIT License](LICENSE).
+See [ROADMAP.md](ROADMAP.md) (Part III & IV) for frozen Policy API v1, 8-layer DAG, 4-harness matrix, migrations, rollback, and `v4.5.2`–`v5.2.0` details. [MIT License](LICENSE).

@@ -30,7 +30,7 @@ from evidence.ledger import (  # noqa: E402
     run_cursor_cli_conformance,
 )
 from evidence.runner import (  # noqa: E402
-    evaluate_campaign_runs,
+    evaluate_runs_file_bundle,
     plan_isolated_campaign,
     run_explainability_hardening_gate,
     run_offline_evidence_replay,
@@ -288,7 +288,7 @@ def main(argv: list[str] | None = None) -> int:
         (bool(ns.governor_check), "--governor-check", replay_governor_decisions, True),
         (bool(ns.hardening_check), "--hardening-check", run_explainability_hardening_gate, True),
         (bool(ns.conformance), "--conformance", run_platform_conformance_suite, True),
-        (bool(ns.platform_matrix), "--platform-matrix", lambda: build_capability_limitation_matrix(include_live_effectiveness=True), False),
+        (bool(ns.platform_matrix), "--platform-matrix", lambda: build_capability_limitation_matrix(include_offline_benchmarks=True), False),
     )
     for active, flag, runner_fn, check_ok in standalone:
         if active:
@@ -323,20 +323,14 @@ def main(argv: list[str] | None = None) -> int:
         runs, meta, load_err = _load_runs_file(Path(ns.runs_file))
         if load_err is not None:
             return _emit_error("invalid_runs_file", load_err, as_json)
-        eff_harness = str(meta.get("harness_id") or ns.harness)
-        report = evaluate_campaign_runs(
-            runs,
-            campaign_id=str(meta.get("campaign_id") or f"{tier}_{Path(ns.runs_file).stem}"),
-            tier=tier,
-            harness_id=eff_harness,
-            harness_build_id=str(meta.get("harness_build_id") or ns.harness_build),
-            model_id=str(meta.get("model_id") or ns.model),
-            runtime_cfg=meta.get("runtime_cfg") if isinstance(meta.get("runtime_cfg"), Mapping) else None,
-            runtime_verifications=meta.get("runtime_verifications") if isinstance(meta.get("runtime_verifications"), Mapping) else None,
-            budget_contract=meta.get("budget_contract") if isinstance(meta.get("budget_contract"), Mapping) else None,
-            seed=int(ns.seed),
-            run_cursor_gate=(eff_harness.lower() == "cursor"),
-        )
+        bundle_meta = {
+            **meta,
+            "campaign_id": meta.get("campaign_id") or f"{tier}_{Path(ns.runs_file).stem}",
+            "harness_build_id": meta.get("harness_build_id") or ns.harness_build,
+            "model_id": meta.get("model_id") or ns.model,
+            "seed": int(ns.seed),
+        }
+        report = evaluate_runs_file_bundle(runs, bundle_meta, tier, harness_override=ns.harness)
         rc = _emit_report(report, ns, check_ok=False)
         return rc if rc != 0 else (0 if report["gate_verdict"].get("ok") else 1)
     if tier in ("small_live_pilot", "release_evaluation"):

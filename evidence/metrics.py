@@ -7,7 +7,7 @@ import random
 from typing import Any, Mapping, Sequence
 
 from services.tariffs import compute_turn_tariff_cost_usd
-from policies.api import VALID_EVAL_TIERS, VALID_RUN_OUTCOME_CLASSES
+from policies.api import EVIDENCE_SCHEMA_VERSION, VALID_EVAL_TIERS, VALID_RUN_OUTCOME_CLASSES
 
 EXTERNAL_NOISE_REASONS: tuple[str, ...] = (
     "upstream_5xx",
@@ -24,6 +24,11 @@ _SELECTION_BIAS_WARNING: str = (
 )
 _PILOT_ARMS: tuple[str, ...] = ("baseline", "context_guard")
 _RELEASE_ARMS: tuple[str, ...] = ("baseline", "context_guard", "context_guard_rtk")
+_TIER_COMPLETENESS_SPECS: dict[str, tuple[tuple[str, ...], int, int]] = {
+    "offline_replay": (_PILOT_ARMS, 2, 1),
+    "small_live_pilot": (_PILOT_ARMS, 6, 3),
+    "release_evaluation": (_RELEASE_ARMS, 12, 2),
+}
 _INT_SPECS: tuple[tuple[str, tuple[str, ...], str, int | None], ...] = (
     ("repeat_idx", ("repeat_idx",), "invalid_repeat_idx", 0),
     ("turns", ("turns",), "invalid_turns", 0),
@@ -43,7 +48,9 @@ _TOKEN_SPECS: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 __all__ = [
     "EXTERNAL_NOISE_REASONS", "compute_arm_summary", "compute_paired_comparison",
-    "plan_evaluation_matrix", "validate_run_record", "wilson_interval_95",
+    "is_verified_live_campaign_artifact", "plan_evaluation_matrix",
+    "resolve_campaign_required_arms", "validate_campaign_plan_completeness",
+    "validate_run_record", "wilson_interval_95",
 ]
 
 
@@ -546,8 +553,11 @@ def plan_evaluation_matrix(
     total_runs = tasks * len(arms) * eff_rep
     est_total = round(total_runs * run_cost, 6) if run_cost is not None else None
     within_budget = (est_total <= budget + 1e-12) if (budget is not None and est_total is not None) else None
+    eff_proof = bool(
+        proof and (tier != "release_evaluation" or (tasks >= 12 and eff_rep >= 2 and set(_RELEASE_ARMS).issubset(arms)))
+    )
     return {
-        "tier": tier, "gate_role": gate_role, "statistical_proof": proof,
+        "tier": tier, "gate_role": gate_role, "statistical_proof": eff_proof,
         "tasks": tasks, "arms": list(arms), "arm_count": len(arms),
         "repeats": eff_rep, "recommended_repeats": desired_rep, "total_runs": total_runs,
         "budget_capped": budget_capped, "within_budget": within_budget,
@@ -555,3 +565,214 @@ def plan_evaluation_matrix(
         "estimated_total_cost_usd": est_total, "observed_cost_sd_usd": sd,
         "target_ci_half_width_usd": hw, "formula": formula_used,
     }
+
+
+def _as_nonneg_int(val: Any) -> int | None:
+    return int(val) if isinstance(val, int) and not isinstance(val, bool) and val >= 0 else None
+
+
+def _extract_plan_tasks(plan: Mapping[str, Any], matrix: Mapping[str, Any]) -> tuple[list[str], int | None, bool]:
+    task_ids: list[str] = []
+    task_count, bad = None, False
+    raw_tasks = plan.get("tasks")
+    if isinstance(raw_tasks, int) and not isinstance(raw_tasks, bool):
+        task_count = int(raw_tasks)
+    elif isinstance(raw_tasks, Sequence) and not isinstance(raw_tasks, (str, bytes)):
+        for item in raw_tasks:
+            tid = item if isinstance(item, str) else (item.get("task_id") if isinstance(item, Mapping) else "")
+            if isinstance(tid, str) and tid.strip():
+                task_ids.append(tid.strip())
+    elif raw_tasks is not None:
+        bad = True
+    raw_tids = plan.get("task_ids")
+    if not task_ids and isinstance(raw_tids, Sequence) and not isinstance(raw_tids, (str, bytes)):
+        task_ids = [str(t).strip() for t in raw_tids if isinstance(t, str) and str(t).strip()]
+    if task_count is None:
+        raw_tc = plan.get("task_count") if plan.get("task_count") is not None else matrix.get("tasks")
+        if isinstance(raw_tc, int) and not isinstance(raw_tc, bool):
+            task_count = int(raw_tc)
+        elif raw_tc is not None:
+            bad = True
+    return list(dict.fromkeys(task_ids)), task_count, bad
+
+
+def _resolve_completeness_spec(tier: str, plan: Mapping[str, Any] | None) -> dict[str, Any]:
+    if tier not in _TIER_COMPLETENESS_SPECS:
+        raise ValueError(f"Unsupported evaluation tier: {tier!r}")
+    base_arms, base_tasks, base_repeats = _TIER_COMPLETENESS_SPECS[tier]
+    errors: list[str] = []
+    plan_arms: list[str] = []
+    plan_tids: list[str] = []
+    plan_tc: int | None = None
+    plan_rep: int | None = None
+    exp_arms = exp_repeats = False
+    if isinstance(plan, Mapping):
+        if (pt := str(plan.get("tier") or "").strip()) and pt != tier:
+            errors.append(f"plan tier {pt!r} does not match evaluation tier {tier!r}")
+        matrix: Mapping[str, Any] = m if isinstance((m := plan.get("matrix")), Mapping) else {}
+        raw_arms = plan.get("arms") if plan.get("arms") is not None else matrix.get("arms")
+        if isinstance(raw_arms, Sequence) and not isinstance(raw_arms, (str, bytes)):
+            plan_arms = list(dict.fromkeys(str(a).strip() for a in raw_arms if isinstance(a, str) and a.strip()))
+        exp_arms = bool(plan_arms)
+        plan_tids, plan_tc, bad_tasks = _extract_plan_tasks(plan, matrix)
+        if bad_tasks or (plan_tc is not None and plan_tc < 1):
+            errors.append("plan tasks must be >= 1 or a non-empty task list")
+        raw_rep = plan.get("repeats") if plan.get("repeats") is not None else matrix.get("repeats")
+        if (rep_int := _as_nonneg_int(raw_rep)) is not None and rep_int >= 1:
+            plan_rep, exp_repeats = rep_int, True
+        elif raw_rep is not None:
+            errors.append("plan repeats must be an integer >= 1")
+    if tier == "release_evaluation":
+        req_arms = tuple(dict.fromkeys([*_RELEASE_ARMS, *plan_arms])) if plan_arms else _RELEASE_ARMS
+        min_tasks, min_repeats = max(base_tasks, len(plan_tids), plan_tc or 0), max(base_repeats, plan_rep or 0)
+    else:
+        req_arms = tuple(plan_arms) if plan_arms else base_arms
+        min_tasks = max(len(plan_tids), plan_tc or 0) if (plan_tids or (plan_tc is not None and plan_tc >= 1)) else base_tasks
+        min_repeats = plan_rep if plan_rep is not None else base_repeats
+    return {
+        "required_arms": req_arms, "expected_task_ids": tuple(plan_tids), "min_tasks": min_tasks,
+        "min_repeats": min_repeats, "explicit_arms": exp_arms, "explicit_repeats": exp_repeats, "plan_errors": errors,
+    }
+
+
+def resolve_campaign_required_arms(tier: str, plan: Mapping[str, Any] | None = None) -> tuple[str, ...]:
+    """Resolve required evaluation arms from tier specification and optional explicit plan."""
+    return tuple(_resolve_completeness_spec(tier, plan)["required_arms"])
+
+
+def _scan_campaign_cells(runs: Sequence[Mapping[str, Any]]) -> tuple[dict[tuple[str, str, int], int], set[str], set[str], int]:
+    cell_counts: dict[tuple[str, str, int], int] = {}
+    obs_arms, obs_tasks, invalid = set(), set(), 0
+    for raw in runs:
+        if not isinstance(raw, Mapping):
+            invalid += 1
+            continue
+        arm, tid, raw_rep = _clean_str(raw, ("arm",)), _clean_str(raw, ("task_id",)), raw.get("repeat_idx")
+        if arm:
+            obs_arms.add(arm)
+        if tid:
+            obs_tasks.add(tid)
+        rep = 0 if raw_rep is None else _as_nonneg_int(raw_rep)
+        if rep is None or not arm or not tid:
+            invalid += 1
+            continue
+        cell = (arm, tid, rep)
+        cell_counts[cell] = cell_counts.get(cell, 0) + 1
+    return cell_counts, obs_arms, obs_tasks, invalid
+
+
+def _evaluate_uncertainty_proof(
+    tier: str, plan_ok: bool, spec: Mapping[str, Any],
+    arm_summaries: Mapping[str, Mapping[str, Any]], paired_comparisons: Sequence[Mapping[str, Any]],
+) -> tuple[bool, list[str]]:
+    if tier != "release_evaluation":
+        return False, ["statistical proof requires release_evaluation tier"]
+    reasons: list[str] = [] if plan_ok else ["campaign plan completeness check failed"]
+    req_arms: tuple[str, ...] = spec["required_arms"]
+    min_pairs = int(spec["min_tasks"]) * int(spec["min_repeats"])
+    for arm in req_arms:
+        if not isinstance((s := arm_summaries.get(arm)), Mapping):
+            reasons.append(f"missing arm summary for {arm}")
+            continue
+        if s.get("cost_per_passed_run_status") != "defined":
+            reasons.append(f"arm {arm} cost_per_passed_run_status is {s.get('cost_per_passed_run_status')!r}")
+        ci: Mapping[str, Any] = c if isinstance((c := s.get("cost_per_passed_run_ci_95")), Mapping) else {}
+        if ci.get("unbounded_high") is not False or ci.get("ci_95_low") is None or ci.get("ci_95_high") is None:
+            reasons.append(f"arm {arm} cost_per_passed_run_ci_95 is unbounded or incomplete")
+        if (clusters := _as_nonneg_int(ci.get("cluster_count"))) is None or clusters < 12:
+            reasons.append(f"arm {arm} cluster_count ({ci.get('cluster_count')}) < 12")
+        if _as_nonneg_int(s.get("reliability_failures")) != 0:
+            reasons.append(f"arm {arm} reliability_failures ({s.get('reliability_failures')}) != 0")
+    if len(paired_comparisons) < max(1, len(req_arms) - 1):
+        reasons.append(f"expected >= {max(1, len(req_arms) - 1)} paired comparisons, got {len(paired_comparisons)}")
+    for cmp_item in paired_comparisons:
+        if not isinstance(cmp_item, Mapping):
+            reasons.append("invalid paired comparison entry")
+            continue
+        lbl = f"{cmp_item.get('baseline_arm')}->{cmp_item.get('treatment_arm')}"
+        if cmp_item.get("comparisons_blocked") is True:
+            reasons.append(f"paired comparison {lbl} is blocked")
+        cond: Mapping[str, Any] = pc if isinstance((pc := cmp_item.get("paired_cost_on_shared_passes")), Mapping) else {}
+        if (matched := _as_nonneg_int(cond.get("matched_pair_count"))) is None or matched < min_pairs:
+            reasons.append(f"paired comparison {lbl} matched_pair_count ({cond.get('matched_pair_count')}) < {min_pairs}")
+        uncond: Mapping[str, Any] = uc if isinstance((uc := cmp_item.get("unconditional")), Mapping) else {}
+        dci: Mapping[str, Any] = dc if isinstance((dc := uncond.get("cost_per_passed_run_delta_ci_95")), Mapping) else {}
+        if dci.get("unbounded") is not False or dci.get("ci_95_low") is None or dci.get("ci_95_high") is None:
+            reasons.append(f"paired comparison {lbl} cost_per_passed_run_delta_ci_95 is unbounded or incomplete")
+    return not reasons, reasons
+
+
+def validate_campaign_plan_completeness(
+    runs: Sequence[Mapping[str, Any]], tier: str,
+    arm_summaries: Mapping[str, Mapping[str, Any]], paired_comparisons: Sequence[Mapping[str, Any]],
+    plan: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate campaign runs against independent tier/plan cell completeness and statistical proof rules."""
+    spec = _resolve_completeness_spec(tier, plan)
+    req_arms, exp_tasks = spec["required_arms"], spec["expected_task_ids"]
+    min_tasks, min_repeats = int(spec["min_tasks"]), int(spec["min_repeats"])
+    cell_counts, obs_arms, obs_tasks, invalid_rows = _scan_campaign_cells(runs)
+    missing_arms = [a for a in req_arms if a not in obs_arms]
+    unexpected_arms = sorted(obs_arms - set(req_arms)) if spec["explicit_arms"] else []
+    arms_to_check = req_arms if spec["explicit_arms"] else tuple(dict.fromkeys([*req_arms, *sorted(obs_arms)]))
+    eff_repeats = min_repeats if spec["explicit_repeats"] else max(min_repeats, max((c[2] + 1 for c in cell_counts), default=0))
+    unexpected_reps = sorted(c for c in cell_counts if spec["explicit_repeats"] and c[2] >= min_repeats)
+    task_grid = list(exp_tasks) if exp_tasks else sorted(obs_tasks)
+    unexpected_tasks = sorted(obs_tasks - set(exp_tasks)) if exp_tasks else []
+    missing_grid = sum(1 for a in arms_to_check for t in task_grid for r in range(eff_repeats) if (a, t, r) not in cell_counts)
+    missing_cells_count = missing_grid + max(0, min_tasks - len(task_grid)) * len(arms_to_check) * eff_repeats
+    duplicate_cells = [
+        {"arm": a, "task_id": t, "repeat_idx": r, "count": cnt}
+        for (a, t, r), cnt in sorted(cell_counts.items()) if cnt > 1
+    ]
+    checks = (
+        (not runs, "no campaign runs provided"),
+        (invalid_rows > 0, f"{invalid_rows} run record(s) missing arm/task_id or having invalid repeat_idx"),
+        (bool(missing_arms), f"missing required arms: {', '.join(missing_arms)}"),
+        (bool(unexpected_arms), f"unexpected arms outside plan: {', '.join(unexpected_arms)}"),
+        (len(obs_tasks) < min_tasks, f"observed {len(obs_tasks)} distinct task(s), minimum required is {min_tasks}"),
+        (bool(unexpected_tasks), f"unexpected task_id(s) outside plan: {', '.join(unexpected_tasks[:5])}"),
+        (bool(unexpected_reps), f"{len(unexpected_reps)} run(s) exceed planned repeat count ({min_repeats})"),
+        (bool(duplicate_cells), "duplicate (arm, task_id, repeat_idx) cells: " + ", ".join(f"{d['arm']}/{d['task_id']}/r{d['repeat_idx']}" for d in duplicate_cells[:5])),
+        (missing_cells_count > 0, f"missing {missing_cells_count} required (arm, task_id, repeat_idx) cell(s)"),
+    )
+    reasons = [*spec["plan_errors"], *(msg for cond, msg in checks if cond)]
+    plan_ok = not reasons
+    unc_ok, unc_reasons = _evaluate_uncertainty_proof(tier, plan_ok, spec, arm_summaries, paired_comparisons)
+    return {
+        "ok": plan_ok, "tier": tier, "required_arms": list(req_arms), "observed_arms": sorted(obs_arms),
+        "missing_arms": missing_arms, "min_tasks": min_tasks, "min_repeats": min_repeats,
+        "min_runs": len(req_arms) * min_tasks * min_repeats, "observed_tasks": len(obs_tasks),
+        "observed_runs": len(runs), "duplicate_cells": duplicate_cells,
+        "missing_cells_count": missing_cells_count, "uncertainty_proof_ok": unc_ok,
+        "reasons": reasons, "uncertainty_reasons": unc_reasons,
+    }
+
+
+def is_verified_live_campaign_artifact(artifact: Any) -> bool:
+    """Return True only when artifact is a complete, passing live pilot or release EvidenceContractV1."""
+    if not isinstance(artifact, Mapping) or artifact.get("schema_version") != EVIDENCE_SCHEMA_VERSION or artifact.get("tier") not in ("small_live_pilot", "release_evaluation"):
+        return False
+    tier, env, verdict, ub = artifact["tier"], artifact.get("environment"), artifact.get("gate_verdict"), artifact.get("uncertainty_bounds")
+    arm_summaries, paired = artifact.get("arm_summaries"), artifact.get("paired_comparisons")
+    if not (isinstance(env, Mapping) and isinstance(verdict, Mapping) and isinstance(ub, Mapping) and isinstance(arm_summaries, Mapping) and isinstance(paired, Sequence) and not isinstance(paired, (str, bytes))):
+        return False
+    h_id, m_id = str(env.get("harness_id") or "").strip().lower(), str(env.get("model_id") or "").strip().lower()
+    if not h_id or h_id == "unknown" or not m_id or m_id == "unknown" or str(env.get("harness_build_id") or "").strip().lower() == "offline-replay":
+        return False
+    controls, plan_comp = verdict.get("controls"), verdict.get("plan_completeness")
+    if not (isinstance(controls, Mapping) and isinstance(plan_comp, Mapping)) or verdict.get("ok") is not True or controls.get("ok") is not True or plan_comp.get("ok") is not True:
+        return False
+    if verdict.get("all_arms_defined") is not True or verdict.get("contract_violation_count") != 0:
+        return False
+    obs_runs, min_runs = _as_nonneg_int(plan_comp.get("observed_runs")), _as_nonneg_int(plan_comp.get("min_runs"))
+    if obs_runs is None or min_runs is None or obs_runs < max(1, min_runs) or controls.get("run_count") != obs_runs or len(paired) < 1:
+        return False
+    req_arms = plan_comp.get("required_arms") or artifact.get("arms")
+    if not isinstance(req_arms, Sequence) or isinstance(req_arms, (str, bytes)) or not req_arms or not all(isinstance((s := arm_summaries.get(a)), Mapping) and s.get("cost_per_passed_run_status") == "defined" for a in req_arms):
+        return False
+    if isinstance((cc := verdict.get("cursor_conformance")), Mapping) and cc.get("admitted") is not True:
+        return False
+    if tier == "release_evaluation":
+        return bool(artifact.get("statistical_proof") is True and verdict.get("statistical_proof") is True and plan_comp.get("uncertainty_proof_ok") is True and ub.get("statistical_proof") is True and ub.get("uncertainty_proof_ok") is True and obs_runs >= 72)
+    return True

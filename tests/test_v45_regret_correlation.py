@@ -122,31 +122,53 @@ def test_output_spool_targeted_slice_and_grep_resolve_without_regret(
     sd = tmp_path / "state"
     sd.mkdir()
 
-    # 1) CLI cg-spool slice (<= 200 lines) resolves output_spool -> targeted/none/observed
+    # 1) CLI cg-spool slice (<= 200 lines) records pending in PreToolUse and resolves only after PostToolUse
     _bash_pre(sd, "s1", "pytest tests/", "c1", cwd=tmp_path)
     sid1 = _extract_spool_id(_bash_post(sd, "s1", "pytest tests/", _big_lines(260, "slice"), "c1", cwd=tmp_path))
     _bash_pre(sd, "s1", f"cg-spool slice {sid1} --start 1 --limit 80", "c2", cwd=tmp_path)
+    mid_ledger = read_outcomes_ledger(sd)
+    assert f"s1|spool:{sid1}|output_spool" in mid_ledger["open_windows"]
+    assert mid_ledger["open_windows"][f"s1|spool:{sid1}|output_spool"]["meta"]["p_cid"] == "c2"
+    assert _spool_row(sd, "output_spool")["recovery"]["targeted"] == 0
+    _bash_post(sd, "s1", f"cg-spool slice {sid1} --start 1 --limit 80", '{"ok": true}', "c2", cwd=tmp_path)
 
-    # 2) MCP cg_spool_grep resolves output_spool -> targeted/none/observed
+    # 2) MCP cg_spool_grep resolves output_spool -> targeted/none/observed on PostToolUse
     _bash_pre(sd, "s2", "pytest tests/a", "c3", cwd=tmp_path)
     sid2 = _extract_spool_id(_bash_post(sd, "s2", "pytest tests/a", _big_lines(260, "grep"), "c3", cwd=tmp_path))
+    mcp_in = {"spool_id": sid2, "pattern": "mismatch"}
     pre_tool_use.evaluate_hook(
         {
-            "hook_event_name": "PreToolUse",
-            "session_id": "s2",
-            "tool_use_id": "c4",
-            "tool_name": "mcp__context-guard-spool__cg_spool_grep",
-            "tool_input": {"spool_id": sid2, "pattern": "mismatch"},
-            "cwd": str(tmp_path),
+            "hook_event_name": "PreToolUse", "session_id": "s2", "tool_use_id": "c4",
+            "tool_name": "mcp__context-guard-spool__cg_spool_grep", "tool_input": mcp_in, "cwd": str(tmp_path),
+        },
+        state_dir=str(sd), cli_harness="claude",
+    )
+    assert f"s2|spool:{sid2}|output_spool" in read_outcomes_ledger(sd)["open_windows"]
+    handle_post_tool_use(
+        "claude",
+        {
+            "hook_event_name": "PostToolUse", "session_id": "s2", "tool_use_id": "c4",
+            "tool_name": "mcp__context-guard-spool__cg_spool_grep", "tool_input": mcp_in,
+            "tool_response": {"ok": True}, "cwd": str(tmp_path),
         },
         state_dir=str(sd),
-        cli_harness="claude",
     )
 
-    # 3) Direct bounded Read on sp_<id>.txt (limit 50 <= 200) resolves output_spool -> targeted/none/observed
+    # 3) Direct bounded Read on sp_<id>.txt (limit 50 <= 200) resolves output_spool -> targeted/none/observed on PostToolUse
     _bash_pre(sd, "s3", "pytest tests/b", "c5", cwd=tmp_path)
     sid3 = _extract_spool_id(_bash_post(sd, "s3", "pytest tests/b", _big_lines(260, "dread"), "c5", cwd=tmp_path))
-    claude_read(spool_dir / f"{sid3}.txt", sd, offset=1, limit=50, session_id="s3", confirm=False, tool_use_id="c6", cwd=tmp_path)
+    blob3 = spool_dir / f"{sid3}.txt"
+    claude_read(blob3, sd, offset=1, limit=50, session_id="s3", confirm=False, tool_use_id="c6", cwd=tmp_path)
+    assert f"s3|spool:{sid3}|output_spool" in read_outcomes_ledger(sd)["open_windows"]
+    handle_post_tool_use(
+        "claude",
+        {
+            "hook_event_name": "PostToolUse", "session_id": "s3", "tool_use_id": "c6",
+            "tool_name": "Read", "tool_input": {"file_path": str(blob3), "offset": 1, "limit": 50},
+            "tool_response": "line 1\n", "cwd": str(tmp_path),
+        },
+        state_dir=str(sd),
+    )
 
     ledger = read_outcomes_ledger(sd)
     assert ledger["open_windows"] == {}
@@ -175,16 +197,28 @@ def test_output_spool_full_read_above_200_lines_and_80_pct_resolves_suspected_re
     _bash_pre(sd, "sb1", "pytest t1", "b1", cwd=tmp_path)
     sid_b1 = _extract_spool_id(_bash_post(sd, "sb1", "pytest t1", _big_lines(300, "b1"), "b1", cwd=tmp_path))
     _bash_pre(sd, "sb1", f"cg-spool slice {sid_b1} --start 1 --limit 220", "b2", cwd=tmp_path)
+    _bash_post(sd, "sb1", f"cg-spool slice {sid_b1} --start 1 --limit 220", '{"ok": true}', "b2", cwd=tmp_path)
 
     # Suspected Case A: 250/250 lines (> 200 and > 80% of 250) -> full/suspected/observed
     _bash_pre(sd, "sf1", "pytest t2", "f1", cwd=tmp_path)
     sid_f1 = _extract_spool_id(_bash_post(sd, "sf1", "pytest t2", _big_lines(250, "f1"), "f1", cwd=tmp_path))
     _bash_pre(sd, "sf1", f"cg-spool slice {sid_f1} --start 1 --limit 250", "f2", cwd=tmp_path)
+    _bash_post(sd, "sf1", f"cg-spool slice {sid_f1} --start 1 --limit 250", '{"ok": true}', "f2", cwd=tmp_path)
 
     # Suspected Case B: direct unbounded Read of sp_<id>.txt -> full/suspected/observed
     _bash_pre(sd, "sf2", "pytest t3", "f3", cwd=tmp_path)
     sid_f2 = _extract_spool_id(_bash_post(sd, "sf2", "pytest t3", _big_lines(250, "f2"), "f3", cwd=tmp_path))
-    claude_read(spool_dir / f"{sid_f2}.txt", sd, session_id="sf2", confirm=False, tool_use_id="f4", cwd=tmp_path)
+    blob_f2 = spool_dir / f"{sid_f2}.txt"
+    claude_read(blob_f2, sd, session_id="sf2", confirm=False, tool_use_id="f4", cwd=tmp_path)
+    handle_post_tool_use(
+        "claude",
+        {
+            "hook_event_name": "PostToolUse", "session_id": "sf2", "tool_use_id": "f4",
+            "tool_name": "Read", "tool_input": {"file_path": str(blob_f2)},
+            "tool_response": "full\n", "cwd": str(tmp_path),
+        },
+        state_dir=str(sd),
+    )
 
     ledger = read_outcomes_ledger(sd)
     assert ledger["open_windows"] == {}
@@ -284,8 +318,9 @@ def test_edit_clears_cmd_sig_preventing_false_regret_while_preserving_later_slic
     assert _spool_row(sd, "output_spool")["regret"] == {"none": 0, "suspected": 0, "confirmed": 0, "unknown": 0}
     assert spool_key in read_outcomes_ledger(sd)["open_windows"]
 
-    # Step 4: Later targeted slice still resolves the preserved spool window cleanly
+    # Step 4: Later targeted slice still resolves the preserved spool window cleanly on PostToolUse
     _bash_pre(sd, "sed", f"cg-spool slice {sid} --start 1 --limit 80", "e4", cwd=tmp_path)
+    _bash_post(sd, "sed", f"cg-spool slice {sid} --start 1 --limit 80", '{"ok": true}', "e4", cwd=tmp_path)
     row = _spool_row(sd, "output_spool")
     assert row["recovery"]["targeted"] == 1
     assert row["regret"]["none"] == 1
@@ -453,14 +488,15 @@ def test_spool_hook_lock_ordering_never_nests_inside_locked_state(
     for target_mod, names in (
         (outcomes, (
             "open_outcome_window", "close_outcome_windows", "record_spool_followup",
+            "record_spool_followup_request", "resolve_spool_followup_result",
             "record_spool_command_repeat", "record_cli_verbose_regret",
             "record_range_trim_regret", "reconcile_mutation_windows",
         )),
-        (post_mod, ("open_outcome_window", "reconcile_mutation_windows", "record_telemetry_event")),
+        (post_mod, ("open_outcome_window", "reconcile_mutation_windows", "resolve_spool_followup_result", "record_telemetry_event")),
         (pre_tool_use, (
             "open_outcome_window", "close_outcome_windows", "reconcile_mutation_windows",
             "record_cli_verbose_regret", "record_range_trim_regret",
-            "record_spool_command_repeat", "record_spool_followup", "classify_pre_tool_spool_followup",
+            "record_spool_command_repeat", "record_spool_followup_request", "classify_pre_tool_spool_followup",
         )),
         (spool_store, ("spool_post_tool_output", "classify_pre_tool_spool_followup")),
     ):
@@ -470,6 +506,7 @@ def test_spool_hook_lock_ordering_never_nests_inside_locked_state(
     _bash_pre(sd, "slock", "pytest tests/", "lk1", cwd=tmp_path)
     sid = _extract_spool_id(_bash_post(sd, "slock", "pytest tests/", _big_lines(260, "lk"), "lk1", cwd=tmp_path))
     _bash_pre(sd, "slock", f"cg-spool slice {sid} --start 1 --limit 50", "lk2", cwd=tmp_path)
+    _bash_post(sd, "slock", f"cg-spool slice {sid} --start 1 --limit 50", '{"ok": true}', "lk2", cwd=tmp_path)
     claude_read(mod, sd, offset=1, limit=100, session_id="slock", tool_use_id="lk3")
     claude_read(mod, sd, offset=1, limit=150, session_id="slock", tool_use_id="lk4")
     _edit_both(sd, "slock", mod, "lk5")

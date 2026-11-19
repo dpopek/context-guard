@@ -15,7 +15,7 @@ from hooks.harness_adapter import (NormalizedToolCall, can_rewrite_shell_command
                                    format_pre_tool_output, normalize_line_bounds, normalize_pre_tool_payload)
 from hooks.outcomes import (close_outcome_windows, consume_outcome_windows, dispatch_direct_outcome, ledger_path_for,  # noqa: E402
                             open_outcome_window, reconcile_mutation_windows, record_cli_verbose_regret,
-                            record_direct_outcome, record_range_trim_regret, record_spool_command_repeat, record_spool_followup)
+                            record_direct_outcome, record_range_trim_regret, record_spool_command_repeat, record_spool_followup_request)
 from hooks.policy_engine import (apply_overwrite_to_call, apply_policy_packs_with_records, reconcile_post_transform,  # noqa: E402
                                  run_pre_decision_hooks, verify_security_policies_post_transform)
 from hooks.read_planner import FOLLOWUP_TARGETED_MAX_LINES, FileReadOutcome, PlannedFileRead, commit_planned_file_read, plan_file_read_verdict  # noqa: E402
@@ -109,8 +109,7 @@ def _apply_spool_followup(sess_id: str, norm: NormalizedToolCall, step_idx: int,
     fu = classify_pre_tool_spool_followup(norm.original_tool_name, norm.original_tool_input, spool_dir=resolve_spool_dir(sp_dir),
                                           workspace_root=norm.cwd, workspace_roots=norm.workspace_roots, session_id=norm.session_id)
     if fu is None: return False
-    record_spool_followup(sess_id, str(fu["spool_id"]), str(fu["recovery"]), str(fu["regret"]), step_idx, evidence=str(fu.get("evidence") or "observed"), ledger_path=outcomes_path)
-    return True
+    return record_spool_followup_request(sess_id, str(fu["spool_id"]), {"call_id": norm.call_id, "recovery": fu["recovery"], "regret": fu["regret"], "step_idx": step_idx}, ledger_path=outcomes_path)
 
 def evaluate_hook(payload: dict[str, Any], state_dir: str | None = None, cli_harness: str | None = None) -> dict[str, Any]:
     """Evaluate PreToolUse hook payload across Antigravity, Claude Code, Cursor, and Codex."""

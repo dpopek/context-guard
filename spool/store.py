@@ -24,7 +24,7 @@ from policies.api import SpoolContractV1
 from policies.governor import is_optimizer_tripped, record_governor_signal
 from spool.classifier import (
     GcEvictionPolicy, SPOOL_ID_RE, build_spool_summary, classify_pre_tool_spool_followup,
-    compute_command_signature, entry_scope_error, format_spooled_tool_output, grep_verified_lines,
+    compute_command_signature, entry_scope_error, format_spooled_tool_output,
     inspect_spool_entry_readonly, inspect_spool_health_readonly, is_verbose_override_command,
     parse_spool_index, plan_gc_evictions, prepare_post_tool_spool_candidate, project_spool_in_memory,
     read_blob_bytes, read_spool_index_readonly, resolve_spool_scope, slice_verified_lines, split_lines,
@@ -35,8 +35,9 @@ from spool.gc import (
 )
 from spool.receipts import (
     DEFAULT_MAX_SPOOL_ENTRY_BYTES, append_receipt, build_receipt, compute_scoped_spool_id,
-    find_created_receipt, read_spool_config, receipts_path_for,
+    enrich_receipt, find_created_receipt, read_spool_config, receipts_path_for,
 )
+from spool.spans import grep_lines_with_spans, measure_raw_source_bytes
 
 SPOOL_SCHEMA_VERSION = 2
 SPOOL_MAX_TOMBSTONES, SPOOL_MAX_CORRUPT_ENTRIES = 128, 64
@@ -313,6 +314,8 @@ def _spool_tool_output_with_receipt(
     if scope_err is not None or (proj := _project_mem(raw_text, scope_key, eff_max)) is None:
         return None
     base_sid, lines, raw_bytes, sha_hex, summary, saved = proj
+    raw_meta = measure_raw_source_bytes(raw_text)
+    source_sha256, source_bytes = raw_meta if raw_meta is not None else (sha_hex, len(raw_bytes))
     eff_dir, ts = spool_dir or resolve_spool_dir(), float(now_ts) if now_ts is not None else time.time()
     tmp_path: Path | None = None
     committed: tuple[str, Path, bool, list[tuple[str, int, tuple[int, int, int] | None]], set[str]] | None = None
@@ -330,7 +333,8 @@ def _spool_tool_output_with_receipt(
             "session_id": str(session_id or ""), "call_id": str(call_id or ""), "harness": str(harness or ""),
             "tool_name": str(tool_name or ""), "cmd_sig": str(cmd_sig or ""), "total_lines": len(lines),
             "total_bytes": len(raw_bytes), "summary_bytes": len(summary.encode("utf-8")), "saved_bytes": saved,
-            "content_sha256": sha_hex, "created_at": ts, "last_accessed_at": ts, "state": "available",
+            "content_sha256": sha_hex, "source_sha256": source_sha256, "source_bytes": source_bytes,
+            "created_at": ts, "last_accessed_at": ts, "state": "available",
         }
         for _attempt in range(2):
             if probe.verified_id is None and tmp_path is None:
@@ -368,13 +372,16 @@ def _spool_tool_output_with_receipt(
     if existing is not None and (event_id is None or existing["event_id"] == event_id):
         receipt_id: str | None = existing["receipt_id"]
     else:
-        rcpt = build_receipt(
-            event_type="spool_created", harness=harness, session_id=str(session_id or ""), workspace_id=ws_id,
-            turn_key=turn_key, call_id=str(call_id or ""), spool_id=sid, line_span=(0, len(lines)),
-            byte_span=(0, len(raw_bytes)), upstream_truncation=upstream_truncation,
-            delivery_evidence="replacement_emitted", spool_id_referenced=False, timestamp=_ts_iso(now_ts),
-            event_id=event_id, hook_duration_ms=hook_duration_ms, turn_correlation=turn_correlation,
-            source_hash=sha_hex, original_bytes=len(raw_bytes), replacement_bytes=len(summary.encode("utf-8")),
+        rcpt = enrich_receipt(
+            build_receipt(
+                event_type="spool_created", harness=harness, session_id=str(session_id or ""), workspace_id=ws_id,
+                turn_key=turn_key, call_id=str(call_id or ""), spool_id=sid, line_span=(0, len(lines)),
+                byte_span=(0, len(raw_bytes)), upstream_truncation=upstream_truncation,
+                delivery_evidence="replacement_emitted", spool_id_referenced=False, timestamp=_ts_iso(now_ts),
+                event_id=event_id, hook_duration_ms=hook_duration_ms, turn_correlation=turn_correlation,
+                source_hash=source_sha256, original_bytes=source_bytes, replacement_bytes=len(summary.encode("utf-8")),
+            ),
+            {"blob_sha256": sha_hex, "blob_bytes": len(raw_bytes)},
         )
         receipt_id = rcpt["receipt_id"] if append_receipt(rcpt, receipts_path=eff_rcpt) else None
     return SpoolContractV1(spool_id=sid, path=str(blob_path), total_lines=len(lines), total_bytes=len(raw_bytes), content_sha256=sha_hex), summary, receipt_id
@@ -533,31 +540,16 @@ def _update_available_entry_locked(eff_dir: Path, spool_id: str, updates: Mappin
         warn(f"failed to update spool index for {spool_id}: {type(exc).__name__}: {exc}")
 
 
-def _emit_spool_receipt(
-    *, event_type: str, spool_id: str, eff_dir: Path, receipts_path: Path | None, harness: str,
-    session_id: str, workspace_id: str, line_span: tuple[int, int], byte_span: tuple[int, int],
-    now_ts: float | None, turn_key: str = "", turn_correlation: str = "unobserved",
-    call_id: str = "", source_hash: str = "", failure_kind: str | None = None, reason: str | None = None,
-) -> None:
+def _rcpt_target_and_parent(spool_id: str, eff_dir: Path, receipts_path: Path | None) -> tuple[Path, str | None]:
     eff_rcpt = receipts_path or receipts_path_for(eff_dir)
     parent = find_created_receipt(spool_id, receipts_path=eff_rcpt)
-    append_receipt(
-        build_receipt(
-            event_type=event_type, harness=harness, session_id=session_id, workspace_id=workspace_id,
-            turn_key=turn_key, call_id=call_id, spool_id=spool_id, line_span=line_span, byte_span=byte_span,
-            delivery_evidence="unverified", spool_id_referenced=True,
-            parent_event_id=(parent["receipt_id"] if parent is not None else None),
-            failure_kind=failure_kind, reason=reason, timestamp=_ts_iso(now_ts),
-            turn_correlation=turn_correlation, source_hash=source_hash,
-        ),
-        receipts_path=eff_rcpt,
-    )
+    return eff_rcpt, (parent["receipt_id"] if parent is not None else None)
 
 
 def _open_locked_entry_blob(
     eff_dir: Path, blob_path: Path, spool_id: str, *, mode: str, ws_id: str, eff_sess: str, canon_root: str, eff_now: float,
-) -> tuple[int | None, str, str, Any, Any, dict[str, Any] | None, str | None, bool]:
-    entry_sess, entry_ws, exp_bytes, exp_sha = eff_sess, ws_id, None, None
+) -> tuple[int | None, str, str, Any, Any, str, dict[str, Any] | None, str | None, bool]:
+    entry_sess, entry_ws, exp_bytes, exp_sha, src_sha = eff_sess, ws_id, None, None, ""
     with _spool_lock(eff_dir):
         index = _open_index_unlocked(eff_dir)
         entry = index["entries"].get(spool_id)
@@ -568,23 +560,24 @@ def _open_locked_entry_blob(
                 if (tomb is not None and entry_scope_error(tomb, mode, ws_id, eff_sess, caller_canon_root=canon_root) is None)
                 else {"ok": False, "error": "spool_not_found"}
             )
-            return None, entry_sess, entry_ws, exp_bytes, exp_sha, err_d, None, False
+            return None, entry_sess, entry_ws, exp_bytes, exp_sha, src_sha, err_d, None, False
         if (mm_err := entry_scope_error(entry, mode, ws_id, eff_sess, caller_canon_root=canon_root)) is not None:
-            return None, entry_sess, entry_ws, exp_bytes, exp_sha, {"ok": False, "error": mm_err}, None, False
+            return None, entry_sess, entry_ws, exp_bytes, exp_sha, src_sha, {"ok": False, "error": mm_err}, None, False
         if (st_val := entry.get("state", "available")) == "corrupt":
             err_d = {"ok": False, "error": "spool_corrupt", "corrupt_reason": str(entry.get("corrupt_reason") or "integrity_mismatch")}
-            return None, entry_sess, entry_ws, exp_bytes, exp_sha, err_d, None, False
+            return None, entry_sess, entry_ws, exp_bytes, exp_sha, src_sha, err_d, None, False
         if st_val == "preparing":
-            return None, entry_sess, entry_ws, exp_bytes, exp_sha, {"ok": False, "error": "spool_not_found"}, None, False
+            return None, entry_sess, entry_ws, exp_bytes, exp_sha, src_sha, {"ok": False, "error": "spool_not_found"}, None, False
         entry_sess = eff_sess or str(entry.get("session_id") or "")
         entry_ws = ws_id or str(entry.get("workspace_id") or "")
         exp_bytes, exp_sha = entry.get("total_bytes"), entry.get("content_sha256")
+        src_sha = str(entry.get("source_sha256") or exp_sha or "")
         fd, early_err, missing = _open_blob_fd_locked(blob_path)
         if missing:
             entry["state"], entry["corrupt_reason"], entry["corrupted_at"] = "corrupt", "unexpectedly_missing", eff_now
             _save_index(eff_dir, index)
-            return None, entry_sess, entry_ws, exp_bytes, exp_sha, early_err, "unexpectedly_missing", True
-        return fd, entry_sess, entry_ws, exp_bytes, exp_sha, early_err, None, False
+            return None, entry_sess, entry_ws, exp_bytes, exp_sha, src_sha, early_err, "unexpectedly_missing", True
+        return fd, entry_sess, entry_ws, exp_bytes, exp_sha, src_sha, early_err, None, False
 
 
 def _touch_and_load_lines(
@@ -593,35 +586,35 @@ def _touch_and_load_lines(
     session_id: str | None = None, isolation: str | None = None, harness: str = "cli",
     receipts_path: Path | None = None, on_reliability_failure: Callable[[], None] | None = None,
     turn_key: str = "", turn_correlation: str = "unobserved", call_id: str = "",
-) -> tuple[list[str], int, str, str, str, dict[str, Any] | None]:
+) -> tuple[list[str], int, str, str, str, str, dict[str, Any] | None]:
     if not isinstance(spool_id, str) or not SPOOL_ID_RE.fullmatch(spool_id):
-        return [], 0, "", "", "", {"ok": False, "error": "invalid_spool_id"}
+        return [], 0, "", "", "", "", {"ok": False, "error": "invalid_spool_id"}
     mode, _sk, ws_id, canon_root, eff_sess, scope_err = resolve_spool_scope(
         isolation=isolation, workspace_root=workspace_root, workspace_roots=workspace_roots, session_id=session_id,
     )
     if scope_err is not None:
-        return [], 0, ws_id, eff_sess, "", {"ok": False, "error": scope_err}
+        return [], 0, ws_id, eff_sess, "", "", {"ok": False, "error": scope_err}
     eff_dir, blob_path = (sd := spool_dir or resolve_spool_dir()), sd / f"{spool_id}.txt"
     if check_unsafe_link(eff_dir) or check_unsafe_link(eff_dir / "spool_index.lock") or check_unsafe_link(eff_dir / "spool_index.json") or check_unsafe_link(blob_path):
-        return [], 0, ws_id, eff_sess, "", {"ok": False, "error": "unsafe_path"}
+        return [], 0, ws_id, eff_sess, "", "", {"ok": False, "error": "unsafe_path"}
     if not eff_dir.is_dir():
-        return [], 0, ws_id, eff_sess, "", {"ok": False, "error": "spool_not_found"}
+        return [], 0, ws_id, eff_sess, "", "", {"ok": False, "error": "spool_not_found"}
     eff_now, fd = float(now_ts) if now_ts is not None else time.time(), None  # type: tuple[float, int | None]
     try:
         try:
-            fd, entry_sess, entry_ws, exp_bytes, exp_sha, early_err, fail_reason, marked_step1 = _open_locked_entry_blob(
+            fd, entry_sess, entry_ws, exp_bytes, exp_sha, src_sha, early_err, fail_reason, marked_step1 = _open_locked_entry_blob(
                 eff_dir, blob_path, spool_id, mode=mode, ws_id=ws_id, eff_sess=eff_sess, canon_root=canon_root, eff_now=eff_now,
             )
         except OSError as exc:
-            return [], 0, ws_id, eff_sess, "", {"ok": False, "error": "unsafe_path" if "unsafe_path" in str(exc) else str(exc)}
+            return [], 0, ws_id, eff_sess, "", "", {"ok": False, "error": "unsafe_path" if "unsafe_path" in str(exc) else str(exc)}
         if early_err is not None:
-            return [], 0, entry_ws, entry_sess, "", early_err
+            return [], 0, entry_ws, entry_sess, "", "", early_err
         obs_bytes, lines = 0, []  # type: tuple[int, list[str]]
         if fd is not None:
             hand_off, fd = fd, None
             lines, obs_bytes, fail_reason, io_err = _read_fd_and_verify(hand_off, exp_bytes, exp_sha)
             if io_err is not None:
-                return [], 0, entry_ws, entry_sess, "", {"ok": False, "error": io_err}
+                return [], 0, entry_ws, entry_sess, "", "", {"ok": False, "error": io_err}
     finally:
         if fd is not None:
             try:
@@ -631,18 +624,25 @@ def _touch_and_load_lines(
     if fail_reason is not None:
         if not marked_step1:
             _update_available_entry_locked(eff_dir, spool_id, {"state": "corrupt", "corrupt_reason": fail_reason, "corrupted_at": eff_now})
-        _emit_spool_receipt(
-            event_type="spool_integrity_failure", spool_id=spool_id, eff_dir=eff_dir, receipts_path=receipts_path,
-            harness=harness, session_id=entry_sess, workspace_id=entry_ws, line_span=(0, 0), byte_span=(0, obs_bytes),
-            now_ts=now_ts, turn_key=turn_key, turn_correlation=turn_correlation, call_id=call_id,
-            source_hash=(exp_sha if isinstance(exp_sha, str) else ""), failure_kind="reliability_failure", reason=fail_reason,
+        eff_rcpt, parent_id = _rcpt_target_and_parent(spool_id, eff_dir, receipts_path)
+        blob_sha = exp_sha if isinstance(exp_sha, str) else ""
+        rcpt = enrich_receipt(
+            build_receipt(
+                event_type="spool_integrity_failure", harness=harness, session_id=entry_sess, workspace_id=entry_ws,
+                turn_key=turn_key, call_id=call_id, spool_id=spool_id, line_span=(0, 0), byte_span=(0, obs_bytes),
+                delivery_evidence="unverified", spool_id_referenced=True, parent_event_id=parent_id,
+                failure_kind="reliability_failure", reason=fail_reason, timestamp=_ts_iso(now_ts),
+                turn_correlation=turn_correlation, source_hash=src_sha or blob_sha,
+            ),
+            {"blob_sha256": blob_sha, **({"blob_bytes": exp_bytes} if isinstance(exp_bytes, int) and not isinstance(exp_bytes, bool) and exp_bytes >= 0 else {})},
         )
+        append_receipt(rcpt, receipts_path=eff_rcpt)
         if on_reliability_failure is not None:
             on_reliability_failure()
         record_governor_signal("output_spool", fail_reason, state_dir=eff_dir, harness=harness, session_id=entry_sess)
-        return [], obs_bytes, entry_ws, entry_sess, "", {"ok": False, "error": fail_reason}
+        return [], obs_bytes, entry_ws, entry_sess, "", "", {"ok": False, "error": fail_reason}
     _update_available_entry_locked(eff_dir, spool_id, {"last_accessed_at": eff_now})
-    return lines, obs_bytes, entry_ws, entry_sess, str(exp_sha or ""), None
+    return lines, obs_bytes, entry_ws, entry_sess, str(exp_sha or ""), src_sha, None
 
 
 def slice_spool(
@@ -654,7 +654,7 @@ def slice_spool(
     turn_key: str = "", turn_correlation: str = "unobserved", call_id: str = "",
 ) -> dict[str, Any]:
     """Read a bounded verified line slice from a spooled blob and emit a recovery receipt."""
-    lines, total_bytes, ws_id, eff_sess, exp_sha, err = _touch_and_load_lines(
+    lines, total_bytes, ws_id, eff_sess, exp_sha, src_sha, err = _touch_and_load_lines(
         spool_id, spool_dir, now_ts, workspace_root=workspace_root, workspace_roots=workspace_roots,
         session_id=session_id, isolation=isolation, harness=harness, receipts_path=receipts_path,
         on_reliability_failure=on_reliability_failure, turn_key=turn_key, turn_correlation=turn_correlation, call_id=call_id,
@@ -662,11 +662,17 @@ def slice_spool(
     if err is not None:
         return err
     fields, lspan, bspan = slice_verified_lines(lines, start_line, limit, end_line)
-    _emit_spool_receipt(
-        event_type="spool_recovery", spool_id=spool_id, eff_dir=spool_dir or resolve_spool_dir(),
-        receipts_path=receipts_path, harness=harness, session_id=eff_sess, workspace_id=ws_id, line_span=lspan,
-        byte_span=bspan, now_ts=now_ts, turn_key=turn_key, turn_correlation=turn_correlation, call_id=call_id, source_hash=exp_sha,
+    eff_rcpt, parent_id = _rcpt_target_and_parent(spool_id, spool_dir or resolve_spool_dir(), receipts_path)
+    rcpt = enrich_receipt(
+        build_receipt(
+            event_type="spool_recovery", harness=harness, session_id=eff_sess, workspace_id=ws_id,
+            turn_key=turn_key, call_id=call_id, spool_id=spool_id, line_span=lspan, byte_span=bspan,
+            delivery_evidence="unverified", spool_id_referenced=True, parent_event_id=parent_id,
+            timestamp=_ts_iso(now_ts), turn_correlation=turn_correlation, source_hash=src_sha or exp_sha,
+        ),
+        {"blob_sha256": exp_sha, "blob_bytes": total_bytes},
     )
+    append_receipt(rcpt, receipts_path=eff_rcpt)
     return {"ok": True, "spool_id": spool_id, "total_bytes": total_bytes, **fields}
 
 
@@ -690,19 +696,31 @@ def grep_spool(
         rx = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
     except (re.error, TypeError) as exc:
         return {"ok": False, "error": f"invalid_regex: {exc}"}
-    lines, _tb, ws_id, eff_sess, exp_sha, err = _touch_and_load_lines(
+    lines, total_bytes, ws_id, eff_sess, exp_sha, src_sha, err = _touch_and_load_lines(
         spool_id, spool_dir, now_ts, workspace_root=workspace_root, workspace_roots=workspace_roots,
         session_id=session_id, isolation=isolation, harness=harness, receipts_path=receipts_path,
         on_reliability_failure=on_reliability_failure, turn_key=turn_key, turn_correlation=turn_correlation, call_id=call_id,
     )
     if err is not None:
         return err
-    matches, truncated, lspan, bspan = grep_verified_lines(lines, rx, max_matches, context_lines)
-    _emit_spool_receipt(
-        event_type="spool_recovery", spool_id=spool_id, eff_dir=spool_dir or resolve_spool_dir(),
-        receipts_path=receipts_path, harness=harness, session_id=eff_sess, workspace_id=ws_id, line_span=lspan,
-        byte_span=bspan, now_ts=now_ts, turn_key=turn_key, turn_correlation=turn_correlation, call_id=call_id, source_hash=exp_sha,
+    matches, truncated, metrics = grep_lines_with_spans(lines, rx, max_matches, context_lines)
+    eff_rcpt, parent_id = _rcpt_target_and_parent(spool_id, spool_dir or resolve_spool_dir(), receipts_path)
+    rcpt = enrich_receipt(
+        build_receipt(
+            event_type="spool_recovery", harness=harness, session_id=eff_sess, workspace_id=ws_id,
+            turn_key=turn_key, call_id=call_id, spool_id=spool_id, line_span=metrics["line_span"], byte_span=metrics["byte_span"],
+            delivery_evidence="unverified", spool_id_referenced=True, parent_event_id=parent_id,
+            timestamp=_ts_iso(now_ts), turn_correlation=turn_correlation, source_hash=src_sha or exp_sha,
+        ),
+        {
+            "recovered_line_spans": metrics["merged_line_spans"],
+            "recovered_byte_spans": metrics["merged_byte_spans"],
+            "recovered_context_bytes": metrics["repeated_context_bytes"],
+            "blob_sha256": exp_sha,
+            "blob_bytes": total_bytes,
+        },
     )
+    append_receipt(rcpt, receipts_path=eff_rcpt)
     return {"ok": True, "spool_id": spool_id, "pattern": pattern, "match_count": len(matches), "truncated": truncated, "total_lines": len(lines), "matches": matches}
 
 

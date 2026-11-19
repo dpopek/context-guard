@@ -205,10 +205,42 @@ def test_outcomes_reconcile_returns_false_when_atomic_write_fails(
     assert outcomes.record_range_trim_regret("s-fail", canon, 5, 10, step_idx=2, ledger_path=ledger) is False
     assert outcomes.record_cli_verbose_regret("s-fail", "pytest:tests", step_idx=2, ledger_path=ledger) is False
     assert outcomes.record_spool_followup("s-fail", "sp_abc", "targeted", "none", step_idx=2, ledger_path=ledger) is False
+    assert outcomes.record_spool_followup_request(
+        "s-fail", "sp_abc", {"call_id": "c-req", "recovery": "targeted", "regret": "none", "step_idx": 2}, ledger_path=ledger
+    ) is False
     assert outcomes.record_spool_command_repeat("s-fail", "bash:pytest", step_idx=2, ledger_path=ledger) is False
     err = capsys.readouterr().err
     assert "direct outcome telemetry skipped: OSError: disk full" in err
     assert len(outcomes.load_outcomes(ledger)["open_windows"]) == 3
+
+
+def test_spool_followup_request_and_result_write_failure_leaves_window_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = tmp_path / "outcomes.json"
+    assert outcomes.record_spool_followup_request(
+        "s-miss", "sp_abc", {"call_id": "c1", "recovery": "targeted", "regret": "none", "step_idx": 1}, ledger_path=ledger
+    ) is False
+    assert outcomes.resolve_spool_followup_result("s-miss", "c1", True, ledger_path=ledger) is False
+
+    outcomes.open_outcome_window(
+        "claude", "claude-sonnet-4-6", "output_spool", "s-ok", "spool:sp_abc", step_idx=1,
+        regret_window_steps=6, ledger_path=ledger, meta={"cmd_sig": "sig1", "total_lines": 250, "call_id": "em1"},
+    )
+    assert outcomes.record_spool_followup_request(
+        "s-ok", "sp_abc", {"call_id": "c-rec", "recovery": "targeted", "regret": "none", "step_idx": 2}, ledger_path=ledger
+    ) is True
+
+    def _fail_write(*_args: object, **_kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(outcomes, "write_json_atomic", _fail_write)
+    assert outcomes.resolve_spool_followup_result("s-ok", "c-rec", True, ledger_path=ledger) is False
+    monkeypatch.undo()
+    loaded = outcomes.load_outcomes(ledger)
+    assert "s-ok|spool:sp_abc|output_spool" in loaded["open_windows"]
+    assert loaded["open_windows"]["s-ok|spool:sp_abc|output_spool"]["meta"]["p_cid"] == "c-rec"
 
 
 def test_outcomes_dual_ended_trim_spans_trigger_regret_on_tail_reread(tmp_path: Path) -> None:

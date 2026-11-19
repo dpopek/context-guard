@@ -13,12 +13,13 @@ from core.contracts import HARNESS_CAPABILITIES  # noqa: E402
 from core.platform_io import warn  # noqa: E402
 from hooks import config, file_io, harness_adapter, model_identity, policy_engine, read_planner  # noqa: E402
 from hooks import session_lifecycle, state_store, telemetry  # noqa: E402
-from hooks.outcomes import dispatch_direct_outcome, ledger_path_for, open_outcome_window, reconcile_mutation_windows, record_direct_outcome  # noqa: E402
+from hooks.outcomes import (dispatch_direct_outcome, ledger_path_for, open_outcome_window,  # noqa: E402 -- sys.path setup precedes local imports
+                            reconcile_mutation_windows, record_direct_outcome, resolve_spool_followup_result)
 from hooks.shell_output import classify_family, measure  # noqa: E402
 from hooks.telemetry import record_shell_output, record_telemetry_event  # noqa: E402
 from policies.api import PolicyPostContext  # noqa: E402
 from policies.governor import apply_runtime_governor  # noqa: E402
-from spool import receipts as spool_receipts, store as spool_store  # noqa: E402
+from spool import receipts as spool_receipts, spans as spool_spans, store as spool_store  # noqa: E402 -- sys.path setup precedes local imports
 
 _SHELL_TOOLS = {"claude": frozenset(("Bash",)), "codex": frozenset(("Bash", "shell", "exec_command", "exec")), "cursor": frozenset(("Shell", "run_terminal_cmd"))}
 _READ_TOOLS = frozenset(("Read", "NotebookRead", "read_file", "view_file"))
@@ -285,16 +286,10 @@ def handle_post_tool_use(harness: str, payload: dict[str, Any], stats_path: Path
         ws_roots = tuple(str(r) for r in raw_wr) if isinstance((raw_wr := payload.get("workspace_roots")), (list, tuple)) else None
         if ev == "PostToolUse" and out_mode in ("active", "shadow"):
             nat = isinstance((rs := payload.get("stepIdx")), int) and not isinstance(rs, bool) and rs > 0
-            tid = payload.get("turn_id") if payload.get("turn_id") is not None else payload.get("turnId")
-            snap = {} if nat else state_store.read_state_snapshot(sdir)
-            tc = ("harness_native" if (nat or (isinstance(tid, str) and bool(tid.strip())) or (isinstance(tid, int) and not isinstance(tid, bool) and tid > 0))
-                  else ("transcript_derived" if ((isinstance((lsi := snap.get("last_step_index")), int) and not isinstance(lsi, bool) and lsi >= 0)
-                                                 or any(isinstance(v, str) and bool(v.strip()) for v in (snap.get("transcript_path"), payload.get("transcript_path"), payload.get("transcriptPath"))))
-                        else "unobserved"))
-            cur_step = rs if nat else max(1, snap_s if isinstance((snap_s := snap.get("auto_step_seq")), int) and not isinstance(snap_s, bool) else 1)
+            tc, tkey = spool_spans.resolve_verified_turn_key(payload, {} if nat else state_store.read_state_snapshot(sdir), sess_id)
             spool_dec, spool_meta = spool_store.spool_post_tool_output(
                 harness, payload, mode=out_mode, session_id=sess_id, call_id=cid, workspace_root=payload.get("cwd"),
-                workspace_roots=ws_roots, turn_key=f"{sess_id}:step:{cur_step}", spool_dir=eff_spool_dir,
+                workspace_roots=ws_roots, turn_key=tkey, spool_dir=eff_spool_dir,
                 turn_correlation=tc, hook_duration_ms=round((time.perf_counter() - t0) * 1000.0, 3))
             spool_resp = harness_adapter.format_post_tool_spool_response(harness, spool_dec)
         else:
@@ -303,6 +298,11 @@ def handle_post_tool_use(harness: str, payload: dict[str, Any], stats_path: Path
                 spool_receipts.persist_spool_delivery_verification(payload, harness=harness, session_id=sess_id, workspace_root=payload.get("cwd"), workspace_roots=ws_roots, spool_dir=eff_spool_dir)
 
         batch_items = _batch_items(payload) if ev == "PostToolBatch" else []
+        for fu_item in (batch_items if ev == "PostToolBatch" else ([payload] if ev in ("PostToolUse", "PostToolUseFailure") else ())):
+            f_cid = _extract_item_call_id(fu_item)
+            rec_ok, rec_sid = spool_spans.classify_post_tool_recovery_outcome(harness, fu_item, ev, eff_spool_dir)
+            if f_cid or rec_sid:
+                resolve_spool_followup_result(sess_id, f_cid, rec_ok, spool_id=rec_sid, ledger_path=out_p)
         mut_sources = batch_items if ev == "PostToolBatch" else ([payload] if ev == "PostToolUse" else [])
         mut_paths, had_mutation = [], False
         for src_item in mut_sources:
@@ -318,7 +318,7 @@ def handle_post_tool_use(harness: str, payload: dict[str, Any], stats_path: Path
             record_telemetry_event(harness, "outputs_spooled", int(spool_meta["total_bytes"]), int(spool_meta["saved_bytes"]), stats_path=sp, event_id=cid or None)
             dispatch_direct_outcome(record_direct_outcome, harness, mod, "output_spool", "applied", out_p, session_id=sess_id, step_idx=step_idx, call_id=cid or None)
             open_outcome_window(harness, mod, "output_spool", sess_id, f"spool:{spool_meta['spool_id']}", step_idx, regret_window_steps=reg_win,
-                                ledger_path=out_p, meta={"cmd_sig": str(spool_meta.get("cmd_sig") or ""), "total_lines": int(spool_meta.get("total_lines") or 0)})
+                                ledger_path=out_p, meta={"cmd_sig": str(spool_meta.get("cmd_sig") or ""), "total_lines": int(spool_meta.get("total_lines") or 0), "call_id": cid})
         elif spool_meta is not None and out_mode == "shadow":
             telemetry.record_shadow_spool(harness, spool_meta, state_dir=sd_str, shadow_path=sh_path)
         for mod_rt, canon_rt, p_step, spans in trims:

@@ -135,8 +135,8 @@ class SpoolContractV1:
 RECEIPT_SCHEMA_VERSION: int = 1
 
 
-class ContextReceiptV1(TypedDict):
-    """Schema v1 receipt emitted on spool creation, delivery verification, recovery, and failures."""
+class _ContextReceiptV1Required(TypedDict):
+    """Required schema v1 receipt fields."""
 
     schema_version: int
     receipt_id: str
@@ -167,6 +167,16 @@ class ContextReceiptV1(TypedDict):
     spool_id_referenced: bool
     failure_kind: str | None
     reason: str | None
+
+
+class ContextReceiptV1(_ContextReceiptV1Required, total=False):
+    """Schema v1 receipt emitted on spool creation, delivery verification, recovery, and failures."""
+
+    recovered_line_spans: list[tuple[int, int]]
+    recovered_byte_spans: list[tuple[int, int]]
+    recovered_context_bytes: int
+    blob_sha256: str
+    blob_bytes: int
 
 
 @dataclass(frozen=True)

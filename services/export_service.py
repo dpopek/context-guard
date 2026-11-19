@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import stat
 import time
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -318,6 +318,73 @@ def _summarize_outcomes_v4(outcomes_path: Path) -> tuple[dict[str, int] | None, 
     }, None
 
 
+def _apply_parent_link(
+    ev: Mapping[str, Any],
+    span: dict[str, Any],
+    log_record: dict[str, Any],
+    parent_info: tuple[str, str, str],
+) -> tuple[str, str, str]:
+    p_trace, p_span, p_turn = parent_info
+    child_turn = str(ev.get("turn_key") or "").strip()
+    if child_turn and p_turn and child_turn != p_turn:
+        span.pop("parentSpanId", None)
+        span["links"] = [{
+            "traceId": p_trace,
+            "spanId": p_span,
+            "attributes": [
+                _otel_kv("context_guard.link_type", "spool_origin"),
+                _otel_kv("context_guard.spool_id", scrub_string(str(ev.get("spool_id") or ""))),
+            ],
+        }]
+        return str(span["traceId"]), str(span["spanId"]), child_turn
+    span["traceId"] = p_trace
+    span["parentSpanId"] = p_span
+    log_record["traceId"], log_record["spanId"] = p_trace, span["spanId"]
+    return p_trace, str(span["spanId"]), (child_turn or p_turn)
+
+
+def _resolve_parent_correlations(
+    deduped: list[dict[str, Any]],
+    spans: list[dict[str, Any]],
+    log_records: list[dict[str, Any]],
+) -> None:
+    by_event_id: dict[str, int] = {}
+    by_receipt_id: dict[str, int] = {}
+    node_state: list[tuple[str, str, str]] = []
+    for idx, (ev, sp) in enumerate(zip(deduped, spans)):
+        if eid := str(ev.get("event_id") or "").strip():
+            by_event_id[eid] = idx
+        if rid := str(ev.get("receipt_id") or "").strip():
+            by_receipt_id[rid] = idx
+        node_state.append((str(sp["traceId"]), str(sp["spanId"]), str(ev.get("turn_key") or "").strip()))
+
+    parent_indices: list[int | None] = []
+    for idx, ev in enumerate(deduped):
+        p_raw = str(ev.get("parent_event_id") or "").strip()
+        found_idx = (by_event_id.get(p_raw) if p_raw in by_event_id else by_receipt_id.get(p_raw)) if p_raw else None
+        parent_indices.append(None if found_idx == idx else found_idx)
+
+    resolved: set[int] = set()
+    for start in range(len(deduped)):
+        if start in resolved:
+            continue
+        path: list[int] = []
+        seen_pos: dict[int, int] = {}
+        cur: int | None = start
+        while cur is not None and cur not in resolved and cur not in seen_pos:
+            seen_pos[cur] = len(path)
+            path.append(cur)
+            cur = parent_indices[cur]
+        if cur is not None and cur in seen_pos:
+            cyc_start = seen_pos[cur]
+            resolved.update(path[cyc_start:])
+            path = path[:cyc_start]
+        for node in reversed(path):
+            if (par := parent_indices[node]) is not None:
+                node_state[node] = _apply_parent_link(deduped[node], spans[node], log_records[node], node_state[par])
+            resolved.add(node)
+
+
 def _error_bundle(error: str) -> dict[str, Any]:
     return {
         "schema_version": OTEL_EXPORT_SCHEMA_VERSION,
@@ -374,6 +441,7 @@ def build_otel_export_bundle(
     scope_obj = {"name": "context-guard.exporter", "version": version}
     pairs = [_build_event_otel_pair(ev) for ev in deduped]
     spans, log_records = [p[0] for p in pairs], [p[1] for p in pairs]
+    _resolve_parent_correlations(deduped, spans, log_records)
 
     now_ns = str(max(0, int(round(eff_now * 1_000_000_000))))
     if outcomes_summary is not None:
@@ -495,6 +563,138 @@ def validate_endpoint_url(endpoint: str) -> str | None:
     return None if (parsed.scheme.lower() in ("http", "https") and bool(parsed.netloc)) else "invalid_endpoint_scheme"
 
 
+_SIGNAL_REJECT_KEYS: dict[str, tuple[str, str]] = {
+    "traces": ("rejectedSpans", "rejected_spans"),
+    "logs": ("rejectedLogRecords", "rejected_log_records"),
+    "metrics": ("rejectedDataPoints", "rejected_data_points"),
+}
+_OTLP_SIGNAL_KEYS: tuple[tuple[str, str], ...] = (
+    ("traces", "resourceSpans"),
+    ("logs", "resourceLogs"),
+    ("metrics", "resourceMetrics"),
+)
+
+
+def _signal_endpoint_url(clean_ep: str, signal: str) -> str:
+    parsed = urllib.parse.urlparse(clean_ep.strip())
+    path = parsed.path.rstrip("/")
+    for suffix in ("/v1/traces", "/v1/logs", "/v1/metrics"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    return urllib.parse.urlunparse(
+        (parsed.scheme, parsed.netloc, f"{path}/v1/{signal}", parsed.params, parsed.query, parsed.fragment)
+    )
+
+
+@runtime_checkable
+class _ContextResponse(Protocol):
+    def __enter__(self) -> Any: ...
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> Any: ...
+
+
+@runtime_checkable
+class _StatusResponse(Protocol):
+    status: Any
+
+
+@runtime_checkable
+class _CodeResponse(Protocol):
+    code: Any
+
+
+@runtime_checkable
+class _ReadableResponse(Protocol):
+    def read(self) -> Any: ...
+
+
+def _extract_status_and_body(obj: Any) -> tuple[int, bytes]:
+    status_code: int | None = None
+    if isinstance(obj, _StatusResponse) and isinstance(obj.status, int) and not isinstance(obj.status, bool):
+        status_code = obj.status
+    if (
+        status_code is None
+        and isinstance(obj, _CodeResponse)
+        and isinstance(obj.code, int)
+        and not isinstance(obj.code, bool)
+    ):
+        status_code = obj.code
+    body = b""
+    if isinstance(obj, _ReadableResponse):
+        raw_body = obj.read()
+        if isinstance(raw_body, (bytes, bytearray)):
+            body = bytes(raw_body)
+        elif isinstance(raw_body, str):
+            body = raw_body.encode("utf-8")
+    return (status_code if status_code is not None else 200), body
+
+
+def _read_response_status_and_body(resp: Any) -> tuple[int, bytes]:
+    if isinstance(resp, _ContextResponse):
+        with resp as ctx_resp:
+            return _extract_status_and_body(ctx_resp)
+    return _extract_status_and_body(resp)
+
+
+def _parse_rejected_count(raw: Any) -> int:
+    if isinstance(raw, bool):
+        return 0
+    if isinstance(raw, int):
+        return raw if raw > 0 else 0
+    if isinstance(raw, str) and (st := raw.strip()).isascii() and st.isdigit():
+        return int(st)
+    return 0
+
+
+def _parse_otlp_partial_success(body: bytes, signal: str) -> tuple[int, str]:
+    if not body or not body.strip():
+        return 0, ""
+    try:
+        doc = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return 0, ""
+    if not isinstance(doc, Mapping):
+        return 0, ""
+    partial = doc.get("partialSuccess") if doc.get("partialSuccess") is not None else doc.get("partial_success")
+    if not isinstance(partial, Mapping):
+        return 0, ""
+    camel_key, snake_key = _SIGNAL_REJECT_KEYS.get(signal, ("", ""))
+    raw_rej = partial[camel_key] if (camel_key and camel_key in partial and partial[camel_key] is not None) else partial.get(snake_key)
+    raw_msg = partial.get("errorMessage") if partial.get("errorMessage") is not None else partial.get("error_message")
+    err_msg = scrub_string(raw_msg.strip()) if isinstance(raw_msg, str) and raw_msg.strip() else ""
+    return _parse_rejected_count(raw_rej), err_msg
+
+
+def _collect_signal_payloads(bundle: Mapping[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    return [
+        (sig, {key: list(raw)})
+        for sig, key in _OTLP_SIGNAL_KEYS
+        if isinstance((raw := bundle.get(key)), (list, tuple)) and len(raw) > 0
+    ]
+
+
+def _post_signal_request(
+    sig_url: str,
+    payload: Mapping[str, Any],
+    eff_timeout: float,
+    transport_fn: Callable[..., Any] | None,
+) -> tuple[int, bytes, dict[str, Any] | None]:
+    req = urllib.request.Request(
+        sig_url, data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        resp = transport_fn(req, timeout=eff_timeout) if transport_fn is not None else urllib.request.urlopen(req, timeout=eff_timeout)
+        status_code, body = _read_response_status_and_body(resp)
+    except urllib.error.HTTPError as exc:
+        return 0, b"", {"ok": False, "error": "otel_post_failed", "status_code": int(exc.code), "detail": scrub_string(f"HTTPError {exc.code}: {exc.reason}")}
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        return 0, b"", {"ok": False, "error": "otel_post_failed", "detail": scrub_string(f"{type(exc).__name__}: {exc}")}
+    if status_code < 200 or status_code >= 300:
+        return status_code, body, {"ok": False, "error": "otel_post_failed", "status_code": status_code, "detail": f"HTTP {status_code}"}
+    return status_code, body, None
+
+
 def post_otel_http(
     bundle: Mapping[str, Any],
     endpoint: str,
@@ -502,7 +702,7 @@ def post_otel_http(
     timeout_seconds: float = 5.0,
     transport_fn: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
-    """Send an opt-in OTLP/JSON HTTP(S) POST with strict URL scheme and timeout bounds."""
+    """Send opt-in signal-separated OTLP/JSON HTTP(S) POSTs with partialSuccess handling."""
     clean_ep = endpoint.strip()
     if (scheme_err := validate_endpoint_url(clean_ep)) is not None:
         return {"ok": False, "error": scheme_err, "detail": "Endpoint must be a valid http:// or https:// URL"}
@@ -510,34 +710,38 @@ def post_otel_http(
         return {"ok": False, "error": str(bundle.get("error") or "invalid_bundle")}
     raw_to = float(timeout_seconds) if isinstance(timeout_seconds, (int, float)) and not isinstance(timeout_seconds, bool) else 5.0
     eff_timeout = min(30.0, max(0.5, raw_to if math.isfinite(raw_to) else 5.0))
-    req = urllib.request.Request(
-        clean_ep,
-        data=json.dumps(bundle, separators=(",", ":")).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        resp = transport_fn(req, timeout=eff_timeout) if transport_fn is not None else urllib.request.urlopen(req, timeout=eff_timeout)
-        if hasattr(resp, "__enter__"):
-            with resp as ctx_resp:
-                status_code = int(getattr(ctx_resp, "status", None) or getattr(ctx_resp, "code", None) or 200)
-        else:
-            status_code = int(getattr(resp, "status", None) or getattr(resp, "code", None) or 200)
-    except urllib.error.HTTPError as exc:
+    exported_events = int(bundle.get("exported_events", 0) or 0)
+    signal_payloads = _collect_signal_payloads(bundle)
+    if not signal_payloads:
         return {
-            "ok": False,
-            "error": "otel_post_failed",
-            "status_code": int(exc.code),
-            "detail": scrub_string(f"HTTPError {exc.code}: {exc.reason}"),
+            "ok": True, "error": None, "status_code": None, "exported_events": 0,
+            "timeout_seconds": eff_timeout, "partial_success": False, "rejected_total": 0, "signals": {},
         }
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
-        return {"ok": False, "error": "otel_post_failed", "detail": scrub_string(f"{type(exc).__name__}: {exc}")}
-    if status_code < 200 or status_code >= 300:
-        return {"ok": False, "error": "otel_post_failed", "status_code": status_code, "detail": f"HTTP {status_code}"}
-    return {
-        "ok": True,
-        "error": None,
-        "status_code": status_code,
-        "exported_events": int(bundle.get("exported_events", 0) or 0),
-        "timeout_seconds": eff_timeout,
-    }
+    signals: dict[str, dict[str, Any]] = {}
+    warnings: list[str] = []
+    reject_msgs: list[str] = []
+    rejected_total = 0
+    first_reject_status: int | None = None
+    last_status = 200
+    for signal, payload in signal_payloads:
+        sig_url = _signal_endpoint_url(clean_ep, signal)
+        status_code, body, err_res = _post_signal_request(sig_url, payload, eff_timeout, transport_fn)
+        if err_res is not None:
+            return {**err_res, "signals": signals} if signals else err_res
+        last_status = status_code
+        rejected, err_msg = _parse_otlp_partial_success(body, signal)
+        signals[signal] = {"url": scrub_string(sig_url), "status_code": status_code, "rejected": rejected, "error_message": err_msg}
+        if rejected > 0:
+            rejected_total += rejected
+            first_reject_status = status_code if first_reject_status is None else first_reject_status
+            if err_msg:
+                reject_msgs.append(err_msg)
+        elif err_msg:
+            warnings.append(f"{signal}: {err_msg}")
+    base: dict[str, Any] = {"exported_events": exported_events, "timeout_seconds": eff_timeout, "signals": signals}
+    if warnings:
+        base["warnings"] = warnings
+    if rejected_total > 0:
+        detail = "; ".join(reject_msgs) if reject_msgs else f"OTLP collector rejected {rejected_total} items"
+        return {"ok": False, "error": "otel_partial_success", "partial_success": True, "rejected_total": rejected_total, "status_code": first_reject_status, "detail": detail, **base}
+    return {"ok": True, "error": None, "status_code": last_status, "partial_success": False, "rejected_total": 0, **base}

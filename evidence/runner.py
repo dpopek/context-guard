@@ -25,7 +25,10 @@ from evidence.ledger import (
     run_cursor_cli_conformance,
     run_governor_release_gates,
 )
-from evidence.metrics import compute_arm_summary, compute_paired_comparison, plan_evaluation_matrix
+from evidence.metrics import (
+    compute_arm_summary, compute_paired_comparison, plan_evaluation_matrix,
+    resolve_campaign_required_arms, validate_campaign_plan_completeness,
+)
 from hooks import config as hooks_config, outcomes
 from hooks.policy_engine import PolicyPackLoadError
 from policies.api import EVIDENCE_SCHEMA_VERSION, EvidenceContractV1, VALID_EVAL_TIERS
@@ -60,9 +63,9 @@ _UNPINNED_SENTINELS = frozenset({"unpinned", "latest", "auto", "unknown"})
 _ISO_ENV_KEYS = ("CONTEXT_GUARD_HOME", "CONTEXT_GUARD_STATE_DIR", "CONTEXT_GUARD_SPOOL_DIR", "CONTEXT_GUARD_CONFIG_PATH", "CONTEXT_GUARD_WORKSPACE_ROOT")
 
 __all__ = [
-    "DEFAULT_BENCHMARK_TASKS", "evaluate_campaign_runs", "execute_isolated_campaign",
-    "plan_isolated_campaign", "run_explainability_hardening_gate", "run_offline_evidence_replay",
-    "verify_campaign_controls",
+    "DEFAULT_BENCHMARK_TASKS", "evaluate_campaign_runs", "evaluate_runs_file_bundle",
+    "execute_isolated_campaign", "plan_isolated_campaign", "run_explainability_hardening_gate",
+    "run_offline_evidence_replay", "verify_campaign_controls",
 ]
 
 
@@ -280,6 +283,71 @@ def _derive_budget_contract(runs: Sequence[Mapping[str, Any]], explicit: Mapping
     return {"total_runs": len(runs)}
 
 
+def _evaluate_runs_with_plan(
+    runs: Sequence[Mapping[str, Any]], plan: Mapping[str, Any] | None, opts: Mapping[str, Any]
+) -> EvidenceContractV1:
+    tier = str(opts.get("tier") or "")
+    if tier not in VALID_EVAL_TIERS:
+        raise ValueError(f"Unsupported evaluation tier: {tier!r}")
+    clean_harness = _clean_text(opts.get("harness_id")).lower() or "unknown"
+    clean_build, clean_model = _clean_text(opts.get("harness_build_id")) or "unavailable", _clean_text(opts.get("model_id")) or "unknown"
+    raw_seed, raw_iters = opts.get("seed"), opts.get("bootstrap_iters")
+    seed = int(raw_seed) if isinstance(raw_seed, int) and not isinstance(raw_seed, bool) else 42
+    bootstrap_iters = int(raw_iters) if isinstance(raw_iters, int) and not isinstance(raw_iters, bool) else 1000
+    rt_cfg = rc if isinstance((rc := opts.get("runtime_cfg")), Mapping) else None
+    rt_ver = rv if isinstance((rv := opts.get("runtime_verifications")), Mapping) else None
+    bud = bc if isinstance((bc := opts.get("budget_contract")), Mapping) else None
+    env_meta = collect_environment_metadata(clean_harness, model_id=clean_model, harness_build_id=clean_build, runtime_cfg=rt_cfg, runtime_verifications=rt_ver)
+    by_arm: dict[str, list[Mapping[str, Any]]] = {}
+    for raw in runs:
+        if isinstance(raw, Mapping):
+            by_arm.setdefault(_clean_text(raw.get("arm")) or "unknown", []).append(raw)
+    required_arms = resolve_campaign_required_arms(tier, plan)
+    arms = list(dict.fromkeys([*required_arms, *by_arm.keys()]))
+    controls = verify_campaign_controls(runs, expected_arms=required_arms)
+    arm_summaries = {a: compute_arm_summary(a, by_arm.get(a, ()), seed=seed, bootstrap_iters=bootstrap_iters) for a in arms}
+    cursor_gate = run_cursor_cli_conformance() if (clean_harness == "cursor" and bool(opts.get("run_cursor_gate"))) else None
+    cursor_ok = True if cursor_gate is None else bool(cursor_gate.get("admitted"))
+
+    paired_comparisons: list[dict[str, Any]] = []
+    if len(by_arm) >= 2:
+        obs_arms = list(by_arm.keys())
+        base_arm = "baseline" if "baseline" in by_arm else obs_arms[0]
+        for treat_arm in obs_arms:
+            if treat_arm == base_arm:
+                continue
+            cmp_res = compute_paired_comparison(base_arm, treat_arm, by_arm[base_arm], by_arm[treat_arm], seed=seed, bootstrap_iters=bootstrap_iters)
+            if not cursor_ok:
+                cmp_res["comparisons_blocked"] = True
+            paired_comparisons.append(cmp_res)
+
+    plan_check = validate_campaign_plan_completeness(runs, tier, arm_summaries, paired_comparisons, plan=plan)
+    disclosed = [item for a in arms for item in (arm_summaries[a].get("disclosed_failures") or ())]
+    viol_count = sum(len(arm_summaries[a].get("contract_violations") or ()) for a in arms)
+    all_defined = bool(runs) and all(arm_summaries[a].get("cost_per_passed_run_status") == "defined" for a in arms)
+    stat_proof = bool(tier == "release_evaluation" and controls["ok"] and plan_check["ok"] and plan_check["uncertainty_proof_ok"] and all_defined and viol_count == 0 and cursor_ok)
+    verdict_ok = bool(controls["ok"] and plan_check["ok"] and runs and cursor_ok and all_defined and viol_count == 0)
+    uncertainty = {
+        "statistical_proof": stat_proof, "uncertainty_proof_ok": plan_check["uncertainty_proof_ok"], "method": "wilson_95_and_task_cluster_bootstrap",
+        "per_arm": {a: {k: arm_summaries[a][k] for k in ("pass_rate_ci_95", "pass_rate_cluster_ci_95", "cost_per_passed_run_ci_95")} for a in arms},
+        "paired_deltas": [{"baseline_arm": p["baseline_arm"], "treatment_arm": p["treatment_arm"], "cost_per_passed_run_delta_ci_95": p["unconditional"]["cost_per_passed_run_delta_ci_95"]} for p in paired_comparisons],
+    }
+    verdict: dict[str, Any] = {
+        "ok": verdict_ok, "tier": tier, "statistical_proof": stat_proof, "controls": controls,
+        "plan_completeness": plan_check, "all_arms_defined": all_defined, "contract_violation_count": viol_count,
+    }
+    if cursor_gate is not None:
+        verdict["cursor_conformance"] = cursor_gate
+    return EvidenceContractV1(
+        schema_version=EVIDENCE_SCHEMA_VERSION, campaign_id=str(opts.get("campaign_id") or f"{tier}_campaign"),
+        tier=tier, generated_at=utc_now_iso_z(), statistical_proof=stat_proof,
+        trajectory_claim=_trajectory_claim_for(tier, stat_proof), environment=env_meta, arms=arms,
+        budget_contract=_derive_budget_contract(runs, bud), arm_summaries=arm_summaries,
+        paired_comparisons=paired_comparisons, disclosed_failures=disclosed,
+        uncertainty_bounds=uncertainty, gate_verdict=verdict,
+    )
+
+
 def evaluate_campaign_runs(
     runs: Sequence[Mapping[str, Any]], *, campaign_id: str, tier: str, harness_id: str,
     harness_build_id: str = "unavailable", model_id: str = "unknown",
@@ -288,65 +356,28 @@ def evaluate_campaign_runs(
     run_cursor_gate: bool = False,
 ) -> EvidenceContractV1:
     """Verify controls and compute EvidenceContractV1 metrics for a set of campaign runs."""
-    if tier not in VALID_EVAL_TIERS:
-        raise ValueError(f"Unsupported evaluation tier: {tier!r}")
-    clean_harness = _clean_text(harness_id).lower() or "unknown"
-    clean_build = _clean_text(harness_build_id) or "unavailable"
-    clean_model = _clean_text(model_id) or "unknown"
-    env_meta = collect_environment_metadata(
-        clean_harness, model_id=clean_model, harness_build_id=clean_build,
-        runtime_cfg=runtime_cfg, runtime_verifications=runtime_verifications,
-    )
-    by_arm: dict[str, list[Mapping[str, Any]]] = {}
-    for raw in runs:
-        if isinstance(raw, Mapping):
-            by_arm.setdefault(_clean_text(raw.get("arm")) or "unknown", []).append(raw)
-    arms = list(by_arm.keys()) or (["baseline", "context_guard"] if tier != "release_evaluation" else ["baseline", "context_guard", "context_guard_rtk"])
-    controls = verify_campaign_controls(runs, expected_arms=arms if len(by_arm) >= 2 else None)
-    arm_summaries = {a: compute_arm_summary(a, by_arm.get(a, ()), seed=seed, bootstrap_iters=bootstrap_iters) for a in arms}
-    cursor_gate = run_cursor_cli_conformance() if (clean_harness == "cursor" and run_cursor_gate) else None
-    cursor_ok = True if cursor_gate is None else bool(cursor_gate.get("admitted"))
+    return _evaluate_runs_with_plan(runs, None, {
+        "campaign_id": campaign_id, "tier": tier, "harness_id": harness_id,
+        "harness_build_id": harness_build_id, "model_id": model_id, "runtime_cfg": runtime_cfg,
+        "runtime_verifications": runtime_verifications, "budget_contract": budget_contract,
+        "seed": seed, "bootstrap_iters": bootstrap_iters, "run_cursor_gate": run_cursor_gate,
+    })
 
-    paired_comparisons: list[dict[str, Any]] = []
-    if len(by_arm) >= 2:
-        base_arm = "baseline" if "baseline" in by_arm else arms[0]
-        for treat_arm in arms:
-            if treat_arm == base_arm:
-                continue
-            cmp_res = compute_paired_comparison(base_arm, treat_arm, by_arm[base_arm], by_arm[treat_arm], seed=seed, bootstrap_iters=bootstrap_iters)
-            if not cursor_ok:
-                cmp_res["comparisons_blocked"] = True
-            paired_comparisons.append(cmp_res)
 
-    disclosed = [item for a in arms for item in (arm_summaries[a].get("disclosed_failures") or ())]
-    viol_count = sum(len(arm_summaries[a].get("contract_violations") or ()) for a in arms)
-    all_defined = bool(runs) and all(arm_summaries[a].get("cost_per_passed_run_status") == "defined" for a in arms)
-    stat_proof = (tier == "release_evaluation" and bool(controls["ok"]) and len(by_arm) >= 2 and all_defined and viol_count == 0 and cursor_ok)
-    uncertainty = {
-        "statistical_proof": stat_proof, "method": "wilson_95_and_task_cluster_bootstrap",
-        "per_arm": {a: {k: arm_summaries[a][k] for k in ("pass_rate_ci_95", "pass_rate_cluster_ci_95", "cost_per_passed_run_ci_95")} for a in arms},
-        "paired_deltas": [
-            {
-                "baseline_arm": p["baseline_arm"],
-                "treatment_arm": p["treatment_arm"],
-                "cost_per_passed_run_delta_ci_95": p["unconditional"]["cost_per_passed_run_delta_ci_95"],
-            }
-            for p in paired_comparisons
-        ],
-    }
-    verdict_ok = bool(controls["ok"]) and bool(runs) and cursor_ok and all_defined and viol_count == 0
-    verdict: dict[str, Any] = {
-        "ok": verdict_ok, "tier": tier, "statistical_proof": stat_proof, "controls": controls,
-        "all_arms_defined": all_defined, "contract_violation_count": viol_count,
-    }
-    if cursor_gate is not None:
-        verdict["cursor_conformance"] = cursor_gate
-    return EvidenceContractV1(
-        schema_version=EVIDENCE_SCHEMA_VERSION, campaign_id=str(campaign_id), tier=tier, generated_at=utc_now_iso_z(),
-        statistical_proof=stat_proof, trajectory_claim=_trajectory_claim_for(tier, stat_proof), environment=env_meta,
-        arms=arms, budget_contract=_derive_budget_contract(runs, budget_contract), arm_summaries=arm_summaries,
-        paired_comparisons=paired_comparisons, disclosed_failures=disclosed, uncertainty_bounds=uncertainty, gate_verdict=verdict,
-    )
+def evaluate_runs_file_bundle(
+    runs: Sequence[Mapping[str, Any]], meta: Mapping[str, Any], tier: str, *, harness_override: str = ""
+) -> EvidenceContractV1:
+    """Evaluate a loaded `--runs-file` bundle against independent tier rules or its embedded `plan`."""
+    m: Mapping[str, Any] = meta if isinstance(meta, Mapping) else {}
+    plan = raw_p if isinstance((raw_p := m.get("plan")), Mapping) else None
+    eff_harness = _clean_text(m.get("harness_id") or harness_override) or "claude"
+    return _evaluate_runs_with_plan(runs, plan, {
+        "campaign_id": str(m.get("campaign_id") or f"{tier}_runs_file"), "tier": tier, "harness_id": eff_harness,
+        "harness_build_id": str(m.get("harness_build_id") or "unavailable"), "model_id": str(m.get("model_id") or "unknown"),
+        "runtime_cfg": m.get("runtime_cfg"), "runtime_verifications": m.get("runtime_verifications"),
+        "budget_contract": m.get("budget_contract"), "seed": m.get("seed"),
+        "run_cursor_gate": eff_harness.lower() == "cursor",
+    })
 
 
 def run_offline_evidence_replay(
@@ -438,12 +469,13 @@ def run_offline_evidence_replay(
                 rec["cache_attribution_status"] = "excluded_missing_telemetry"
             synth_runs.append(rec)
 
-    report = evaluate_campaign_runs(
-        synth_runs, campaign_id=f"offline_replay_{clean_harness}_s{eff_seed}", tier="offline_replay",
-        harness_id=clean_harness, harness_build_id=clean_build, model_id=clean_model, runtime_cfg={},
-        budget_contract={**_DEFAULT_BUDGET, "task_count": len(tasks), "repeats": 1, "total_runs": len(synth_runs)},
-        seed=eff_seed, bootstrap_iters=200, run_cursor_gate=False,
-    )
+    offline_plan = {"tier": "offline_replay", "arms": ["baseline", "context_guard"], "tasks": tasks, "repeats": 1}
+    report = _evaluate_runs_with_plan(synth_runs, offline_plan, {
+        "campaign_id": f"offline_replay_{clean_harness}_s{eff_seed}", "tier": "offline_replay",
+        "harness_id": clean_harness, "harness_build_id": clean_build, "model_id": clean_model,
+        "runtime_cfg": {}, "budget_contract": {**_DEFAULT_BUDGET, "task_count": len(tasks), "repeats": 1, "total_runs": len(synth_runs)},
+        "seed": eff_seed, "bootstrap_iters": 200, "run_cursor_gate": False,
+    })
     report["environment"] = env_meta
     report["statistical_proof"] = False
     report["trajectory_claim"] = _OFFLINE_CLAIM
@@ -546,12 +578,12 @@ def _run_in_workspace_base(
     eff_model = _clean_text(env_in.get("model_id") or first.get("model_id")) or "unknown"
     raw_budget = plan.get("budget_contract")
     eff_budget: Mapping[str, Any] | None = raw_budget if isinstance(raw_budget, Mapping) else None
-    return evaluate_campaign_runs(
-        collected, campaign_id=campaign_id, tier=str(plan["tier"]), harness_id=eff_harness,
-        harness_build_id=eff_build, model_id=eff_model, runtime_cfg=runtime_cfg,
-        runtime_verifications=runtime_verifications, budget_contract=eff_budget,
-        seed=seed, bootstrap_iters=bootstrap_iters, run_cursor_gate=(eff_harness == "cursor"),
-    )
+    return _evaluate_runs_with_plan(collected, plan, {
+        "campaign_id": campaign_id, "tier": str(plan["tier"]), "harness_id": eff_harness,
+        "harness_build_id": eff_build, "model_id": eff_model, "runtime_cfg": runtime_cfg,
+        "runtime_verifications": runtime_verifications, "budget_contract": eff_budget,
+        "seed": seed, "bootstrap_iters": bootstrap_iters, "run_cursor_gate": eff_harness == "cursor",
+    })
 
 
 def execute_isolated_campaign(

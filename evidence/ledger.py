@@ -315,12 +315,13 @@ def ingest_context_receipts(
                 continue
             try:
                 obj = json.loads(line)
-                if isinstance(obj, dict):
-                    parsed_events.append(obj)
-                else:
-                    corrupt_lines += 1
             except ValueError:
                 corrupt_lines += 1
+                continue
+            if not isinstance(obj, dict):
+                corrupt_lines += 1
+            elif obj.get("_meta") != "receipts_rotation":
+                parsed_events.append(obj)
     baseline: dict[str, Any] | None = None
     if eff_outcomes is not None:
         out_bytes, out_err = _read_regular_bytes(eff_outcomes)
@@ -494,7 +495,11 @@ def collect_environment_metadata(
 
 
 def _cursor_error(error: str) -> dict[str, Any]:
-    return {"ok": False, "harness_id": "cursor", "admitted": False, "comparisons_blocked": True, "cache_attribution_status": "excluded_missing_telemetry", "error": error}
+    return {
+        "ok": False, "harness_id": "cursor", "admitted": False, "comparisons_blocked": True,
+        "cache_attribution_status": "excluded_missing_telemetry", "verification_scope": "adapter_contract_only",
+        "adapter_conformance_passed": False, "live_client_executed": False, "runtime_verified": False, "error": error,
+    }
 
 
 def _run_cursor_conformance_in_dir(root: Path) -> dict[str, Any]:
@@ -578,7 +583,9 @@ def _run_cursor_conformance_in_dir(root: Path) -> dict[str, Any]:
     all_passed = all(checks.values())
     return {
         "ok": all_passed, "harness_id": "cursor", "admitted": all_passed, "comparisons_blocked": not all_passed,
-        "cache_attribution_status": "excluded_missing_telemetry", "hook_config_fingerprint": fingerprint,
+        "cache_attribution_status": "excluded_missing_telemetry", "verification_scope": "adapter_contract_only",
+        "adapter_conformance_passed": all_passed, "live_client_executed": False, "runtime_verified": False,
+        "hook_config_fingerprint": fingerprint,
         "harness_output_capabilities": {
             "can_replace_tool_output": bool(caps.can_replace_tool_output) if caps is not None else False,
             "has_native_fail_closed_hook": bool(caps.has_native_fail_closed_hook) if caps is not None else False,

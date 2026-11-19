@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 from email.message import Message
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -22,7 +23,7 @@ from services import export_service
 from evidence.ledger import append_durable_events
 from hooks.outcomes import record_direct_outcome
 from spool.receipts import append_receipt, build_receipt
-from spool.store import spool_tool_output
+from spool.store import slice_spool, spool_tool_output
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -542,13 +543,41 @@ def test_otel_export_http_post_scheme_validation_and_transport_handling(
         return _FakeResponse(202)
 
     low_to = export_service.post_otel_http(bundle, "https://collector.example.com/v1/traces", timeout_seconds=0.05, transport_fn=_ok_transport)
-    high_to = export_service.post_otel_http(bundle, "http://127.0.0.1:4318/v1/traces", timeout_seconds=120.0, transport_fn=_ok_transport)
+    high_to = export_service.post_otel_http(bundle, "http://127.0.0.1:4318/v1/traces?token=dev", timeout_seconds=120.0, transport_fn=_ok_transport)
     assert low_to["ok"] is True and low_to["status_code"] == 202 and low_to["timeout_seconds"] == 0.5
     assert high_to["ok"] is True and high_to["timeout_seconds"] == 30.0
-    assert len(captured_calls) == 2
-    assert captured_calls[0][1] == "POST"
-    assert captured_calls[0][2] == "application/json"
-    assert captured_calls[0][4]["exported_events"] == 1
+    assert [c[0] for c in captured_calls] == [
+        "https://collector.example.com/v1/traces",
+        "https://collector.example.com/v1/logs",
+        "http://127.0.0.1:4318/v1/traces?token=dev",
+        "http://127.0.0.1:4318/v1/logs?token=dev",
+    ]
+    assert captured_calls[0][1] == "POST" and captured_calls[0][2] == "application/json"
+    assert set(captured_calls[0][4]) == {"resourceSpans"}
+    assert set(captured_calls[1][4]) == {"resourceLogs"}
+    for call_row in captured_calls:
+        assert not (set(call_row[4]) & {"schema_version", "ok", "exported_events", "privacy_scrubbed"})
+
+    empty_res = export_service.post_otel_http(
+        export_service.build_otel_export_bundle(receipts_path=tmp_path / "missing.jsonl"),
+        "https://collector.example.com",
+        transport_fn=_never_called,
+    )
+    assert empty_res["ok"] is True and empty_res["status_code"] is None and empty_res["signals"] == {}
+    assert called_urls == []
+
+    outcomes_path = tmp_path / "outcomes.json"
+    record_direct_outcome("codex", "gpt-5", "output_spool", "applied", outcomes_path, session_id="s_m", step_idx=1, call_id="c_m")
+    metrics_bundle = export_service.build_otel_export_bundle(receipts_path=receipts_path, outcomes_path=outcomes_path)
+    captured_calls.clear()
+    m_res = export_service.post_otel_http(metrics_bundle, "https://collector.example.com/", transport_fn=_ok_transport)
+    assert m_res["ok"] is True and set(m_res["signals"]) == {"traces", "logs", "metrics"}
+    assert [c[0] for c in captured_calls] == [
+        "https://collector.example.com/v1/traces",
+        "https://collector.example.com/v1/logs",
+        "https://collector.example.com/v1/metrics",
+    ]
+    assert set(captured_calls[2][4]) == {"resourceMetrics"}
 
     def _err_url(req: urllib.request.Request, timeout: float = 5.0) -> _FakeResponse:
         raise urllib.error.URLError("TLS cert missing at /Users/alice/.certs/client.pem")
@@ -572,6 +601,144 @@ def test_otel_export_http_post_scheme_validation_and_transport_handling(
     net_fail_out = json.loads(capsys.readouterr().out)
     assert net_fail_out["error"] == "otel_post_failed"
     assert "/Users/alice" not in json.dumps(net_fail_out)
+
+
+def test_otel_export_http_partial_success_and_warnings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    receipts_path = tmp_path / "receipts.jsonl"
+    outcomes_path = tmp_path / "outcomes.json"
+    assert append_receipt(build_receipt(
+        event_type="spool_created", harness="codex", session_id="sess_ps", workspace_id="ws_1234567890abcdef",
+        turn_key="t_ps", call_id="c_ps", spool_id="sp_1234567890ab", line_span=(1, 10), byte_span=(0, 300),
+        delivery_evidence="replacement_emitted", spool_id_referenced=False, event_id="ev_ps_00000000001",
+    ), receipts_path)
+    record_direct_outcome("codex", "gpt-5", "output_spool", "applied", outcomes_path, session_id="s_ps", step_idx=1, call_id="c_ps")
+    bundle = export_service.build_otel_export_bundle(receipts_path=receipts_path)
+    full_bundle = export_service.build_otel_export_bundle(receipts_path=receipts_path, outcomes_path=outcomes_path)
+
+    class _JsonResponse:
+        def __init__(self, payload: dict[str, Any], status: int = 200) -> None:
+            self.status, self._raw = status, json.dumps(payload).encode("utf-8")
+        def read(self) -> bytes: return self._raw
+        def __enter__(self) -> _JsonResponse: return self
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None: return None
+
+    seen_urls: list[str] = []
+
+    def _reject_spans(req: urllib.request.Request, timeout: float = 5.0) -> _JsonResponse:
+        seen_urls.append(req.full_url)
+        if req.full_url.endswith("/v1/traces"):
+            return _JsonResponse({"partialSuccess": {"rejectedSpans": 2, "errorMessage": "invalid attr /Users/alice/x"}})
+        return _JsonResponse({})
+
+    ps_res = export_service.post_otel_http(bundle, "https://collector.example.com", transport_fn=_reject_spans)
+    assert ps_res["ok"] is False and ps_res["error"] == "otel_partial_success"
+    assert ps_res["partial_success"] is True and ps_res["rejected_total"] == 2 and ps_res["status_code"] == 200
+    assert "invalid attr" in ps_res["detail"] and "/Users/alice" not in ps_res["detail"]
+    assert seen_urls == ["https://collector.example.com/v1/traces", "https://collector.example.com/v1/logs"]
+
+    monkeypatch.setattr(urllib.request, "urlopen", _reject_spans)
+    rc_ps = cg_export.main(["--otel", "--receipts-path", str(receipts_path), "--endpoint", "https://collector.example.com"])
+    assert rc_ps == 1
+    assert json.loads(capsys.readouterr().out)["error"] == "otel_partial_success"
+
+    def _reject_logs_and_metrics(req: urllib.request.Request, timeout: float = 5.0) -> _JsonResponse:
+        if req.full_url.endswith("/v1/logs"):
+            return _JsonResponse({"partial_success": {"rejected_log_records": "1"}})
+        if req.full_url.endswith("/v1/metrics"):
+            return _JsonResponse({"partialSuccess": {"rejectedDataPoints": "3"}})
+        return _JsonResponse({})
+
+    lm_res = export_service.post_otel_http(full_bundle, "https://collector.example.com", transport_fn=_reject_logs_and_metrics)
+    assert lm_res["ok"] is False and lm_res["error"] == "otel_partial_success" and lm_res["rejected_total"] == 4
+    assert lm_res["signals"]["logs"]["rejected"] == 1 and lm_res["signals"]["metrics"]["rejected"] == 3
+
+    def _invalid_counts_and_warn(req: urllib.request.Request, timeout: float = 5.0) -> _JsonResponse:
+        if req.full_url.endswith("/v1/traces"):
+            return _JsonResponse({"partialSuccess": {"rejectedSpans": 0, "errorMessage": "rate limit warning"}})
+        if req.full_url.endswith("/v1/logs"):
+            return _JsonResponse({"partialSuccess": {"rejectedLogRecords": True}})
+        return _JsonResponse({"partialSuccess": {"rejectedDataPoints": -2}})
+
+    warn_res = export_service.post_otel_http(full_bundle, "https://collector.example.com", transport_fn=_invalid_counts_and_warn)
+    assert warn_res["ok"] is True and warn_res["partial_success"] is False and warn_res["rejected_total"] == 0
+    assert any("rate limit warning" in w for w in warn_res["warnings"])
+
+    class _CodeOnlyResponse:
+        code = 201
+
+        def read(self) -> bytes:
+            return b'{"partialSuccess":{}}'
+
+    code_res = export_service.post_otel_http(
+        bundle, "https://collector.example.com", transport_fn=lambda req, timeout=5.0: _CodeOnlyResponse()
+    )
+    assert code_res["ok"] is True and code_res["status_code"] == 201 and code_res["rejected_total"] == 0
+
+    def _real_http_resp(req: urllib.request.Request, timeout: float = 5.0) -> http.client.HTTPResponse:
+        raw = b'{"partialSuccess":{"rejectedSpans":1}}' if req.full_url.endswith("/v1/traces") else b"{}"
+        sock: Any = type("_Sock", (), {"makefile": lambda _s, *_a, **_kw: io.BytesIO(f"HTTP/1.1 200 OK\r\nContent-Length: {len(raw)}\r\n\r\n".encode("ascii") + raw)})()
+        resp = http.client.HTTPResponse(sock)
+        resp.begin()
+        return resp
+
+    hr_res = export_service.post_otel_http(bundle, "https://collector.example.com", transport_fn=_real_http_resp)
+    assert hr_res["ok"] is False and hr_res["error"] == "otel_partial_success" and hr_res["rejected_total"] == 1
+
+
+def test_otel_export_correlates_cli_recovery_and_cross_turn_spool_links(tmp_path: Path) -> None:
+    ws_dir = tmp_path / "ws_corr"
+    ws_dir.mkdir()
+    (ws_dir / ".git").mkdir()
+    spool_dir = tmp_path / "spool"
+    receipts_path = spool_dir / "receipts.jsonl"
+    blob = "\n".join(f"ROW {i:04d}: " + ("x" * 60) for i in range(1, 220))
+    sp = spool_tool_output(
+        blob, session_id="sess_corr", call_id="call_create", harness="claude", tool_name="Bash",
+        workspace_root=ws_dir, isolation="workspace", turn_key="s:step:1",
+        spool_dir=spool_dir, receipts_path=receipts_path, now_ts=1_795_003_200.0,
+    )
+    assert sp is not None
+    sid = sp[0].spool_id
+    assert slice_spool(
+        sid, start_line=1, limit=20, workspace_root=ws_dir, isolation="workspace",
+        spool_dir=spool_dir, receipts_path=receipts_path, now_ts=1_795_003_201.0,
+    )["ok"] is True
+    assert slice_spool(
+        sid, start_line=21, limit=20, workspace_root=ws_dir, isolation="workspace", harness="claude",
+        turn_key="s:step:5", call_id="call_cross", spool_dir=spool_dir, receipts_path=receipts_path, now_ts=1_795_003_202.0,
+    )["ok"] is True
+
+    bundle = export_service.build_otel_export_bundle(receipts_path=receipts_path)
+    spans = bundle["resourceSpans"][0]["scopeSpans"][0]["spans"]
+    logs = bundle["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
+    assert len(spans) == 3 and len(logs) == 3
+    parent_sp, cli_sp, cross_sp = spans[0], spans[1], spans[2]
+    parent_lg, cli_lg, cross_lg = logs[0], logs[1], logs[2]
+
+    assert cli_sp["traceId"] == parent_sp["traceId"]
+    assert cli_sp["parentSpanId"] == parent_sp["spanId"]
+    assert cli_lg["traceId"] == cli_sp["traceId"] and cli_lg["spanId"] == cli_sp["spanId"]
+
+    assert cross_sp["traceId"] != parent_sp["traceId"]
+    assert "parentSpanId" not in cross_sp
+    assert len(cross_sp["links"]) == 1
+    assert cross_sp["links"][0]["traceId"] == parent_sp["traceId"] and cross_sp["links"][0]["spanId"] == parent_sp["spanId"]
+    assert _attr_map(cross_sp["links"][0]["attributes"]) == {"context_guard.link_type": "spool_origin", "context_guard.spool_id": sid}
+    assert cross_lg["traceId"] == cross_sp["traceId"] and cross_lg["spanId"] == cross_sp["spanId"]
+    assert parent_lg["traceId"] == parent_sp["traceId"] and parent_lg["spanId"] == parent_sp["spanId"]
+
+    cyc_rcpt = tmp_path / "cyc" / "receipts.jsonl"
+    for eid, rid, peid, ts in (("ev_cyc_a", "rcpt_cyc_a", "rcpt_cyc_b", 1_795_003_201_000), ("ev_cyc_b", "rcpt_cyc_b", "rcpt_cyc_a", 1_795_003_200_000)):
+        r = build_receipt(
+            event_type="spool_recovery", harness="cli", session_id="s_c", workspace_id="ws_1234567890abcdef",
+            turn_key="", call_id=eid, spool_id="sp_1234567890ab", line_span=(1, 2), byte_span=(0, 10),
+            delivery_evidence="unverified", spool_id_referenced=True, parent_event_id=peid, ts_ms=ts, event_id=eid,
+        )
+        r["receipt_id"] = rid
+        assert append_receipt(r, cyc_rcpt) is True
+    assert export_service.build_otel_export_bundle(receipts_path=cyc_rcpt)["exported_events"] == 2
 
 
 def test_hot_path_modules_have_zero_otel_or_network_imports() -> None:

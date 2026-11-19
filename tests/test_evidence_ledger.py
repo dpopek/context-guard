@@ -381,6 +381,9 @@ def test_durable_ledger_rejects_unsafe_symlinks(tmp_path: Path, monkeypatch: pyt
         conf_sym = run_cursor_cli_conformance(sym_dir)
         assert conf_sym["ok"] is False and conf_sym["error"] == "unsafe_path"
         assert conf_sym["admitted"] is False and conf_sym["comparisons_blocked"] is True
+        assert conf_sym["verification_scope"] == "adapter_contract_only"
+        assert conf_sym["adapter_conformance_passed"] is False
+        assert conf_sym["live_client_executed"] is False and conf_sym["runtime_verified"] is False
 
     blocked = tmp_path / "win_reparse_ledger.json"
     monkeypatch.setattr(spool_receipts, "check_unsafe_link", lambda p: Path(p) == blocked)
@@ -484,6 +487,10 @@ def test_cursor_cli_conformance_gate_admits_cursor_with_missing_cache_excluded(t
     assert default_res["admitted"] is True
     assert default_res["comparisons_blocked"] is False
     assert default_res["cache_attribution_status"] == "excluded_missing_telemetry"
+    assert default_res["verification_scope"] == "adapter_contract_only"
+    assert default_res["adapter_conformance_passed"] is True
+    assert default_res["live_client_executed"] is False
+    assert default_res["runtime_verified"] is False
     assert default_res["harness_output_capabilities"]["supports_content_verified_reads"] is True
     assert default_res["harness_output_capabilities"]["can_replace_tool_output"] is False
     assert default_res["hook_config_fingerprint"].startswith("sha256:")
@@ -545,3 +552,31 @@ def test_provider_only_evidence_rejected_in_requirement_and_environment_metadata
     assert claimed_only["runtime_verified"] is False
     assert claimed_only["evidence_level"] == "provider_supported"
     assert claimed_only["verification_source"] == "provider_only_rejected:claude:provider_supported"
+
+
+def test_ingest_context_receipts_ignores_rotation_metadata_markers(tmp_path: Path) -> None:
+    """Skip _meta=receipts_rotation marker lines so clean rotation never taints ledger completeness."""
+    ledger_path = tmp_path / "evidence" / DEFAULT_EVENT_LEDGER_FILENAME
+    receipts_path = tmp_path / "spool" / "receipts.jsonl"
+    receipts_path.parent.mkdir(parents=True, exist_ok=True)
+    r_created = spool_receipts.build_receipt(
+        event_type="spool_created", harness="claude", session_id="s_rot", workspace_id="ws_1",
+        turn_key="s_rot:step:1", call_id="c_rot_1", spool_id="sp_1234567890ab",
+        line_span=(0, 80), byte_span=(0, 4000), delivery_evidence="replacement_emitted", spool_id_referenced=False,
+    )
+    r_rec = spool_receipts.build_receipt(
+        event_type="spool_recovery", harness="claude", session_id="s_rot", workspace_id="ws_1",
+        turn_key="s_rot:step:2", call_id="c_rot_2", spool_id="sp_1234567890ab",
+        line_span=(1, 40), byte_span=(0, 2000), delivery_evidence="unverified", spool_id_referenced=True,
+    )
+    rot_meta = {"_meta": "receipts_rotation", "rotated_at": "2026-11-19T12:00:00Z", "dropped_rows": 12}
+    receipts_path.write_text(
+        "\n".join(json.dumps(dict(x)) for x in (rot_meta, r_created, r_rec)) + "\n", encoding="utf-8"
+    )
+    ing = ingest_context_receipts(ledger_path, receipts_path)
+    assert ing["ok"] is True and ing["appended_count"] == 2
+    assert ing["invalid_count"] == 0 and ing["corrupt_source_lines"] == 0
+    assert ing["completeness"] == "complete"
+    derived = derive_outcomes_from_ledger(ledger_path)
+    assert derived["completeness"] == "complete" and derived["corrupt_source_lines"] == 0
+    assert derived["totals"]["created"] == 1 and derived["totals"]["recoveries"] == 1
