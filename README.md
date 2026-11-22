@@ -56,7 +56,7 @@ Trims noisy test/grep boilerplate unless verbosity flags (`-v`/`--verbose`/`--tb
 - **Budget Advisor (`cg budget`):** Audits preambles and MCPs read-only (`measured`/`estimated`/`unavailable`); `--probe` runs opt-in stdio `tools/list`.
 
 ### 5. Reversible Output Spooling & Regret (`spool/`)
-- **Opt-In Spooling:** `"output_spool": "active"` validates UTF-8 and `max_spool_entry_bytes` (`4 MiB`), swapping `>= 12,288` B / `200`-line outputs for `<= 3,072` B summaries (`"shadow"` logs `shadow_spools`).
+- **Opt-In Spooling:** `"output_spool": "active"` (UTF-8, `max_spool_entry_bytes` `4 MiB`) swaps `>= 12,288` B / `200`-line shell (MCP: bytes only) outputs for `<= 3,072` B summaries (`"shadow"` logs `shadow_spools`).
 - **Recovery & GC:** Stores `sp_<12hex>.txt` (raw `source_sha256` + `blob_sha256`, `24h`/`64`/`32 MB` GC) across `available`/`evicting`/`evicted`/`corrupt`; checks fd SHA-256 and unlinks off-lock.
 - **Scoped Access & Spans:** `cg-spool`/MCP (`--workspace-root`) enforce `os.path.samefile()`; `spool/spans.py` tracks grep spans, source digests, verified turns, and `complete`/`incomplete` `ContextReceiptV1`.
 

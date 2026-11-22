@@ -5,6 +5,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 
 ## [Unreleased]
 
+### Changed
+- **MCP spool gate (`spool/store.py`):** MCP outputs spool only at `>= 12,288` B; the `200`-line gate now applies to shell only.
+
 ## [5.2.0] - 2026-11-19
 
 ### Added

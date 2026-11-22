@@ -13,7 +13,7 @@ import pytest
 
 from services.migration_guard import RollbackJournal
 from spool.mcp_server import is_cursor_spool_mcp_configured, serve_stdio, sync_cursor_spool_mcp
-from spool.store import spool_tool_output
+from spool.store import spool_post_tool_output, spool_tool_output
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -264,3 +264,31 @@ def test_sync_cursor_spool_mcp_rollback_journal_restores_on_exception(tmp_path: 
             raise RuntimeError("abort fresh install")
 
     assert not fresh.exists()
+
+
+def _short_lines(count: int, width: int) -> str:
+    return "".join(f"{i:04d} {'y' * (width - 6)}\n" for i in range(count))
+
+
+def test_mcp_output_spools_only_above_byte_gate_while_shell_keeps_line_gate(tmp_path: Path) -> None:
+    """Many short MCP lines under the byte gate stay inline; shell output keeps the line-count gate."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    spool_dir = tmp_path / "spool"
+    many_short = _short_lines(300, 24)  # 300 lines, ~7 KB: under the 12 KB byte gate
+    big = _short_lines(300, 48)  # 300 lines, ~14 KB: over the byte gate
+
+    def run(tool: str, text: str, call: str) -> Any:
+        resp: Any = {"stdout": text, "stderr": ""} if tool == "Bash" else [{"type": "text", "text": text}]
+        tin: Any = {"command": "dump"} if tool == "Bash" else {"q": call}
+        decision, _meta = spool_post_tool_output(
+            "claude", {"tool_name": tool, "tool_input": tin, "tool_response": resp, "cwd": str(repo)},
+            mode="active", session_id="s1", call_id=call, spool_dir=spool_dir, now_ts=1_000.0,
+        )
+        return decision
+
+    assert len(many_short.encode()) < 12_288 < len(big.encode())
+    assert run("mcp__demo__tree", many_short, "m1") is None
+    assert run("mcp__demo__tree", big, "m2") is not None
+    assert run("Bash", many_short, "b1") is not None
+
