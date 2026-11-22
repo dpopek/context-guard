@@ -264,7 +264,9 @@ def _run_policy_pass(
             continue
         eval_records.append((manifest, ctx, p_dec))
         if p_dec is not None and p_dec.decision == "deny":
-            reason = escalate_repeat_deny(p_dec.reason or f"Blocked by policy pack {pid}", pid, cur_norm.call_id, state_dir_path)
+            reason = p_dec.reason or f"Blocked by policy pack {pid}"
+            if not security_only:  # Pass-2 re-verification is side-effect free and may run twice per call
+                reason = escalate_repeat_deny(reason, pid, cur_norm.call_id, state_dir_path)
             return {"decision": "deny", "reason": reason}, eval_records, cur_norm, (cur_overwrite or None), False
         if p_dec is not None and isinstance(p_dec.overwrite, Mapping) and p_dec.overwrite:
             if security_only and kind == "security":

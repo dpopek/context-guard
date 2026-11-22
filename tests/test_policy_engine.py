@@ -726,3 +726,20 @@ def test_repeat_deny_escalation_respects_rule_identity_and_time_window(tmp_path:
     assert esc("Other rule", "c4", 1020.0 + REPEAT_DENY_WINDOW_S + 1) == "Other rule"
     (tmp_path / "policy_deny_last.json").write_text("{not json", encoding="utf-8")
     assert esc("Other rule", "c5", 5000.0) == "Other rule"
+
+
+def test_pass2_reverification_without_call_id_never_escalates_first_block(isolated_user_env: Path, tmp_path: Path) -> None:
+    """Pass-2 candidate + fallback checks of one call (no call_id) must not count as a retry."""
+    policies_dir = isolated_user_env / ".config" / "context-guard" / "policies"
+    _pack, entry = _write_synthetic_pack(policies_dir, "repeat-p2")
+    runtime_cfg = {
+        "read_confirm_policy": "strict", "optimizers": {}, "integrations": {"atlassian_twg": "off"},
+        "regret_window_steps": 2, "policy_packs": [entry], "model_labels": {}, "legacy_security_keys": (),
+        "config_path": str(isolated_user_env / ".config" / "context-guard" / "config.json"), "config_error": None,
+    }
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    call = _make_norm(tool="edit_file", args={"Path": "/tmp/ws/blocked.txt"}, mutated=("/tmp/ws/blocked.txt",))
+    assert call.call_id == ""
+    act, dec = policy_engine.reconcile_post_transform(call, runtime_cfg, fallback_norm=call, state_dir_path=state_dir)
+    assert act == "deny" and dec is not None and dec["reason"] == "BLOCKED_BY_SYNTH"
