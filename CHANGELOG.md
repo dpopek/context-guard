@@ -5,6 +5,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 
 ## [Unreleased]
 
+### Added
+- **Repeat-block escalation (`policies/repeat_deny.py`):** Same-rule pack deny within 600 s adds a stop-and-report-to-operator note.
+
 ### Changed
 - **MCP spool gate (`spool/store.py`):** MCP outputs spool only at `>= 12,288` B; the `200`-line gate now applies to shell only.
 

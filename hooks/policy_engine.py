@@ -13,6 +13,7 @@ from policies.loader import (
     SAFE_PACK_ID_RE, PolicyPackLoadError, clear_pack_cache, compile_verified_manifest,
     get_cached_manifest, normalize_pack_ns, verify_pack_tree_bytes,
 )
+from policies.repeat_deny import escalate_repeat_deny
 
 __all__ = [
     "PolicyPackLoadError", "SAFE_PACK_ID_RE", "apply_overwrite_to_call", "apply_policy_packs",
@@ -263,7 +264,8 @@ def _run_policy_pass(
             continue
         eval_records.append((manifest, ctx, p_dec))
         if p_dec is not None and p_dec.decision == "deny":
-            return {"decision": "deny", "reason": p_dec.reason or f"Blocked by policy pack {pid}"}, eval_records, cur_norm, (cur_overwrite or None), False
+            reason = escalate_repeat_deny(p_dec.reason or f"Blocked by policy pack {pid}", pid, cur_norm.call_id, state_dir_path)
+            return {"decision": "deny", "reason": reason}, eval_records, cur_norm, (cur_overwrite or None), False
         if p_dec is not None and isinstance(p_dec.overwrite, Mapping) and p_dec.overwrite:
             if security_only and kind == "security":
                 return {"decision": "deny", "reason": f"Disallowed overwrite proposed by security pack {pid} in Pass-2"}, eval_records, cur_norm, (cur_overwrite or None), False

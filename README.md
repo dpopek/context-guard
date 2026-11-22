@@ -35,6 +35,7 @@ Code/Markdown reads never block; `cg-outline <path>` covers 21 extensions, and `
 ### 2. Verified Policy API v1 & Security (`policies/api.py`, `policies/loader.py`)
 - Normalizes MCP calls across Antigravity (`mcp_<server>_<tool>`), Claude/Codex (`mcp__<server>__<tool>`), Cursor (`MCP:<tool>`), and `call_mcp_tool`.
 - Loads verified packs from memory (`file_hashes` + `tree_sha256`) with Stage-2 scoped canonicalized fallbacks and `verify_security_policies_post_transform`.
+- **Repeat-Block Escalation (`policies/repeat_deny.py`):** A second same-rule pack deny within 600 s tells the agent to stop and report to the operator.
 - **Fail-Closed:** Claude `>= 2.1.295` `"onFailure": "block"`; Cursor `"failClosed": true` (`NATIVE_FAIL_CLOSED_DRIFT`); Antigravity `exit 2`; Codex `[features].hooks = true`.
 
 ### 3. Guardrailed Quiet CLI Rewrites (`PreToolUse`)
@@ -80,6 +81,7 @@ Enforced by `tests/test_module_boundaries.py` and `tests/test_version_source.py`
 | `policies/api.py` | Policy | `POLICY_API_VERSION = 1`, `CORE_SCHEMA_VERSIONS`, contracts. |
 | `policies/governor.py` | Policy | Governor modes, static ceilings, state path, breakers. |
 | `policies/loader.py` | Policy | Verified pack loader (`file_hashes`, `tree_sha256`). |
+| `policies/repeat_deny.py` | Policy | Session-scoped repeat-deny escalation note (fail-open). |
 | `spool/receipts.py` | Spool | Workspace `samefile`, link checks, `receipts.jsonl`. |
 | `spool/store.py` | Spool | Write-once blobs, UTF-8/byte guard, fd-safe GC, inspect. |
 | `spool/gc.py` | Spool | Dedup blob verification, epoch/inode GC, orphan staging. |
