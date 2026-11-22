@@ -265,7 +265,8 @@ def _run_policy_pass(
         eval_records.append((manifest, ctx, p_dec))
         if p_dec is not None and p_dec.decision == "deny":
             reason = p_dec.reason or f"Blocked by policy pack {pid}"
-            if not security_only:  # Pass-2 re-verification is side-effect free and may run twice per call
+            retry_to_proceed = isinstance(p_dec.metadata, Mapping) and p_dec.metadata.get("fail_open_if_retry_unsaved") is True
+            if not security_only and not retry_to_proceed:  # Pass-2 is side-effect free; retry-to-proceed denies expect a retry
                 reason = escalate_repeat_deny(reason, pid, cur_norm.call_id, state_dir_path)
             return {"decision": "deny", "reason": reason}, eval_records, cur_norm, (cur_overwrite or None), False
         if p_dec is not None and isinstance(p_dec.overwrite, Mapping) and p_dec.overwrite:

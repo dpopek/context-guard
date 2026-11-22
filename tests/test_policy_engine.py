@@ -705,7 +705,7 @@ def test_repeated_pack_deny_appends_operator_escalation_without_changing_decisio
 
     first = deny_at("c1")
     assert first["reason"] == "BLOCKED_BY_SYNTH"
-    assert deny_at("c1")["reason"] == "BLOCKED_BY_SYNTH"  # Pass-2 re-evaluation of the same call is not a retry
+    assert deny_at("c1")["reason"] == "BLOCKED_BY_SYNTH"  # re-evaluating the same call_id is not a retry
     second = deny_at("c2")
     assert second["reason"].startswith("BLOCKED_BY_SYNTH")
     assert "report to the operator" in second["reason"].lower()
@@ -743,3 +743,38 @@ def test_pass2_reverification_without_call_id_never_escalates_first_block(isolat
     assert call.call_id == ""
     act, dec = policy_engine.reconcile_post_transform(call, runtime_cfg, fallback_norm=call, state_dir_path=state_dir)
     assert act == "deny" and dec is not None and dec["reason"] == "BLOCKED_BY_SYNTH"
+
+
+def test_repeat_deny_never_raises_on_corrupt_state(tmp_path: Path) -> None:
+    from policies.repeat_deny import escalate_repeat_deny
+
+    (tmp_path / "policy_deny_last.json").write_text("[" * 200_000, encoding="utf-8")
+    assert escalate_repeat_deny("Blocked", "gov", "c1", tmp_path, now_ts=1.0) == "Blocked"
+
+
+def test_retry_to_proceed_denies_are_never_escalated(isolated_user_env: Path, tmp_path: Path) -> None:
+    """Denies whose instruction is 'repeat the call to proceed' must not get a 'stop retrying' note."""
+    import dataclasses
+
+    pack_src = (
+        "from policies.api import POLICY_API_VERSION, PolicyDecision, PolicyPackManifest\n\n"
+        "def evaluate(ctx):\n"
+        "    if ctx.canonical_tool == 'edit_file':\n"
+        "        return PolicyDecision(decision='deny', reason='READ_LOCAL_FIRST', metadata={'fail_open_if_retry_unsaved': True})\n"
+        "    return None\n\n"
+        "PACK_MANIFEST = PolicyPackManifest(pack_id='retry-sec', api_version=POLICY_API_VERSION, "
+        "kind='security', covered_domains=('synthetic',), evaluate=evaluate)\n"
+    )
+    policies_dir = isolated_user_env / ".config" / "context-guard" / "policies"
+    _pack, entry = _write_synthetic_pack(policies_dir, "retry-sec", pack_src=pack_src)
+    runtime_cfg = {
+        "read_confirm_policy": "strict", "optimizers": {}, "integrations": {"atlassian_twg": "off"},
+        "regret_window_steps": 2, "policy_packs": [entry], "model_labels": {}, "legacy_security_keys": (),
+        "config_path": str(isolated_user_env / ".config" / "context-guard" / "config.json"), "config_error": None,
+    }
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    base = _make_norm(tool="edit_file", args={"Path": "/tmp/ws/a.txt"}, mutated=("/tmp/ws/a.txt",))
+    for call in ("c1", "c2"):
+        dec, _r, _n, _o = policy_engine.apply_policy_packs_with_records(dataclasses.replace(base, call_id=call), runtime_cfg, state_dir_path=state_dir)
+        assert dec is not None and dec["reason"] == "READ_LOCAL_FIRST"

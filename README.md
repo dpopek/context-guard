@@ -35,7 +35,7 @@ Code/Markdown reads never block; `cg-outline <path>` covers 21 extensions, and `
 ### 2. Verified Policy API v1 & Security (`policies/api.py`, `policies/loader.py`)
 - Normalizes MCP calls across Antigravity (`mcp_<server>_<tool>`), Claude/Codex (`mcp__<server>__<tool>`), Cursor (`MCP:<tool>`), and `call_mcp_tool`.
 - Loads verified packs from memory (`file_hashes` + `tree_sha256`) with Stage-2 scoped canonicalized fallbacks and `verify_security_policies_post_transform`.
-- **Repeat-Block Escalation (`policies/repeat_deny.py`):** A second same-rule pack deny within 600 s tells the agent to stop and report to the operator.
+- **Repeat-Block Escalation (`policies/repeat_deny.py`):** A second same-rule pack deny within 600 s tells the agent to stop and report to the operator (skips retry-to-proceed denies; fail-open).
 - **Fail-Closed:** Claude `>= 2.1.295` `"onFailure": "block"`; Cursor `"failClosed": true` (`NATIVE_FAIL_CLOSED_DRIFT`); Antigravity `exit 2`; Codex `[features].hooks = true`.
 
 ### 3. Guardrailed Quiet CLI Rewrites (`PreToolUse`)
