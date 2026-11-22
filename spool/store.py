@@ -420,6 +420,8 @@ def spool_post_tool_output(
     if (cand := prepare_post_tool_spool_candidate(harness, payload, raw_text)) is None:
         return None, None
     tool_name, raw_in, is_shell, shell_cmd, raw_resp, eff_raw, shape, up_trunc = cand
+    if not is_shell and len(eff_raw.encode("utf-8", "replace") if isinstance(eff_raw, str) else eff_raw) < SPOOL_MIN_BYTES:
+        return None, None  # MCP output: byte gate only (many short structured lines are usually fully re-read)
     eff_ws_root = workspace_root if workspace_root is not None else (payload.get("cwd") if isinstance(payload.get("cwd"), (str, Path)) else None)
     eff_ws_roots = workspace_roots if workspace_roots is not None else (tuple(str(r) for r in raw_roots) if isinstance((raw_roots := payload.get("workspace_roots")), (list, tuple)) else None)
     _m, scope_key, ws_id, _cr, _s, eff_max, scope_err = _resolve_write_cfg(

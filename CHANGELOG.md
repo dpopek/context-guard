@@ -5,6 +5,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Sem
 
 ## [Unreleased]
 
+### Added
+- **Repeat-block escalation (`policies/repeat_deny.py`):** Repeat same-rule deny in 600 s adds a stop-and-report note (not retry denies).
+
+### Changed
+- **MCP spool gate (`spool/store.py`):** MCP outputs spool only at `>= 12,288` B; the `200`-line gate now applies to shell only.
+
 ## [5.2.0] - 2026-11-19
 
 ### Added

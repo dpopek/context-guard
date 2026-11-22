@@ -39,3 +39,8 @@ Under **NO** circumstances may author-specific, company-specific, or local-works
    - `guard.lock` and `scripts/guard` enforce dev/CI governance only (zero runtime dependencies in the 8 production packages).
    - `.githooks/pre-commit` requires `uv` and `uvx` on `PATH`; warm the offline cache once with `scripts/guard version --sha` before offline hook runs.
    - **Never** set `ALLOW_GUARD_LOCK_UPDATE=1` autonomously (operator-only gate for `guard.lock` / `scripts/guard` updates).
+
+## Operational notes
+
+- [verified] Governance enforcement (`CONTEXT-GUARD GOVERNANCE BLOCK` messages, governance shell parser) is not in this repo: since `21abb75` it lives in an operator-owned private policy pack, installed into `~/.config/context-guard/policies/<pack_id>/` and pinned by `file_hashes` + `tree_sha256` in `config.json`. Fix governance false positives there, never by re-adding governance code here (Section 1).
+- [verified] The loader fails closed on disallowed directories in an installed pack tree (e.g. `__pycache__`: `disallowed directory in pack tree`), blocking every tool call. Never import modules from the installed pack directory to test them; test the pack's source checkout, or set `PYTHONDONTWRITEBYTECODE=1`.
